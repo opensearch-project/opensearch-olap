@@ -1,4 +1,0 @@
-velox4j
-Copyright 2024 BoostScale
-
-This product includes software developed by BoostScale.
