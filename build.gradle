@@ -1,0 +1,530 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * OpenSearch OLAP Plugin - Vectorized analytics via Apache Velox
+ */
+
+buildscript {
+    ext {
+        opensearch_version = System.getProperty("opensearch.version", "${opensearch_version}")
+        isSnapshot = "true" == System.getProperty("build.snapshot", "true")
+    }
+
+    repositories {
+        mavenLocal()
+        mavenCentral()
+        maven { url "https://ci.opensearch.org/ci/dbc/snapshots/maven/" }
+    }
+
+    dependencies {
+        classpath "org.opensearch.gradle:build-tools:${opensearch_version}"
+    }
+}
+
+apply plugin: 'java'
+apply plugin: 'opensearch.opensearchplugin'
+apply plugin: 'opensearch.pluginzip'
+
+group = 'org.opensearch.plugin'
+version = opensearch_version
+description = 'OpenSearch OLAP Plugin with Apache Velox integration for vectorized analytical query execution'
+
+opensearchplugin {
+    name 'opensearch-olap'
+    description 'OpenSearch OLAP Plugin with Apache Velox integration for vectorized analytical query execution'
+    classname 'org.opensearch.plugin.olap.OlapPlugin'
+    // Extend the SQL plugin so our classloader can access its classes (ExecutionEngine, etc.)
+    extendedPlugins = ['opensearch-sql']
+    licenseFile rootProject.file("LICENSE.txt")
+    noticeFile rootProject.file("NOTICE.txt")
+}
+
+repositories {
+    mavenLocal()
+    mavenCentral()
+    maven { url "https://ci.opensearch.org/ci/dbc/snapshots/maven/" }
+    maven { url "https://central.sonatype.com/repository/maven-snapshots/" }
+}
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.VERSION_21
+}
+
+configurations.all {
+    // velox4j bundles slf4j classes; exclude the separate jar to avoid jar hell
+    exclude group: 'org.slf4j', module: 'slf4j-api'
+    // jsr305 (javax.annotation) is provided by the SQL plugin; exclude to avoid jar hell
+    exclude group: 'com.google.code.findbugs', module: 'jsr305'
+}
+
+// Repackage velox4j to strip classes that conflict with the SQL plugin's jsr305 jar.
+// The velox4j fat jar bundles javax.annotation and org.slf4j which cause jar hell.
+configurations {
+    velox4jOriginal {
+        transitive = false
+    }
+}
+
+tasks.register('repackageVelox4j', Jar) {
+    archiveBaseName = 'velox4j-repackaged'
+    from(zipTree(configurations.velox4jOriginal.singleFile)) {
+        exclude 'javax/annotation/**'
+        exclude 'org/slf4j/**'
+    }
+}
+
+dependencies {
+    velox4jOriginal "org.boostscale:velox4j:${velox4j_version}"
+
+    // OpenSearch core (provided at runtime by OpenSearch)
+    compileOnly "org.opensearch:opensearch:${opensearch_version}"
+
+    // SQL plugin classes (provided at runtime via extendedPlugins classloader delegation).
+    // These provide: ExecutionEngineExtension, ExecutionEngine.QueryResponse,
+    // ExprValue, ExprCoreType, ResponseListener, CalcitePlanContext, Cursor
+    compileOnly files(
+        "${project.findProperty('sql_plugin_path') ?: '../search-plugins-sql-calcite'}/core/build/libs/core-${sql_plugin_version}.jar",
+        "${project.findProperty('sql_plugin_path') ?: '../search-plugins-sql-calcite'}/common/build/libs/common-${sql_plugin_version}.jar"
+    )
+
+    // Apache Calcite for plan conversion (provided at runtime by the SQL plugin)
+    compileOnly "org.apache.calcite:calcite-core:${calcite_version}"
+
+    // Apache Arrow for columnar in-memory data
+    implementation "org.apache.arrow:arrow-vector:${arrow_version}"
+    implementation "org.apache.arrow:arrow-memory-core:${arrow_version}"
+    runtimeOnly "org.apache.arrow:arrow-memory-netty:${arrow_version}"
+
+    // velox4j for Velox execution engine JNI bridge (repackaged to remove javax.annotation/slf4j)
+    compileOnly "org.boostscale:velox4j:${velox4j_version}"
+    runtimeOnly files(tasks.named('repackageVelox4j').map { it.archiveFile })
+
+    // Test dependencies
+    testImplementation "org.opensearch.test:framework:${opensearch_version}"
+    testImplementation "org.opensearch:opensearch-agent-bootstrap:${opensearch_version}"
+    testImplementation "org.opensearch:opensearch-agent:${opensearch_version}"
+    testImplementation "junit:junit:4.13.2"
+    testImplementation "org.mockito:mockito-core:5.20.0"
+}
+
+publishing {
+    publications {
+        nebula(MavenPublication) {
+            pom {
+                name = 'OpenSearch OLAP Plugin'
+                description = 'OpenSearch OLAP Plugin with Apache Velox integration for vectorized analytical query execution'
+                licenses {
+                    license {
+                        name = 'The Apache License, Version 2.0'
+                        url = 'http://www.apache.org/licenses/LICENSE-2.0.txt'
+                    }
+                }
+                developers {
+                    developer {
+                        name = 'OpenSearch'
+                        url = 'https://github.com/opensearch-project'
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Disable loggerUsageCheck — requires logger-usage artifact from full OpenSearch build
+tasks.named('loggerUsageCheck').configure { enabled = false }
+
+test {
+    systemProperty 'io.netty.tryReflectionSetAccessible', 'true'
+    jvmArgs += ["--add-opens", "java.base/java.nio=ALL-UNNAMED"]
+    // Attach OpenSearch security agent required by test framework
+    jvmArgs += ["-javaagent:${configurations.testRuntimeClasspath.files.find { it.name.startsWith('opensearch-agent-') && !it.name.contains('bootstrap') && !it.name.contains('policy') }}"]
+}
+
+thirdPartyAudit.ignoreMissingClasses(
+    // Jackson (provided by OpenSearch at runtime)
+    'com.fasterxml.jackson.databind.DeserializationFeature',
+    'com.fasterxml.jackson.databind.JsonNode',
+    'com.fasterxml.jackson.databind.MapperFeature',
+    'com.fasterxml.jackson.databind.MappingJsonFactory',
+    'com.fasterxml.jackson.databind.ObjectMapper',
+    'com.fasterxml.jackson.databind.ObjectReader',
+    'com.fasterxml.jackson.databind.ObjectWriter',
+    'com.fasterxml.jackson.databind.SerializerProvider',
+    'com.fasterxml.jackson.databind.json.JsonMapper',
+    'com.fasterxml.jackson.databind.json.JsonMapper$Builder',
+    'com.fasterxml.jackson.databind.node.ObjectNode',
+    'com.fasterxml.jackson.databind.ser.std.StdSerializer',
+    // Guava (provided by OpenSearch at runtime)
+    'com.google.common.base.CaseFormat',
+    'com.google.common.base.Equivalence',
+    'com.google.common.base.Function',
+    'com.google.common.base.MoreObjects',
+    'com.google.common.base.MoreObjects$ToStringHelper',
+    'com.google.common.base.Preconditions',
+    'com.google.common.base.Predicate',
+    'com.google.common.base.Predicates',
+    'com.google.common.base.Splitter',
+    'com.google.common.base.Strings',
+    'com.google.common.base.Supplier',
+    'com.google.common.base.Suppliers',
+    'com.google.common.base.Throwables',
+    'com.google.common.base.Utf8',
+    'com.google.common.base.Verify',
+    'com.google.common.cache.Cache',
+    'com.google.common.cache.CacheBuilder',
+    'com.google.common.cache.CacheLoader',
+    'com.google.common.cache.LoadingCache',
+    'com.google.common.collect.ArrayListMultimap',
+    'com.google.common.collect.BiMap',
+    'com.google.common.collect.BoundType',
+    'com.google.common.collect.Collections2',
+    'com.google.common.collect.FluentIterable',
+    'com.google.common.collect.HashBasedTable',
+    'com.google.common.collect.HashBiMap',
+    'com.google.common.collect.HashMultimap',
+    'com.google.common.collect.HashMultiset',
+    'com.google.common.collect.ImmutableCollection',
+    'com.google.common.collect.ImmutableCollection$Builder',
+    'com.google.common.collect.ImmutableList',
+    'com.google.common.collect.ImmutableList$Builder',
+    'com.google.common.collect.ImmutableListMultimap',
+    'com.google.common.collect.ImmutableListMultimap$Builder',
+    'com.google.common.collect.ImmutableMap',
+    'com.google.common.collect.ImmutableMap$Builder',
+    'com.google.common.collect.ImmutableMultimap',
+    'com.google.common.collect.ImmutableMultimap$Builder',
+    'com.google.common.collect.ImmutableRangeSet',
+    'com.google.common.collect.ImmutableRangeSet$Builder',
+    'com.google.common.collect.ImmutableSet',
+    'com.google.common.collect.ImmutableSet$Builder',
+    'com.google.common.collect.ImmutableSetMultimap',
+    'com.google.common.collect.ImmutableSetMultimap$Builder',
+    'com.google.common.collect.ImmutableSortedMap',
+    'com.google.common.collect.ImmutableSortedMap$Builder',
+    'com.google.common.collect.ImmutableSortedMultiset',
+    'com.google.common.collect.ImmutableSortedSet',
+    'com.google.common.collect.ImmutableSortedSet$Builder',
+    'com.google.common.collect.Interner',
+    'com.google.common.collect.Interners',
+    'com.google.common.collect.Iterables',
+    'com.google.common.collect.Iterators',
+    'com.google.common.collect.LinkedHashMultimap',
+    'com.google.common.collect.LinkedListMultimap',
+    'com.google.common.collect.Lists',
+    'com.google.common.collect.Maps',
+    'com.google.common.collect.Multimap',
+    'com.google.common.collect.MultimapBuilder$MultimapBuilderWithKeys',
+    'com.google.common.collect.MultimapBuilder$SortedSetMultimapBuilder',
+    'com.google.common.collect.Multiset$Entry',
+    'com.google.common.collect.Ordering',
+    'com.google.common.collect.Range',
+    'com.google.common.collect.RangeSet',
+    'com.google.common.collect.SetMultimap',
+    'com.google.common.collect.Sets',
+    'com.google.common.collect.SortedSetMultimap',
+    'com.google.common.collect.Table',
+    'com.google.common.collect.TreeMultimap',
+    'com.google.common.collect.TreeRangeSet',
+    'com.google.common.collect.UnmodifiableIterator',
+    'com.google.common.collect.UnmodifiableListIterator',
+    'com.google.common.io.ByteSource',
+    'com.google.common.io.CharSource',
+    'com.google.common.math.IntMath',
+    'com.google.common.primitives.Booleans',
+    'com.google.common.primitives.Ints',
+    'com.google.common.primitives.Longs',
+    'com.google.common.util.concurrent.UncheckedExecutionException',
+    // FlatBuffers (Arrow optional dependency)
+    'com.google.flatbuffers.FlatBufferBuilder',
+    // Uzaygezen (Calcite optional dependency for spatial indexing)
+    'com.google.uzaygezen.core.BacktrackingQueryBuilder',
+    'com.google.uzaygezen.core.BitVector',
+    'com.google.uzaygezen.core.BitVectorFactories',
+    'com.google.uzaygezen.core.CompactHilbertCurve',
+    'com.google.uzaygezen.core.FilteredIndexRange',
+    'com.google.uzaygezen.core.Query',
+    'com.google.uzaygezen.core.SimpleRegionInspector',
+    'com.google.uzaygezen.core.ranges.LongRange',
+    'com.google.uzaygezen.core.ranges.LongRangeHome',
+    // JsonPath (Calcite optional dependency)
+    'com.jayway.jsonpath.Configuration',
+    'com.jayway.jsonpath.Configuration$ConfigurationBuilder',
+    'com.jayway.jsonpath.DocumentContext',
+    'com.jayway.jsonpath.InvalidPathException',
+    'com.jayway.jsonpath.JsonPath',
+    'com.jayway.jsonpath.Option',
+    'com.jayway.jsonpath.Predicate',
+    'com.jayway.jsonpath.spi.json.JacksonJsonProvider',
+    'com.jayway.jsonpath.spi.mapper.MappingProvider',
+    // Yahoo DataSketches (Calcite optional dependency)
+    'com.yahoo.sketches.hll.HllSketch',
+    'com.yahoo.sketches.hll.HllSketchBuilder',
+    // Netty (Arrow memory-netty internals)
+    'io.netty.buffer.PooledByteBufAllocatorL',
+    'io.netty.buffer.UnsafeDirectLittleEndian',
+    'io.netty.util.internal.PlatformDependent',
+    // Arrow C Data Interface
+    'org.apache.arrow.c.ArrowArray',
+    'org.apache.arrow.c.ArrowSchema',
+    'org.apache.arrow.c.Data',
+    // Arrow FlatBuf
+    'org.apache.arrow.flatbuf.Binary',
+    'org.apache.arrow.flatbuf.BinaryView',
+    'org.apache.arrow.flatbuf.Block',
+    'org.apache.arrow.flatbuf.BodyCompression',
+    'org.apache.arrow.flatbuf.Bool',
+    'org.apache.arrow.flatbuf.Buffer',
+    'org.apache.arrow.flatbuf.Date',
+    'org.apache.arrow.flatbuf.Decimal',
+    'org.apache.arrow.flatbuf.DictionaryBatch',
+    'org.apache.arrow.flatbuf.DictionaryEncoding',
+    'org.apache.arrow.flatbuf.Duration',
+    'org.apache.arrow.flatbuf.Field',
+    'org.apache.arrow.flatbuf.FieldNode',
+    'org.apache.arrow.flatbuf.FixedSizeBinary',
+    'org.apache.arrow.flatbuf.FixedSizeList',
+    'org.apache.arrow.flatbuf.FloatingPoint',
+    'org.apache.arrow.flatbuf.Footer',
+    'org.apache.arrow.flatbuf.Int',
+    'org.apache.arrow.flatbuf.Interval',
+    'org.apache.arrow.flatbuf.KeyValue',
+    'org.apache.arrow.flatbuf.LargeBinary',
+    'org.apache.arrow.flatbuf.LargeList',
+    'org.apache.arrow.flatbuf.LargeListView',
+    'org.apache.arrow.flatbuf.LargeUtf8',
+    'org.apache.arrow.flatbuf.List',
+    'org.apache.arrow.flatbuf.ListView',
+    'org.apache.arrow.flatbuf.Map',
+    'org.apache.arrow.flatbuf.Message',
+    'org.apache.arrow.flatbuf.Null',
+    'org.apache.arrow.flatbuf.RecordBatch',
+    'org.apache.arrow.flatbuf.RunEndEncoded',
+    'org.apache.arrow.flatbuf.Schema',
+    'org.apache.arrow.flatbuf.Struct_',
+    'org.apache.arrow.flatbuf.Time',
+    'org.apache.arrow.flatbuf.Timestamp',
+    'org.apache.arrow.flatbuf.Union',
+    'org.apache.arrow.flatbuf.Utf8',
+    'org.apache.arrow.flatbuf.Utf8View'
+)
+
+thirdPartyAudit.ignoreMissingClasses(
+    // Calcite Avatica (JDBC layer, not used by this plugin)
+    'org.apache.calcite.avatica.AvaticaConnection',
+    'org.apache.calcite.avatica.AvaticaConnection$Trojan',
+    'org.apache.calcite.avatica.AvaticaDatabaseMetaData',
+    'org.apache.calcite.avatica.AvaticaFactory',
+    'org.apache.calcite.avatica.AvaticaPreparedStatement',
+    'org.apache.calcite.avatica.AvaticaResultSet',
+    'org.apache.calcite.avatica.AvaticaSite',
+    'org.apache.calcite.avatica.AvaticaStatement',
+    'org.apache.calcite.avatica.AvaticaUtils',
+    'org.apache.calcite.avatica.BuiltInConnectionProperty',
+    'org.apache.calcite.avatica.ColumnMetaData',
+    'org.apache.calcite.avatica.ColumnMetaData$AvaticaType',
+    'org.apache.calcite.avatica.ColumnMetaData$Rep',
+    'org.apache.calcite.avatica.ColumnMetaData$StructType',
+    'org.apache.calcite.avatica.ConnectionConfig',
+    'org.apache.calcite.avatica.ConnectionConfigImpl',
+    'org.apache.calcite.avatica.ConnectionConfigImpl$PropEnv',
+    'org.apache.calcite.avatica.ConnectionPropertiesImpl',
+    'org.apache.calcite.avatica.ConnectionProperty',
+    'org.apache.calcite.avatica.ConnectionProperty$Type',
+    'org.apache.calcite.avatica.DriverVersion',
+    'org.apache.calcite.avatica.Handler',
+    'org.apache.calcite.avatica.HandlerImpl',
+    'org.apache.calcite.avatica.Helper',
+    'org.apache.calcite.avatica.InternalProperty',
+    'org.apache.calcite.avatica.Meta',
+    'org.apache.calcite.avatica.Meta$ConnectionHandle',
+    'org.apache.calcite.avatica.Meta$ConnectionProperties',
+    'org.apache.calcite.avatica.Meta$CursorFactory',
+    'org.apache.calcite.avatica.Meta$DatabaseProperty',
+    'org.apache.calcite.avatica.Meta$ExecuteBatchResult',
+    'org.apache.calcite.avatica.Meta$ExecuteResult',
+    'org.apache.calcite.avatica.Meta$Frame',
+    'org.apache.calcite.avatica.Meta$MetaResultSet',
+    'org.apache.calcite.avatica.Meta$Pat',
+    'org.apache.calcite.avatica.Meta$PrepareCallback',
+    'org.apache.calcite.avatica.Meta$Signature',
+    'org.apache.calcite.avatica.Meta$StatementHandle',
+    'org.apache.calcite.avatica.Meta$StatementType',
+    'org.apache.calcite.avatica.Meta$Style',
+    'org.apache.calcite.avatica.MetaImpl',
+    'org.apache.calcite.avatica.MetaImpl$MetaCatalog',
+    'org.apache.calcite.avatica.MetaImpl$MetaColumn',
+    'org.apache.calcite.avatica.MetaImpl$MetaFunction',
+    'org.apache.calcite.avatica.MetaImpl$MetaSchema',
+    'org.apache.calcite.avatica.MetaImpl$MetaTable',
+    'org.apache.calcite.avatica.MetaImpl$MetaTableType',
+    'org.apache.calcite.avatica.MetaImpl$MetaTypeInfo',
+    'org.apache.calcite.avatica.MetaImpl$Named',
+    'org.apache.calcite.avatica.QueryState',
+    'org.apache.calcite.avatica.SqlType',
+    'org.apache.calcite.avatica.UnregisteredDriver',
+    'org.apache.calcite.avatica.UnregisteredDriver$JdbcVersion',
+    'org.apache.calcite.avatica.remote.TypedValue',
+    'org.apache.calcite.avatica.util.AbstractCursor$Getter',
+    'org.apache.calcite.avatica.util.ArrayImpl',
+    'org.apache.calcite.avatica.util.ByteString',
+    'org.apache.calcite.avatica.util.Casing',
+    'org.apache.calcite.avatica.util.Cursor',
+    'org.apache.calcite.avatica.util.DateTimeUtils',
+    'org.apache.calcite.avatica.util.DateTimeUtils$PrecisionTime',
+    'org.apache.calcite.avatica.util.PositionedCursor',
+    'org.apache.calcite.avatica.util.Quoting',
+    'org.apache.calcite.avatica.util.Spacer',
+    'org.apache.calcite.avatica.util.Spaces',
+    'org.apache.calcite.avatica.util.TimeUnit',
+    'org.apache.calcite.avatica.util.TimeUnitRange',
+    // Calcite Linq4j (expression tree / enumerable, not used at runtime)
+    'org.apache.calcite.linq4j.AbstractEnumerable',
+    'org.apache.calcite.linq4j.AbstractQueryable',
+    'org.apache.calcite.linq4j.BaseQueryable',
+    'org.apache.calcite.linq4j.CartesianProductEnumerator',
+    'org.apache.calcite.linq4j.Enumerable',
+    'org.apache.calcite.linq4j.EnumerableDefaults',
+    'org.apache.calcite.linq4j.Enumerator',
+    'org.apache.calcite.linq4j.ExtendedEnumerable',
+    'org.apache.calcite.linq4j.JoinType',
+    'org.apache.calcite.linq4j.Linq4j',
+    'org.apache.calcite.linq4j.MemoryFactory',
+    'org.apache.calcite.linq4j.MemoryFactory$Memory',
+    'org.apache.calcite.linq4j.Nullness',
+    'org.apache.calcite.linq4j.Ord',
+    'org.apache.calcite.linq4j.OrderedQueryable',
+    'org.apache.calcite.linq4j.Queryable',
+    'org.apache.calcite.linq4j.QueryableDefaults$Replayable',
+    'org.apache.calcite.linq4j.QueryableFactory',
+    'org.apache.calcite.linq4j.QueryProvider',
+    'org.apache.calcite.linq4j.QueryProviderImpl',
+    'org.apache.calcite.linq4j.TransformedEnumerator',
+    'org.apache.calcite.linq4j.function.EqualityComparer',
+    'org.apache.calcite.linq4j.function.Function0',
+    'org.apache.calcite.linq4j.function.Function1',
+    'org.apache.calcite.linq4j.function.Function2',
+    'org.apache.calcite.linq4j.function.Functions',
+    'org.apache.calcite.linq4j.function.Hints',
+    'org.apache.calcite.linq4j.function.Parameter',
+    'org.apache.calcite.linq4j.function.Predicate1',
+    'org.apache.calcite.linq4j.function.Predicate2',
+    'org.apache.calcite.linq4j.function.SemiStrict',
+    'org.apache.calcite.linq4j.function.Strict',
+    'org.apache.calcite.linq4j.tree.BinaryExpression',
+    'org.apache.calcite.linq4j.tree.BlockBuilder',
+    'org.apache.calcite.linq4j.tree.Blocks',
+    'org.apache.calcite.linq4j.tree.BlockStatement',
+    'org.apache.calcite.linq4j.tree.CatchBlock',
+    'org.apache.calcite.linq4j.tree.ClassDeclaration',
+    'org.apache.calcite.linq4j.tree.ConstantExpression',
+    'org.apache.calcite.linq4j.tree.ConstantUntypedNull',
+    'org.apache.calcite.linq4j.tree.DeclarationStatement',
+    'org.apache.calcite.linq4j.tree.Expression',
+    'org.apache.calcite.linq4j.tree.Expressions',
+    'org.apache.calcite.linq4j.tree.Expressions$FluentList',
+    'org.apache.calcite.linq4j.tree.ExpressionType',
+    'org.apache.calcite.linq4j.tree.FieldDeclaration',
+    'org.apache.calcite.linq4j.tree.FunctionExpression',
+    'org.apache.calcite.linq4j.tree.FunctionExpression$Invokable',
+    'org.apache.calcite.linq4j.tree.GotoStatement',
+    'org.apache.calcite.linq4j.tree.IndexExpression',
+    'org.apache.calcite.linq4j.tree.MemberDeclaration',
+    'org.apache.calcite.linq4j.tree.MemberExpression',
+    'org.apache.calcite.linq4j.tree.MethodCallExpression',
+    'org.apache.calcite.linq4j.tree.MethodDeclaration',
+    'org.apache.calcite.linq4j.tree.NewArrayExpression',
+    'org.apache.calcite.linq4j.tree.NewExpression',
+    'org.apache.calcite.linq4j.tree.ParameterExpression',
+    'org.apache.calcite.linq4j.tree.Primitive',
+    'org.apache.calcite.linq4j.tree.Primitive$Flavor',
+    'org.apache.calcite.linq4j.tree.PseudoField',
+    'org.apache.calcite.linq4j.tree.Statement',
+    'org.apache.calcite.linq4j.tree.TableExpressionFactory',
+    'org.apache.calcite.linq4j.tree.Types',
+    'org.apache.calcite.linq4j.tree.Types$ArrayType',
+    'org.apache.calcite.linq4j.tree.Types$MapType',
+    'org.apache.calcite.linq4j.tree.Types$RecordField',
+    'org.apache.calcite.linq4j.tree.Types$RecordType',
+    'org.apache.calcite.linq4j.tree.UnaryExpression',
+    'org.apache.calcite.linq4j.tree.UnsignedType',
+    'org.apache.calcite.linq4j.tree.VisitorImpl',
+    // Commons Codec (Calcite optional dependency)
+    'org.apache.commons.codec.binary.Base32',
+    'org.apache.commons.codec.binary.Hex',
+    'org.apache.commons.codec.digest.DigestUtils',
+    'org.apache.commons.codec.language.Soundex',
+    // Commons DBCP2 (Calcite optional dependency for JDBC data sources)
+    'org.apache.commons.dbcp2.BasicDataSource',
+    // Commons IO
+    'org.apache.commons.io.IOUtils',
+    // Commons Lang3
+    'org.apache.commons.lang3.StringUtils',
+    'org.apache.commons.lang3.Strings',
+    'org.apache.commons.lang3.mutable.MutableBoolean',
+    // Commons Math3 (Calcite optional dependency)
+    'org.apache.commons.math3.fraction.BigFraction',
+    'org.apache.commons.math3.util.CombinatoricsUtils',
+    // Commons Text
+    'org.apache.commons.text.StringEscapeUtils',
+    'org.apache.commons.text.similarity.LevenshteinDistance',
+    // Janino compiler (Calcite optional dependency for code generation)
+    'org.codehaus.commons.compiler.CompilerFactoryFactory',
+    'org.codehaus.commons.compiler.IClassBodyEvaluator',
+    'org.codehaus.commons.compiler.ICompilerFactory',
+    'org.codehaus.commons.compiler.ISimpleCompiler',
+    'org.codehaus.commons.compiler.util.resource.ResourceFinder',
+    'org.codehaus.janino.ClassBodyEvaluator',
+    'org.codehaus.janino.JavaSourceClassLoader',
+    'org.codehaus.janino.util.ClassFile',
+    // jOOU (Calcite optional dependency for unsigned types)
+    'org.joou.UByte',
+    'org.joou.UInteger',
+    'org.joou.ULong',
+    'org.joou.UShort',
+    'org.joou.Unsigned',
+    // JTS / Proj4j (Calcite optional dependency for spatial functions)
+    'org.locationtech.jts.algorithm.InteriorPoint',
+    'org.locationtech.jts.geom.util.GeometryFixer',
+    'org.locationtech.jts.io.geojson.GeoJsonReader',
+    'org.locationtech.jts.io.geojson.GeoJsonWriter',
+    'org.locationtech.jts.operation.buffer.OffsetCurve',
+    'org.locationtech.jts.triangulate.polygon.ConstrainedDelaunayTriangulator',
+    'org.locationtech.jts.triangulate.tri.Tri',
+    'org.locationtech.proj4j.CRSFactory',
+    'org.locationtech.proj4j.CoordinateReferenceSystem',
+    'org.locationtech.proj4j.CoordinateTransform',
+    'org.locationtech.proj4j.CoordinateTransformFactory',
+    'org.locationtech.proj4j.ProjCoordinate',
+    'org.locationtech.proj4j.proj.Projection',
+    // Pentaho Aggdes (Calcite optional dependency for aggregate designer)
+    'org.pentaho.aggdes.algorithm.Algorithm',
+    'org.pentaho.aggdes.algorithm.Algorithm$ParameterEnum',
+    'org.pentaho.aggdes.algorithm.Result',
+    'org.pentaho.aggdes.model.Aggregate',
+    'org.pentaho.aggdes.model.Attribute',
+    'org.pentaho.aggdes.model.Dialect',
+    'org.pentaho.aggdes.model.Schema',
+    'org.pentaho.aggdes.model.StatisticsProvider',
+    'org.pentaho.aggdes.model.Table'
+)
+
+thirdPartyAudit.ignoreViolations(
+    // Arrow off-heap memory uses sun.misc.Unsafe
+    'org.apache.arrow.memory.util.MemoryUtil',
+    'org.apache.arrow.memory.util.MemoryUtil$1',
+    // velox4j shaded Guava uses sun.misc.Unsafe for atomics and hashing
+    'org.boostscale.velox4j.shaded.com.google.common.cache.Striped64',
+    'org.boostscale.velox4j.shaded.com.google.common.cache.Striped64$1',
+    'org.boostscale.velox4j.shaded.com.google.common.cache.Striped64$Cell',
+    'org.boostscale.velox4j.shaded.com.google.common.hash.LittleEndianByteArray$UnsafeByteArray',
+    'org.boostscale.velox4j.shaded.com.google.common.hash.LittleEndianByteArray$UnsafeByteArray$1',
+    'org.boostscale.velox4j.shaded.com.google.common.hash.LittleEndianByteArray$UnsafeByteArray$2',
+    'org.boostscale.velox4j.shaded.com.google.common.hash.Striped64',
+    'org.boostscale.velox4j.shaded.com.google.common.hash.Striped64$1',
+    'org.boostscale.velox4j.shaded.com.google.common.hash.Striped64$Cell',
+    'org.boostscale.velox4j.shaded.com.google.common.primitives.UnsignedBytes$LexicographicalComparatorHolder$UnsafeComparator',
+    'org.boostscale.velox4j.shaded.com.google.common.primitives.UnsignedBytes$LexicographicalComparatorHolder$UnsafeComparator$1',
+    'org.boostscale.velox4j.shaded.com.google.common.util.concurrent.AbstractFuture$UnsafeAtomicHelper',
+    'org.boostscale.velox4j.shaded.com.google.common.util.concurrent.AbstractFuture$UnsafeAtomicHelper$1'
+)
