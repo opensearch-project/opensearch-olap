@@ -256,6 +256,125 @@ On platforms without Velox native library support (e.g. macOS/aarch64), the plug
 
 All queries will fall back to the default OpenSearch execution engine.
 
+## Manual Testing
+
+### Prerequisites
+
+- OpenSearch 3.6.0-SNAPSHOT built locally (e.g. at `../OpenSearch/build/distribution/local/opensearch-3.6.0-SNAPSHOT`)
+- SQL plugin installed
+- OLAP plugin built and installed (see [Building](#building) and [Installation](#installation))
+
+### 1. Start OpenSearch
+
+```bash
+cd ../OpenSearch/build/distribution/local/opensearch-3.6.0-SNAPSHOT
+bin/opensearch -d -p /tmp/opensearch.pid
+```
+
+Wait for startup and verify Velox initialized:
+
+```bash
+# Wait until OpenSearch is ready
+curl -s http://localhost:9200
+
+# Check Velox engine status in logs
+grep "Velox engine" logs/opensearch.log | tail -1
+# Expected: Velox engine initialized successfully
+```
+
+### 2. Create test index and insert data
+
+```bash
+# Create index with typed mappings
+curl -s -X PUT "http://localhost:9200/test_olap" \
+  -H "Content-Type: application/json" \
+  -d '{
+  "mappings": {
+    "properties": {
+      "name": {"type": "keyword"},
+      "age": {"type": "integer"},
+      "city": {"type": "keyword"},
+      "salary": {"type": "double"}
+    }
+  }
+}'
+
+# Insert sample data
+curl -s -X POST "http://localhost:9200/test_olap/_doc" -H "Content-Type: application/json" -d '{"name":"Alice","age":35,"city":"Seattle","salary":120000}'
+curl -s -X POST "http://localhost:9200/test_olap/_doc" -H "Content-Type: application/json" -d '{"name":"Bob","age":28,"city":"Portland","salary":95000}'
+curl -s -X POST "http://localhost:9200/test_olap/_doc" -H "Content-Type: application/json" -d '{"name":"Charlie","age":42,"city":"Seattle","salary":150000}'
+curl -s -X POST "http://localhost:9200/test_olap/_doc" -H "Content-Type: application/json" -d '{"name":"Diana","age":31,"city":"Denver","salary":110000}'
+curl -s -X POST "http://localhost:9200/test_olap/_doc" -H "Content-Type: application/json" -d '{"name":"Eve","age":26,"city":"Portland","salary":88000}'
+
+# Verify data
+curl -s "http://localhost:9200/test_olap/_count"
+# Expected: {"count":5, ...}
+```
+
+### 3. Run PPL queries through Velox
+
+```bash
+# Filter + projection
+curl -s -X POST "http://localhost:9200/_plugins/_ppl" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "source=test_olap | where age > 30 | fields name, age, salary"}'
+
+# SQL query (same delegation path)
+curl -s -X POST "http://localhost:9200/_plugins/_sql" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "SELECT name, age, salary FROM test_olap WHERE age > 30"}'
+```
+
+### 4. Verify OLAP plugin handled the query
+
+Check logs for the Velox execution path:
+
+```bash
+grep -E "Routing query to extension|Executing query.*Velox|Executing fragment|Dispatching stage|Cannot vectorize" logs/opensearch.log | tail -10
+```
+
+Expected log sequence when query is handled by Velox:
+```
+[o.o.s.e.DelegatingExecutionEngine] Routing query to extension engine : VectorizedEngineExtension
+[o.o.p.o.e.VeloxExecutionEngine]    Executing query <id> via Velox engine
+[o.o.p.o.s.QueryScheduler]          Dispatching stage <id> with 1 tasks
+[o.o.p.o.t.TransportExecuteFragmentAction] Executing fragment 0 for query <id> on 1 shards
+```
+
+If the query falls back to the default engine, you will see:
+```
+[o.o.p.o.e.VectorizedEngineExtension] Cannot vectorize plan: unsupported node [<class>] in <plan>
+```
+
+If no OLAP plugin log appears at all, `canVectorize()` returned `false` because Velox is unavailable — check for `Velox engine unavailable` at startup.
+
+### 5. Enable debug logging (optional)
+
+```bash
+curl -s -X PUT "http://localhost:9200/_cluster/settings" \
+  -H "Content-Type: application/json" \
+  -d '{"transient": {"logger.org.opensearch.plugin.olap": "DEBUG"}}'
+```
+
+### 6. Reinstall after code changes
+
+```bash
+# Stop OpenSearch
+kill $(cat /tmp/opensearch.pid)
+
+# Rebuild
+cd /path/to/opensearch-olap
+./gradlew assemble
+
+# Reinstall
+cd ../OpenSearch/build/distribution/local/opensearch-3.6.0-SNAPSHOT
+bin/opensearch-plugin remove opensearch-olap
+bin/opensearch-plugin install file:///absolute/path/to/opensearch-olap/build/distributions/opensearch-olap-3.6.0-SNAPSHOT.zip
+
+# Restart
+bin/opensearch -d -p /tmp/opensearch.pid
+```
+
 ## SQL Plugin Changes Required
 
 The following changes are needed in the SQL plugin (`opensearch-sql`) for the OLAP plugin to work:
