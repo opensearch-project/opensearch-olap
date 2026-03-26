@@ -13,6 +13,7 @@ import org.opensearch.common.inject.Inject;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.indices.IndicesService;
+import org.opensearch.plugin.olap.engine.VeloxExecutionEngine;
 import org.opensearch.plugin.olap.execution.ExternalStreamBridge;
 import org.opensearch.plugin.olap.execution.LuceneArrowReader;
 import org.opensearch.plugin.olap.execution.VeloxExecutor;
@@ -55,11 +56,14 @@ public class TransportExecuteFragmentAction
       ActionFilters actionFilters,
       IndicesService indicesService,
       ThreadPool threadPool,
-      VeloxLifecycleService veloxLifecycle) {
+      VeloxLifecycleService veloxLifecycle,
+      VeloxExecutionEngine veloxExecutionEngine) {
     super(ExecuteFragmentAction.NAME, transportService, actionFilters, ExecuteFragmentRequest::new);
     this.indicesService = indicesService;
     this.threadPool = threadPool;
     this.veloxLifecycle = veloxLifecycle;
+    // Wire TransportService into the execution engine (not available during createComponents)
+    veloxExecutionEngine.setTransportService(transportService);
   }
 
   @Override
@@ -117,9 +121,9 @@ public class TransportExecuteFragmentAction
                     reader.readShardIntoStream(shardId, request.getSourceIndex(), bridge);
                   }
                   bridge.noMoreInput();
-                } catch (Exception e) {
+                } catch (Throwable e) {
                   logger.error("Error feeding data for query {}", queryId, e);
-                  bridge.abort(e);
+                  bridge.abort(e instanceof Exception ? (Exception) e : new RuntimeException(e));
                 }
               },
               "olap-feeder-" + queryId + "-" + request.getFragmentId());
@@ -127,7 +131,9 @@ public class TransportExecuteFragmentAction
       feederThread.start();
 
       // Step 4: Execute the Velox plan, reading from the ExternalStream
-      byte[] resultData = executor.execute(request.getPlanFragmentJson(), bridge.getConnectorId());
+      byte[] resultData =
+          executor.execute(
+              request.getPlanFragmentJson(), bridge.getConnectorId(), bridge.getQueue());
 
       // Wait for feeder to finish
       feederThread.join(30_000);

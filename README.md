@@ -174,12 +174,12 @@ src/main/java/org/opensearch/plugin/olap/
 
 | Calcite RelNode | Velox PlanNode |
 |----------------|---------------|
-| `LogicalTableScan` | `TableScanNode` + `ExternalStreamTableHandle` |
+| `TableScan` (`LogicalTableScan`, `CalciteLogicalIndexScan`) | `TableScanNode` + `ExternalStreamTableHandle` |
 | `LogicalFilter` | `FilterNode` |
 | `LogicalProject` | `ProjectNode` |
 | `LogicalAggregate` | `AggregationNode` (SINGLE / PARTIAL+FINAL) |
 | `LogicalJoin` | `HashJoinNode` (equi-join key extraction) |
-| `LogicalSort` | `OrderByNode` + `LimitNode` |
+| `Sort` (`LogicalSort`, `LogicalSystemLimit`) | `OrderByNode` + `LimitNode` |
 
 ### Expression Conversion (RexNode → TypedExpr)
 
@@ -187,7 +187,7 @@ src/main/java/org/opensearch/plugin/olap/
 |-------------------|-----------------|
 | `RexInputRef` | `FieldAccessTypedExpr` |
 | `RexLiteral` | `ConstantTypedExpr` (BooleanValue, IntegerValue, BigIntValue, DoubleValue, VarCharValue) |
-| `RexCall` (=, !=, <, >, AND, OR, +, -, *, /) | `CallTypedExpr` (eq, neq, lt, gt, and, or, plus, minus, multiply, divide) |
+| `RexCall` (=, !=, <, >, AND, OR, +, -, *, /) | `CallTypedExpr` (equalto, notequalto, lessthan, greaterthan, and, or, plus, minus, multiply, divide) |
 | `CAST` | `CastTypedExpr` |
 | `IS NULL` / `IS NOT NULL` | `CallTypedExpr` (is_null / not(is_null)) |
 | `IN` | Chain of eq + or |
@@ -212,7 +212,8 @@ COUNT, SUM, AVG, MIN, MAX (with DISTINCT support)
 | OpenSearch | 3.6.0 | compileOnly | Host platform |
 | opensearch-sql | 3.6.0.0 | compileOnly + runtime (extended plugin) | SQL/PPL parsing, `ExecutionEngine` interface, Calcite |
 | Apache Calcite | 1.41.0 | compileOnly | Plan conversion — provided by SQL plugin at runtime |
-| Apache Arrow | 18.1.0 | implementation | Columnar in-memory format |
+| Apache Arrow | 18.1.0 | implementation | `arrow-vector`, `arrow-memory-core`, `arrow-c-data`, `arrow-format` + `arrow-memory-unsafe` (runtime) |
+| flatbuffers-java | 24.3.25 | implementation | Required by `arrow-c-data` (not pulled transitively) |
 | velox4j | 0.1.0 | compileOnly + repackaged runtime | JNI bridge to Velox C++ engine |
 
 ### Jar Hell Avoidance
@@ -222,6 +223,7 @@ The OLAP plugin extends the SQL plugin's classloader (`extendedPlugins = ['opens
 - **Calcite** is `compileOnly` — already bundled by the SQL plugin
 - **velox4j** is repackaged at build time (`repackageVelox4j` task) to strip `javax.annotation` and `org.slf4j` classes that conflict with the SQL plugin's `jsr305` jar
 - **jsr305** is excluded globally via `configurations.all`
+- **Arrow memory**: Uses `arrow-memory-unsafe` instead of `arrow-memory-netty` — OpenSearch's Netty is in the system classloader and invisible to plugin classloaders
 
 ## Building
 

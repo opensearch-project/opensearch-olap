@@ -10,12 +10,12 @@ import java.util.List;
 import org.apache.calcite.rel.RelFieldCollation;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.core.AggregateCall;
+import org.apache.calcite.rel.core.Sort;
+import org.apache.calcite.rel.core.TableScan;
 import org.apache.calcite.rel.logical.LogicalAggregate;
 import org.apache.calcite.rel.logical.LogicalFilter;
 import org.apache.calcite.rel.logical.LogicalJoin;
 import org.apache.calcite.rel.logical.LogicalProject;
-import org.apache.calcite.rel.logical.LogicalSort;
-import org.apache.calcite.rel.logical.LogicalTableScan;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rel.type.RelDataTypeField;
 import org.apache.calcite.rex.RexInputRef;
@@ -63,7 +63,7 @@ import org.boostscale.velox4j.type.Type;
  */
 public class VeloxPlanConverter {
 
-  private static final String EXTERNAL_STREAM_CONNECTOR_ID = "external_stream";
+  private static final String EXTERNAL_STREAM_CONNECTOR_ID = "connector-external-stream";
 
   private final PlanIdGenerator idGenerator;
 
@@ -78,8 +78,8 @@ public class VeloxPlanConverter {
   }
 
   private PlanNode visitNode(RelNode relNode) {
-    if (relNode instanceof LogicalTableScan) {
-      return visitTableScan((LogicalTableScan) relNode);
+    if (relNode instanceof TableScan) {
+      return visitTableScan((TableScan) relNode);
     } else if (relNode instanceof LogicalFilter) {
       return visitFilter((LogicalFilter) relNode);
     } else if (relNode instanceof LogicalProject) {
@@ -88,14 +88,15 @@ public class VeloxPlanConverter {
       return visitAggregate((LogicalAggregate) relNode);
     } else if (relNode instanceof LogicalJoin) {
       return visitJoin((LogicalJoin) relNode);
-    } else if (relNode instanceof LogicalSort) {
-      return visitSort((LogicalSort) relNode);
+    } else if (relNode instanceof Sort) {
+      // Handles both LogicalSort and LogicalSystemLimit (system-imposed row limit)
+      return visitSort((Sort) relNode);
     }
     throw new UnsupportedOperationException(
         "Unsupported RelNode type: " + relNode.getClass().getSimpleName());
   }
 
-  private PlanNode visitTableScan(LogicalTableScan scan) {
+  private PlanNode visitTableScan(TableScan scan) {
     String nodeId = idGenerator.next();
     RelDataType rowType = scan.getRowType();
     RowType outputType = VeloxTypeConverter.toVeloxRowType(rowType);
@@ -218,7 +219,7 @@ public class VeloxPlanConverter {
         );
   }
 
-  private PlanNode visitSort(LogicalSort sort) {
+  private PlanNode visitSort(Sort sort) {
     PlanNode source = visitNode(sort.getInput());
     RelDataType inputRowType = sort.getInput().getRowType();
 

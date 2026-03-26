@@ -54,7 +54,7 @@ public class ExternalStreamBridge implements AutoCloseable {
   public void open() {
     ExternalStreams streams = session.externalStreamOps();
     this.queue = streams.newBlockingQueue();
-    this.connectorId = "external_stream";
+    this.connectorId = "connector-external-stream";
     logger.debug("Opened ExternalStreamBridge with queue id={}", queue.id());
   }
 
