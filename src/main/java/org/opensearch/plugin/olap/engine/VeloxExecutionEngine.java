@@ -15,7 +15,7 @@ import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowStreamReader;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.calcite.rel.RelNode;
-import org.apache.calcite.rel.logical.LogicalTableScan;
+import org.apache.calcite.rel.core.TableScan;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rel.type.RelDataTypeField;
 import org.apache.calcite.sql.type.SqlTypeName;
@@ -61,7 +61,7 @@ public class VeloxExecutionEngine {
   private final PlanFragmenter planFragmenter;
   private final QueryScheduler queryScheduler;
   private final VeloxLifecycleService veloxLifecycle;
-  private final TransportService transportService;
+  private volatile TransportService transportService;
 
   public VeloxExecutionEngine(
       VeloxLifecycleService veloxLifecycle,
@@ -110,13 +110,19 @@ public class VeloxExecutionEngine {
     }
   }
 
+  public void setTransportService(TransportService transportService) {
+    this.transportService = transportService;
+  }
+
   public boolean isAvailable() {
     return veloxLifecycle.isEnabled();
   }
 
   private String extractSourceIndex(RelNode relNode) {
-    if (relNode instanceof LogicalTableScan) {
-      return String.join(".", ((LogicalTableScan) relNode).getTable().getQualifiedName());
+    if (relNode instanceof TableScan) {
+      List<String> names = ((TableScan) relNode).getTable().getQualifiedName();
+      // Qualified name is ["catalog", "index"] or ["index"] — use the last element
+      return names.get(names.size() - 1);
     }
     for (RelNode input : relNode.getInputs()) {
       String index = extractSourceIndex(input);

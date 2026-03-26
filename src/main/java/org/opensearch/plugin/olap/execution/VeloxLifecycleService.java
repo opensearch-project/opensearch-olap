@@ -75,18 +75,28 @@ public class VeloxLifecycleService implements Closeable {
         memoryLimit / (1024 * 1024),
         numThreads);
 
-    // Configure before initialization
-    Velox4j.configure("max_memory", String.valueOf(memoryLimit));
-    Velox4j.configure("num_threads", String.valueOf(numThreads));
+    // OpenSearch uses isolated classloaders for plugins. The thread context
+    // classloader may not see the velox4j-repackaged jar that contains the
+    // native libraries under velox4j-lib/. Temporarily switch to the classloader
+    // that loaded Velox4j so the native library discovery works correctly.
+    ClassLoader originalCL = Thread.currentThread().getContextClassLoader();
+    Thread.currentThread().setContextClassLoader(Velox4j.class.getClassLoader());
+    try {
+      // Configure before initialization
+      Velox4j.configure("max_memory", String.valueOf(memoryLimit));
+      Velox4j.configure("num_threads", String.valueOf(numThreads));
 
-    // Initialize the native engine (loads JNI libraries, registers functions)
-    Velox4j.initialize();
+      // Initialize the native engine (loads JNI libraries, registers functions)
+      Velox4j.initialize();
 
-    // Create a shared memory manager
-    this.memoryManager = Velox4j.newMemoryManager(AllocationListener.NOOP);
+      // Create a shared memory manager
+      this.memoryManager = Velox4j.newMemoryManager(AllocationListener.NOOP);
 
-    // Create a session for query execution
-    this.session = Velox4j.newSession(memoryManager);
+      // Create a session for query execution
+      this.session = Velox4j.newSession(memoryManager);
+    } finally {
+      Thread.currentThread().setContextClassLoader(originalCL);
+    }
 
     this.initialized = true;
     logger.info("Velox engine initialized successfully");

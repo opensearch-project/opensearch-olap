@@ -8,8 +8,8 @@ import org.opensearch.test.OpenSearchTestCase;
 
 public class OlapPluginTests extends OpenSearchTestCase {
 
-    public void testPluginInstantiation() {
-        OlapPlugin plugin = new OlapPlugin();
-        assertNotNull(plugin);
-    }
+  public void testPluginInstantiation() {
+    OlapPlugin plugin = new OlapPlugin();
+    assertNotNull(plugin);
+  }
 }

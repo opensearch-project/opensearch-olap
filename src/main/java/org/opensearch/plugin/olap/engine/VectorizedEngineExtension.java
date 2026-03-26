@@ -17,9 +17,11 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.sql.calcite.CalcitePlanContext;
 import org.opensearch.sql.calcite.plan.rel.LogicalSystemLimit;
+import org.opensearch.sql.calcite.plan.rel.OpenSearchTableScan;
 import org.opensearch.sql.common.response.ResponseListener;
 import org.opensearch.sql.executor.ExecutionContext;
 import org.opensearch.sql.executor.ExecutionEngine;
+import org.opensearch.sql.opensearch.storage.scan.CalciteLogicalIndexScan;
 import org.opensearch.sql.planner.physical.PhysicalPlan;
 
 /**
@@ -40,6 +42,8 @@ public class VectorizedEngineExtension implements ExecutionEngine {
 
   static {
     SUPPORTED_REL_NODES.add(LogicalTableScan.class);
+    SUPPORTED_REL_NODES.add(OpenSearchTableScan.class);
+    SUPPORTED_REL_NODES.add(CalciteLogicalIndexScan.class);
     SUPPORTED_REL_NODES.add(LogicalFilter.class);
     SUPPORTED_REL_NODES.add(LogicalProject.class);
     SUPPORTED_REL_NODES.add(LogicalAggregate.class);
@@ -61,11 +65,13 @@ public class VectorizedEngineExtension implements ExecutionEngine {
     if (veloxEngine == null || !veloxEngine.isAvailable()) {
       return false;
     }
-    boolean supported = checkSupported(plan);
-    if (!supported) {
-      logger.info("Cannot vectorize plan {}", plan.getDigest());
+    String unsupportedNode = findUnsupportedNode(plan);
+    if (unsupportedNode != null) {
+      logger.info(
+          "Cannot vectorize plan: unsupported node [{}] in {}", unsupportedNode, plan.getDigest());
+      return false;
     }
-    return supported;
+    return true;
   }
 
   @Override
@@ -106,16 +112,20 @@ public class VectorizedEngineExtension implements ExecutionEngine {
             "Vectorized engine extension does not support PhysicalPlan explain"));
   }
 
-  /** Recursively checks if all RelNode operators in the plan tree are supported by Velox. */
-  private boolean checkSupported(RelNode node) {
+  /**
+   * Recursively finds the first unsupported RelNode in the plan tree. Returns the class name of the
+   * unsupported node, or null if all nodes are supported.
+   */
+  private String findUnsupportedNode(RelNode node) {
     if (!SUPPORTED_REL_NODES.contains(node.getClass())) {
-      return false;
+      return node.getClass().getName();
     }
     for (RelNode input : node.getInputs()) {
-      if (!checkSupported(input)) {
-        return false;
+      String unsupported = findUnsupportedNode(input);
+      if (unsupported != null) {
+        return unsupported;
       }
     }
-    return true;
+    return null;
   }
 }

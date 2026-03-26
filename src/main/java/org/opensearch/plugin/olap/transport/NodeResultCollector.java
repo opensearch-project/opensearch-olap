@@ -11,6 +11,10 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.boostscale.velox4j.config.Config;
+import org.boostscale.velox4j.config.ConnectorConfig;
+import org.boostscale.velox4j.query.Query;
+import org.boostscale.velox4j.serde.Serde;
 import org.opensearch.plugin.olap.common.QueryId;
 import org.opensearch.plugin.olap.scheduler.QueryExecution;
 import org.opensearch.plugin.olap.scheduler.QueryScheduler;
@@ -121,9 +125,8 @@ public class NodeResultCollector {
   }
 
   private String serializePlanFragment(TaskDescriptor task) {
-    // Serialize the PlanNode tree to JSON for transmission.
-    // velox4j PlanNode extends ISerializable which supports JSON serialization.
-    // TODO: Use velox4j's Jackson ObjectMapper for serialization
-    return "{}";
+    Query query =
+        new Query(task.getFragment().getPlanRoot(), Config.empty(), ConnectorConfig.empty());
+    return Serde.toJson(query);
   }
 }

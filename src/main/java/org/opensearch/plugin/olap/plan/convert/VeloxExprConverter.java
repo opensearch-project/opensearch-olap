@@ -40,13 +40,13 @@ public class VeloxExprConverter {
   private static final Map<SqlKind, String> FUNCTION_MAP = new HashMap<>();
 
   static {
-    // Comparison operators
-    FUNCTION_MAP.put(SqlKind.EQUALS, "eq");
-    FUNCTION_MAP.put(SqlKind.NOT_EQUALS, "neq");
-    FUNCTION_MAP.put(SqlKind.GREATER_THAN, "gt");
-    FUNCTION_MAP.put(SqlKind.GREATER_THAN_OR_EQUAL, "gte");
-    FUNCTION_MAP.put(SqlKind.LESS_THAN, "lt");
-    FUNCTION_MAP.put(SqlKind.LESS_THAN_OR_EQUAL, "lte");
+    // Comparison operators (Velox uses Presto-style full names)
+    FUNCTION_MAP.put(SqlKind.EQUALS, "equalto");
+    FUNCTION_MAP.put(SqlKind.NOT_EQUALS, "notequalto");
+    FUNCTION_MAP.put(SqlKind.GREATER_THAN, "greaterthan");
+    FUNCTION_MAP.put(SqlKind.GREATER_THAN_OR_EQUAL, "greaterthanorequal");
+    FUNCTION_MAP.put(SqlKind.LESS_THAN, "lessthan");
+    FUNCTION_MAP.put(SqlKind.LESS_THAN_OR_EQUAL, "lessthanorequal");
 
     // Logical operators
     FUNCTION_MAP.put(SqlKind.AND, "and");
@@ -94,9 +94,31 @@ public class VeloxExprConverter {
   }
 
   private TypedExpr convertLiteral(RexLiteral literal) {
-    Type veloxType = VeloxTypeConverter.toVeloxType(literal.getType());
     Variant variant = toVariant(literal);
+    // Derive the type from the variant to ensure consistency (e.g., DECIMAL(30)
+    // produces IntegerValue, so type must be IntegerType, not DoubleType)
+    Type veloxType =
+        (variant != null)
+            ? variantToType(variant)
+            : VeloxTypeConverter.toVeloxType(literal.getType());
     return ConstantTypedExpr.create(veloxType, variant);
+  }
+
+  private Type variantToType(Variant variant) {
+    if (variant instanceof IntegerValue) {
+      return new org.boostscale.velox4j.type.IntegerType();
+    } else if (variant instanceof BigIntValue) {
+      return new org.boostscale.velox4j.type.BigIntType();
+    } else if (variant instanceof DoubleValue) {
+      return new org.boostscale.velox4j.type.DoubleType();
+    } else if (variant instanceof RealValue) {
+      return new org.boostscale.velox4j.type.RealType();
+    } else if (variant instanceof BooleanValue) {
+      return new org.boostscale.velox4j.type.BooleanType();
+    } else if (variant instanceof VarCharValue) {
+      return new org.boostscale.velox4j.type.VarCharType();
+    }
+    throw new UnsupportedOperationException("Unknown variant type: " + variant.getClass());
   }
 
   private Variant toVariant(RexLiteral literal) {
@@ -120,6 +142,17 @@ public class VeloxExprConverter {
         return new DoubleValue(literal.getValueAs(Double.class));
       case DECIMAL:
         BigDecimal bd = literal.getValueAs(BigDecimal.class);
+        // Calcite represents integer literals (e.g. 30) as DECIMAL with scale 0.
+        // Velox requires exact type match in expressions, so produce an integer
+        // variant when the value fits, to avoid type mismatch with integer columns.
+        if (bd.scale() <= 0
+            && bd.compareTo(BigDecimal.valueOf(Integer.MAX_VALUE)) <= 0
+            && bd.compareTo(BigDecimal.valueOf(Integer.MIN_VALUE)) >= 0) {
+          return new IntegerValue(bd.intValue());
+        }
+        if (bd.scale() <= 0) {
+          return new BigIntValue(bd.longValue());
+        }
         return new DoubleValue(bd.doubleValue());
       case CHAR:
       case VARCHAR:

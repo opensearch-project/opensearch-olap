@@ -132,6 +132,7 @@ dependencies {
     // Exclude transitive deps - they're provided at runtime by OpenSearch/SQL plugin
     compileOnly("org.opensearch.query:unified-query-core:${sql_plugin_version}") { transitive = false }
     compileOnly("org.opensearch.query:unified-query-common:${sql_plugin_version}") { transitive = false }
+    compileOnly("org.opensearch.query:unified-query-opensearch:${sql_plugin_version}") { transitive = false }
 
     // Apache Calcite for plan conversion (provided at runtime by the SQL plugin)
     compileOnly "org.apache.calcite:calcite-core:${calcite_version}"
@@ -139,7 +140,14 @@ dependencies {
     // Apache Arrow for columnar in-memory data
     implementation "org.apache.arrow:arrow-vector:${arrow_version}"
     implementation "org.apache.arrow:arrow-memory-core:${arrow_version}"
-    runtimeOnly "org.apache.arrow:arrow-memory-netty:${arrow_version}"
+    implementation "org.apache.arrow:arrow-c-data:${arrow_version}"
+    implementation "org.apache.arrow:arrow-format:${arrow_version}"
+    implementation "com.google.flatbuffers:flatbuffers-java:24.3.25"
+    // Use arrow-memory-unsafe instead of arrow-memory-netty. OpenSearch loads Netty in the
+    // system classloader, but plugin classloaders are isolated and cannot see those classes.
+    // arrow-memory-netty triggers a fatal NoClassDefFoundError (PooledByteBufAllocatorL) at
+    // runtime. arrow-memory-unsafe uses sun.misc.Unsafe directly with no external dependencies.
+    runtimeOnly "org.apache.arrow:arrow-memory-unsafe:${arrow_version}"
 
     // velox4j for Velox execution engine JNI bridge (repackaged to remove javax.annotation/slf4j)
     compileOnly "org.boostscale:velox4j:${velox4j_version}"
