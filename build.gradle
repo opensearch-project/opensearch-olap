@@ -21,6 +21,10 @@ buildscript {
     }
 }
 
+plugins {
+    id 'com.diffplug.spotless' version '8.1.0'
+}
+
 apply plugin: 'java'
 apply plugin: 'opensearch.opensearchplugin'
 apply plugin: 'opensearch.pluginzip'
@@ -49,6 +53,23 @@ repositories {
 java {
     sourceCompatibility = JavaVersion.VERSION_21
     targetCompatibility = JavaVersion.VERSION_21
+}
+
+spotless {
+    java {
+        target fileTree('.') {
+            include '**/*.java'
+            exclude '**/build/**', '**/build-*/**', '**/gen/**'
+        }
+        importOrder()
+        licenseHeader("/*\n" +
+                " * SPDX-License-Identifier: Apache-2.0\n" +
+                " */\n\n")
+        removeUnusedImports()
+        trimTrailingWhitespace()
+        endWithNewline()
+        googleJavaFormat('1.32.0').reflowLongStrings().groupArtifact('com.google.googlejavaformat:google-java-format')
+    }
 }
 
 configurations.all {

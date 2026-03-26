@@ -1,10 +1,10 @@
 /*
  * SPDX-License-Identifier: Apache-2.0
  */
+
 package org.opensearch.plugin.olap.transport;
 
 import java.io.IOException;
-
 import org.opensearch.core.action.ActionResponse;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
@@ -14,92 +14,92 @@ import org.opensearch.core.xcontent.XContentBuilder;
 /**
  * Response from executing a Velox plan fragment on a data node.
  *
- * <p>Contains the execution status, row count, and serialized result data.
- * For leaf fragments, the results are Arrow-serialized batches.
- * For the root fragment, the results are the final query output.
+ * <p>Contains the execution status, row count, and serialized result data. For leaf fragments, the
+ * results are Arrow-serialized batches. For the root fragment, the results are the final query
+ * output.
  */
 public class ExecuteFragmentResponse extends ActionResponse implements ToXContentObject {
 
-    public enum Status {
-        SUCCESS,
-        FAILURE
+  public enum Status {
+    SUCCESS,
+    FAILURE
+  }
+
+  private Status status;
+  private long rowCount;
+  private byte[] resultData;
+  private String errorMessage;
+
+  public ExecuteFragmentResponse() {}
+
+  public ExecuteFragmentResponse(StreamInput in) throws IOException {
+    super(in);
+    this.status = in.readEnum(Status.class);
+    this.rowCount = in.readVLong();
+    if (in.readBoolean()) {
+      this.resultData = in.readByteArray();
+    } else {
+      this.resultData = null;
     }
+    this.errorMessage = in.readOptionalString();
+  }
 
-    private Status status;
-    private long rowCount;
-    private byte[] resultData;
-    private String errorMessage;
+  public ExecuteFragmentResponse(Status status, long rowCount, byte[] resultData) {
+    this.status = status;
+    this.rowCount = rowCount;
+    this.resultData = resultData;
+  }
 
-    public ExecuteFragmentResponse() {}
+  public static ExecuteFragmentResponse success(long rowCount, byte[] resultData) {
+    return new ExecuteFragmentResponse(Status.SUCCESS, rowCount, resultData);
+  }
 
-    public ExecuteFragmentResponse(StreamInput in) throws IOException {
-        super(in);
-        this.status = in.readEnum(Status.class);
-        this.rowCount = in.readVLong();
-        if (in.readBoolean()) {
-            this.resultData = in.readByteArray();
-        } else {
-            this.resultData = null;
-        }
-        this.errorMessage = in.readOptionalString();
+  public static ExecuteFragmentResponse failure(String errorMessage) {
+    ExecuteFragmentResponse response = new ExecuteFragmentResponse();
+    response.status = Status.FAILURE;
+    response.rowCount = 0;
+    response.errorMessage = errorMessage;
+    return response;
+  }
+
+  @Override
+  public void writeTo(StreamOutput out) throws IOException {
+    out.writeEnum(status);
+    out.writeVLong(rowCount);
+    if (resultData != null) {
+      out.writeBoolean(true);
+      out.writeByteArray(resultData);
+    } else {
+      out.writeBoolean(false);
     }
+    out.writeOptionalString(errorMessage);
+  }
 
-    public ExecuteFragmentResponse(Status status, long rowCount, byte[] resultData) {
-        this.status = status;
-        this.rowCount = rowCount;
-        this.resultData = resultData;
+  @Override
+  public XContentBuilder toXContent(XContentBuilder builder, Params params) throws IOException {
+    builder.startObject();
+    builder.field("status", status.name());
+    builder.field("row_count", rowCount);
+    if (errorMessage != null) {
+      builder.field("error", errorMessage);
     }
+    builder.endObject();
+    return builder;
+  }
 
-    public static ExecuteFragmentResponse success(long rowCount, byte[] resultData) {
-        return new ExecuteFragmentResponse(Status.SUCCESS, rowCount, resultData);
-    }
+  public Status getStatus() {
+    return status;
+  }
 
-    public static ExecuteFragmentResponse failure(String errorMessage) {
-        ExecuteFragmentResponse response = new ExecuteFragmentResponse();
-        response.status = Status.FAILURE;
-        response.rowCount = 0;
-        response.errorMessage = errorMessage;
-        return response;
-    }
+  public long getRowCount() {
+    return rowCount;
+  }
 
-    @Override
-    public void writeTo(StreamOutput out) throws IOException {
-        out.writeEnum(status);
-        out.writeVLong(rowCount);
-        if (resultData != null) {
-            out.writeBoolean(true);
-            out.writeByteArray(resultData);
-        } else {
-            out.writeBoolean(false);
-        }
-        out.writeOptionalString(errorMessage);
-    }
+  public byte[] getResultData() {
+    return resultData;
+  }
 
-    @Override
-    public XContentBuilder toXContent(XContentBuilder builder, Params params) throws IOException {
-        builder.startObject();
-        builder.field("status", status.name());
-        builder.field("row_count", rowCount);
-        if (errorMessage != null) {
-            builder.field("error", errorMessage);
-        }
-        builder.endObject();
-        return builder;
-    }
-
-    public Status getStatus() {
-        return status;
-    }
-
-    public long getRowCount() {
-        return rowCount;
-    }
-
-    public byte[] getResultData() {
-        return resultData;
-    }
-
-    public String getErrorMessage() {
-        return errorMessage;
-    }
+  public String getErrorMessage() {
+    return errorMessage;
+  }
 }

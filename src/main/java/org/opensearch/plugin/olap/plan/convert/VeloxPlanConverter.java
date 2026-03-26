@@ -1,12 +1,12 @@
 /*
  * SPDX-License-Identifier: Apache-2.0
  */
+
 package org.opensearch.plugin.olap.plan.convert;
 
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
-
 import org.apache.calcite.rel.RelFieldCollation;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.core.AggregateCall;
@@ -23,406 +23,368 @@ import org.apache.calcite.rex.RexLiteral;
 import org.apache.calcite.rex.RexNode;
 import org.apache.calcite.sql.SqlKind;
 import org.apache.calcite.util.ImmutableBitSet;
-
+import org.boostscale.velox4j.aggregate.Aggregate;
+import org.boostscale.velox4j.aggregate.AggregateStep;
 import org.boostscale.velox4j.connector.Assignment;
 import org.boostscale.velox4j.connector.ColumnType;
 import org.boostscale.velox4j.connector.ExternalStreamTableHandle;
 import org.boostscale.velox4j.connector.HiveColumnHandle;
 import org.boostscale.velox4j.expression.FieldAccessTypedExpr;
 import org.boostscale.velox4j.expression.TypedExpr;
-import org.boostscale.velox4j.aggregate.Aggregate;
-import org.boostscale.velox4j.aggregate.AggregateStep;
+import org.boostscale.velox4j.join.JoinType;
 import org.boostscale.velox4j.plan.AggregationNode;
 import org.boostscale.velox4j.plan.FilterNode;
 import org.boostscale.velox4j.plan.HashJoinNode;
-import org.boostscale.velox4j.join.JoinType;
 import org.boostscale.velox4j.plan.LimitNode;
 import org.boostscale.velox4j.plan.OrderByNode;
 import org.boostscale.velox4j.plan.PlanNode;
 import org.boostscale.velox4j.plan.ProjectNode;
-import org.boostscale.velox4j.sort.SortOrder;
 import org.boostscale.velox4j.plan.TableScanNode;
+import org.boostscale.velox4j.sort.SortOrder;
 import org.boostscale.velox4j.type.RowType;
 import org.boostscale.velox4j.type.Type;
 
 /**
  * Converts a Calcite RelNode tree to a velox4j PlanNode tree.
  *
- * <p>This is the central plan conversion component. It walks the Calcite logical plan
- * top-down and constructs the corresponding velox4j plan nodes with proper expression
- * and type conversions.
+ * <p>This is the central plan conversion component. It walks the Calcite logical plan top-down and
+ * constructs the corresponding velox4j plan nodes with proper expression and type conversions.
  *
  * <p>Supported Calcite nodes:
+ *
  * <ul>
- *   <li>LogicalTableScan → TableScanNode (with ExternalStreamTableHandle)</li>
- *   <li>LogicalFilter → FilterNode</li>
- *   <li>LogicalProject → ProjectNode</li>
- *   <li>LogicalAggregate → AggregationNode</li>
- *   <li>LogicalJoin → HashJoinNode</li>
- *   <li>LogicalSort → OrderByNode + LimitNode</li>
+ *   <li>LogicalTableScan → TableScanNode (with ExternalStreamTableHandle)
+ *   <li>LogicalFilter → FilterNode
+ *   <li>LogicalProject → ProjectNode
+ *   <li>LogicalAggregate → AggregationNode
+ *   <li>LogicalJoin → HashJoinNode
+ *   <li>LogicalSort → OrderByNode + LimitNode
  * </ul>
  */
 public class VeloxPlanConverter {
 
-    private static final String EXTERNAL_STREAM_CONNECTOR_ID = "external_stream";
+  private static final String EXTERNAL_STREAM_CONNECTOR_ID = "external_stream";
 
-    private final PlanIdGenerator idGenerator;
+  private final PlanIdGenerator idGenerator;
 
-    public VeloxPlanConverter() {
-        this.idGenerator = new PlanIdGenerator();
+  public VeloxPlanConverter() {
+    this.idGenerator = new PlanIdGenerator();
+  }
+
+  /** Convert a Calcite RelNode tree to a velox4j PlanNode tree. */
+  public PlanNode convert(RelNode relNode) {
+    idGenerator.reset();
+    return visitNode(relNode);
+  }
+
+  private PlanNode visitNode(RelNode relNode) {
+    if (relNode instanceof LogicalTableScan) {
+      return visitTableScan((LogicalTableScan) relNode);
+    } else if (relNode instanceof LogicalFilter) {
+      return visitFilter((LogicalFilter) relNode);
+    } else if (relNode instanceof LogicalProject) {
+      return visitProject((LogicalProject) relNode);
+    } else if (relNode instanceof LogicalAggregate) {
+      return visitAggregate((LogicalAggregate) relNode);
+    } else if (relNode instanceof LogicalJoin) {
+      return visitJoin((LogicalJoin) relNode);
+    } else if (relNode instanceof LogicalSort) {
+      return visitSort((LogicalSort) relNode);
+    }
+    throw new UnsupportedOperationException(
+        "Unsupported RelNode type: " + relNode.getClass().getSimpleName());
+  }
+
+  private PlanNode visitTableScan(LogicalTableScan scan) {
+    String nodeId = idGenerator.next();
+    RelDataType rowType = scan.getRowType();
+    RowType outputType = VeloxTypeConverter.toVeloxRowType(rowType);
+    String tableName = String.join(".", scan.getTable().getQualifiedName());
+
+    ExternalStreamTableHandle tableHandle =
+        new ExternalStreamTableHandle(EXTERNAL_STREAM_CONNECTOR_ID);
+
+    List<Assignment> assignments = new ArrayList<>();
+    for (RelDataTypeField field : rowType.getFieldList()) {
+      Type colType = VeloxTypeConverter.toVeloxType(field.getType());
+      // Use HiveColumnHandle as the concrete ColumnHandle implementation.
+      // velox4j's ExternalStream connector uses the same handle format.
+      HiveColumnHandle columnHandle =
+          new HiveColumnHandle(
+              field.getName(), ColumnType.REGULAR, colType, colType, Collections.emptyList());
+      assignments.add(new Assignment(field.getName(), columnHandle));
     }
 
-    /**
-     * Convert a Calcite RelNode tree to a velox4j PlanNode tree.
-     */
-    public PlanNode convert(RelNode relNode) {
-        idGenerator.reset();
-        return visitNode(relNode);
+    return new TableScanNode(nodeId, outputType, tableHandle, assignments);
+  }
+
+  private PlanNode visitFilter(LogicalFilter filter) {
+    String nodeId = idGenerator.next();
+    PlanNode source = visitNode(filter.getInput());
+
+    VeloxExprConverter exprConverter = new VeloxExprConverter(filter.getInput().getRowType());
+    TypedExpr filterExpr = exprConverter.convert(filter.getCondition());
+
+    return new FilterNode(nodeId, Collections.singletonList(source), filterExpr);
+  }
+
+  private PlanNode visitProject(LogicalProject project) {
+    String nodeId = idGenerator.next();
+    PlanNode source = visitNode(project.getInput());
+
+    VeloxExprConverter exprConverter = new VeloxExprConverter(project.getInput().getRowType());
+
+    List<String> names = new ArrayList<>();
+    List<TypedExpr> projections = new ArrayList<>();
+    List<RelDataTypeField> outputFields = project.getRowType().getFieldList();
+
+    for (int i = 0; i < project.getProjects().size(); i++) {
+      RexNode expr = project.getProjects().get(i);
+      names.add(outputFields.get(i).getName());
+      projections.add(exprConverter.convert(expr));
     }
 
-    private PlanNode visitNode(RelNode relNode) {
-        if (relNode instanceof LogicalTableScan) {
-            return visitTableScan((LogicalTableScan) relNode);
-        } else if (relNode instanceof LogicalFilter) {
-            return visitFilter((LogicalFilter) relNode);
-        } else if (relNode instanceof LogicalProject) {
-            return visitProject((LogicalProject) relNode);
-        } else if (relNode instanceof LogicalAggregate) {
-            return visitAggregate((LogicalAggregate) relNode);
-        } else if (relNode instanceof LogicalJoin) {
-            return visitJoin((LogicalJoin) relNode);
-        } else if (relNode instanceof LogicalSort) {
-            return visitSort((LogicalSort) relNode);
-        }
-        throw new UnsupportedOperationException(
-            "Unsupported RelNode type: " + relNode.getClass().getSimpleName()
+    return new ProjectNode(nodeId, Collections.singletonList(source), names, projections);
+  }
+
+  private PlanNode visitAggregate(LogicalAggregate agg) {
+    String nodeId = idGenerator.next();
+    PlanNode source = visitNode(agg.getInput());
+
+    RelDataType inputRowType = agg.getInput().getRowType();
+    VeloxAggConverter aggConverter = new VeloxAggConverter(inputRowType);
+
+    // Convert grouping keys
+    ImmutableBitSet groupSet = agg.getGroupSet();
+    List<FieldAccessTypedExpr> groupingKeys = new ArrayList<>();
+    for (int fieldIndex : groupSet) {
+      RelDataTypeField field = inputRowType.getFieldList().get(fieldIndex);
+      Type veloxType = VeloxTypeConverter.toVeloxType(field.getType());
+      groupingKeys.add(FieldAccessTypedExpr.create(veloxType, field.getName()));
+    }
+
+    // Convert aggregate functions
+    List<String> aggregateNames = new ArrayList<>();
+    List<Aggregate> aggregates = new ArrayList<>();
+    List<AggregateCall> aggCalls = agg.getAggCallList();
+    for (int i = 0; i < aggCalls.size(); i++) {
+      AggregateCall aggCall = aggCalls.get(i);
+      aggregateNames.add(aggConverter.resolveAggOutputName(aggCall, i));
+      aggregates.add(aggConverter.convert(aggCall));
+    }
+
+    // Use SINGLE step for non-distributed execution.
+    // The PlanFragmenter will split this into PARTIAL + FINAL for distributed plans.
+    return new AggregationNode(
+        nodeId,
+        AggregateStep.SINGLE,
+        groupingKeys,
+        Collections.emptyList(), // preGroupedKeys
+        aggregateNames,
+        aggregates,
+        false, // ignoreNullKeys
+        false, // noGroupsSpanBatches
+        Collections.singletonList(source),
+        null, // groupId
+        Collections.emptyList() // globalGroupingSets
         );
-    }
+  }
 
-    private PlanNode visitTableScan(LogicalTableScan scan) {
-        String nodeId = idGenerator.next();
-        RelDataType rowType = scan.getRowType();
-        RowType outputType = VeloxTypeConverter.toVeloxRowType(rowType);
-        String tableName = String.join(".", scan.getTable().getQualifiedName());
+  private PlanNode visitJoin(LogicalJoin join) {
+    String nodeId = idGenerator.next();
+    PlanNode left = visitNode(join.getLeft());
+    PlanNode right = visitNode(join.getRight());
 
-        ExternalStreamTableHandle tableHandle =
-            new ExternalStreamTableHandle(EXTERNAL_STREAM_CONNECTOR_ID);
+    JoinType veloxJoinType = convertJoinType(join.getJoinType());
+    RowType outputType = VeloxTypeConverter.toVeloxRowType(join.getRowType());
 
-        List<Assignment> assignments = new ArrayList<>();
-        for (RelDataTypeField field : rowType.getFieldList()) {
-            Type colType = VeloxTypeConverter.toVeloxType(field.getType());
-            // Use HiveColumnHandle as the concrete ColumnHandle implementation.
-            // velox4j's ExternalStream connector uses the same handle format.
-            HiveColumnHandle columnHandle = new HiveColumnHandle(
-                field.getName(),
-                ColumnType.REGULAR,
-                colType,
-                colType,
-                Collections.emptyList()
-            );
-            assignments.add(new Assignment(field.getName(), columnHandle));
-        }
+    // Extract join keys from the condition.
+    // For equi-joins, the condition is typically AND(EQ(left.col, right.col), ...).
+    JoinKeyExtractor keyExtractor =
+        new JoinKeyExtractor(
+            join.getLeft().getRowType(), join.getRight().getRowType(), join.getCondition());
 
-        return new TableScanNode(nodeId, outputType, tableHandle, assignments);
-    }
-
-    private PlanNode visitFilter(LogicalFilter filter) {
-        String nodeId = idGenerator.next();
-        PlanNode source = visitNode(filter.getInput());
-
-        VeloxExprConverter exprConverter = new VeloxExprConverter(filter.getInput().getRowType());
-        TypedExpr filterExpr = exprConverter.convert(filter.getCondition());
-
-        return new FilterNode(nodeId, Collections.singletonList(source), filterExpr);
-    }
-
-    private PlanNode visitProject(LogicalProject project) {
-        String nodeId = idGenerator.next();
-        PlanNode source = visitNode(project.getInput());
-
-        VeloxExprConverter exprConverter = new VeloxExprConverter(project.getInput().getRowType());
-
-        List<String> names = new ArrayList<>();
-        List<TypedExpr> projections = new ArrayList<>();
-        List<RelDataTypeField> outputFields = project.getRowType().getFieldList();
-
-        for (int i = 0; i < project.getProjects().size(); i++) {
-            RexNode expr = project.getProjects().get(i);
-            names.add(outputFields.get(i).getName());
-            projections.add(exprConverter.convert(expr));
-        }
-
-        return new ProjectNode(nodeId, Collections.singletonList(source), names, projections);
-    }
-
-    private PlanNode visitAggregate(LogicalAggregate agg) {
-        String nodeId = idGenerator.next();
-        PlanNode source = visitNode(agg.getInput());
-
-        RelDataType inputRowType = agg.getInput().getRowType();
-        VeloxAggConverter aggConverter = new VeloxAggConverter(inputRowType);
-
-        // Convert grouping keys
-        ImmutableBitSet groupSet = agg.getGroupSet();
-        List<FieldAccessTypedExpr> groupingKeys = new ArrayList<>();
-        for (int fieldIndex : groupSet) {
-            RelDataTypeField field = inputRowType.getFieldList().get(fieldIndex);
-            Type veloxType = VeloxTypeConverter.toVeloxType(field.getType());
-            groupingKeys.add(FieldAccessTypedExpr.create(veloxType, field.getName()));
-        }
-
-        // Convert aggregate functions
-        List<String> aggregateNames = new ArrayList<>();
-        List<Aggregate> aggregates = new ArrayList<>();
-        List<AggregateCall> aggCalls = agg.getAggCallList();
-        for (int i = 0; i < aggCalls.size(); i++) {
-            AggregateCall aggCall = aggCalls.get(i);
-            aggregateNames.add(aggConverter.resolveAggOutputName(aggCall, i));
-            aggregates.add(aggConverter.convert(aggCall));
-        }
-
-        // Use SINGLE step for non-distributed execution.
-        // The PlanFragmenter will split this into PARTIAL + FINAL for distributed plans.
-        return new AggregationNode(
-            nodeId,
-            AggregateStep.SINGLE,
-            groupingKeys,
-            Collections.emptyList(),    // preGroupedKeys
-            aggregateNames,
-            aggregates,
-            false,                      // ignoreNullKeys
-            false,                      // noGroupsSpanBatches
-            Collections.singletonList(source),
-            null,                       // groupId
-            Collections.emptyList()     // globalGroupingSets
+    return new HashJoinNode(
+        nodeId,
+        veloxJoinType,
+        keyExtractor.getLeftKeys(),
+        keyExtractor.getRightKeys(),
+        keyExtractor.getResidualFilter(),
+        left,
+        right,
+        outputType,
+        false, // nullAware
+        false // useHashTableCache
         );
+  }
+
+  private PlanNode visitSort(LogicalSort sort) {
+    PlanNode source = visitNode(sort.getInput());
+    RelDataType inputRowType = sort.getInput().getRowType();
+
+    // If there's a collation, create OrderByNode
+    if (sort.getCollation() != null && !sort.getCollation().getFieldCollations().isEmpty()) {
+      String orderNodeId = idGenerator.next();
+      List<FieldAccessTypedExpr> sortingKeys = new ArrayList<>();
+      List<SortOrder> sortingOrders = new ArrayList<>();
+
+      for (RelFieldCollation fieldCollation : sort.getCollation().getFieldCollations()) {
+        int fieldIndex = fieldCollation.getFieldIndex();
+        RelDataTypeField field = inputRowType.getFieldList().get(fieldIndex);
+        Type veloxType = VeloxTypeConverter.toVeloxType(field.getType());
+        sortingKeys.add(FieldAccessTypedExpr.create(veloxType, field.getName()));
+
+        boolean ascending = fieldCollation.getDirection().isDescending() ? false : true;
+        boolean nullsFirst = fieldCollation.nullDirection == RelFieldCollation.NullDirection.FIRST;
+        sortingOrders.add(new SortOrder(ascending, nullsFirst));
+      }
+
+      source =
+          new OrderByNode(
+              orderNodeId,
+              Collections.singletonList(source),
+              sortingKeys,
+              sortingOrders,
+              false // not partial
+              );
     }
 
-    private PlanNode visitJoin(LogicalJoin join) {
-        String nodeId = idGenerator.next();
-        PlanNode left = visitNode(join.getLeft());
-        PlanNode right = visitNode(join.getRight());
+    // If there's a LIMIT/OFFSET, wrap with LimitNode
+    if (sort.fetch != null || sort.offset != null) {
+      String limitNodeId = idGenerator.next();
+      long offset = sort.offset != null ? RexLiteral.intValue(sort.offset) : 0;
+      long count = sort.fetch != null ? RexLiteral.intValue(sort.fetch) : Long.MAX_VALUE;
 
-        JoinType veloxJoinType = convertJoinType(join.getJoinType());
-        RowType outputType = VeloxTypeConverter.toVeloxRowType(join.getRowType());
-
-        // Extract join keys from the condition.
-        // For equi-joins, the condition is typically AND(EQ(left.col, right.col), ...).
-        JoinKeyExtractor keyExtractor = new JoinKeyExtractor(
-            join.getLeft().getRowType(),
-            join.getRight().getRowType(),
-            join.getCondition()
-        );
-
-        return new HashJoinNode(
-            nodeId,
-            veloxJoinType,
-            keyExtractor.getLeftKeys(),
-            keyExtractor.getRightKeys(),
-            keyExtractor.getResidualFilter(),
-            left,
-            right,
-            outputType,
-            false,  // nullAware
-            false   // useHashTableCache
-        );
+      source =
+          new LimitNode(
+              limitNodeId, Collections.singletonList(source), offset, count, false // not partial
+              );
     }
 
-    private PlanNode visitSort(LogicalSort sort) {
-        PlanNode source = visitNode(sort.getInput());
-        RelDataType inputRowType = sort.getInput().getRowType();
+    return source;
+  }
 
-        // If there's a collation, create OrderByNode
-        if (sort.getCollation() != null && !sort.getCollation().getFieldCollations().isEmpty()) {
-            String orderNodeId = idGenerator.next();
-            List<FieldAccessTypedExpr> sortingKeys = new ArrayList<>();
-            List<SortOrder> sortingOrders = new ArrayList<>();
+  private JoinType convertJoinType(org.apache.calcite.rel.core.JoinRelType calciteType) {
+    switch (calciteType) {
+      case INNER:
+        return JoinType.INNER;
+      case LEFT:
+        return JoinType.LEFT;
+      case RIGHT:
+        return JoinType.RIGHT;
+      case FULL:
+        return JoinType.FULL;
+      case SEMI:
+        return JoinType.LEFT_SEMI_FILTER;
+      case ANTI:
+        return JoinType.ANTI;
+      default:
+        throw new UnsupportedOperationException("Unsupported join type: " + calciteType);
+    }
+  }
 
-            for (RelFieldCollation fieldCollation : sort.getCollation().getFieldCollations()) {
-                int fieldIndex = fieldCollation.getFieldIndex();
-                RelDataTypeField field = inputRowType.getFieldList().get(fieldIndex);
-                Type veloxType = VeloxTypeConverter.toVeloxType(field.getType());
-                sortingKeys.add(FieldAccessTypedExpr.create(veloxType, field.getName()));
+  /**
+   * Extracts equi-join keys from a join condition. Decomposes the condition into left keys, right
+   * keys, and residual filter.
+   */
+  private static class JoinKeyExtractor {
+    private final List<FieldAccessTypedExpr> leftKeys = new ArrayList<>();
+    private final List<FieldAccessTypedExpr> rightKeys = new ArrayList<>();
+    private TypedExpr residualFilter;
 
-                boolean ascending = fieldCollation.getDirection().isDescending()
-                    ? false : true;
-                boolean nullsFirst = fieldCollation.nullDirection ==
-                    RelFieldCollation.NullDirection.FIRST;
-                sortingOrders.add(new SortOrder(ascending, nullsFirst));
-            }
-
-            source = new OrderByNode(
-                orderNodeId,
-                Collections.singletonList(source),
-                sortingKeys,
-                sortingOrders,
-                false   // not partial
-            );
-        }
-
-        // If there's a LIMIT/OFFSET, wrap with LimitNode
-        if (sort.fetch != null || sort.offset != null) {
-            String limitNodeId = idGenerator.next();
-            long offset = sort.offset != null
-                ? RexLiteral.intValue(sort.offset) : 0;
-            long count = sort.fetch != null
-                ? RexLiteral.intValue(sort.fetch) : Long.MAX_VALUE;
-
-            source = new LimitNode(
-                limitNodeId,
-                Collections.singletonList(source),
-                offset,
-                count,
-                false   // not partial
-            );
-        }
-
-        return source;
+    JoinKeyExtractor(RelDataType leftRowType, RelDataType rightRowType, RexNode condition) {
+      extract(leftRowType, rightRowType, condition);
     }
 
-    private JoinType convertJoinType(org.apache.calcite.rel.core.JoinRelType calciteType) {
-        switch (calciteType) {
-            case INNER:
-                return JoinType.INNER;
-            case LEFT:
-                return JoinType.LEFT;
-            case RIGHT:
-                return JoinType.RIGHT;
-            case FULL:
-                return JoinType.FULL;
-            case SEMI:
-                return JoinType.LEFT_SEMI_FILTER;
-            case ANTI:
-                return JoinType.ANTI;
-            default:
-                throw new UnsupportedOperationException(
-                    "Unsupported join type: " + calciteType
-                );
-        }
+    List<FieldAccessTypedExpr> getLeftKeys() {
+      return leftKeys;
     }
 
-    /**
-     * Extracts equi-join keys from a join condition.
-     * Decomposes the condition into left keys, right keys, and residual filter.
-     */
-    private static class JoinKeyExtractor {
-        private final List<FieldAccessTypedExpr> leftKeys = new ArrayList<>();
-        private final List<FieldAccessTypedExpr> rightKeys = new ArrayList<>();
-        private TypedExpr residualFilter;
-
-        JoinKeyExtractor(
-            RelDataType leftRowType,
-            RelDataType rightRowType,
-            RexNode condition
-        ) {
-            extract(leftRowType, rightRowType, condition);
-        }
-
-        List<FieldAccessTypedExpr> getLeftKeys() {
-            return leftKeys;
-        }
-
-        List<FieldAccessTypedExpr> getRightKeys() {
-            return rightKeys;
-        }
-
-        TypedExpr getResidualFilter() {
-            return residualFilter;
-        }
-
-        private void extract(
-            RelDataType leftRowType,
-            RelDataType rightRowType,
-            RexNode condition
-        ) {
-            if (condition == null) {
-                return;
-            }
-
-            int leftFieldCount = leftRowType.getFieldCount();
-
-            if (condition instanceof org.apache.calcite.rex.RexCall) {
-                org.apache.calcite.rex.RexCall call =
-                    (org.apache.calcite.rex.RexCall) condition;
-
-                if (call.getKind() == SqlKind.EQUALS) {
-                    RexNode op0 = call.getOperands().get(0);
-                    RexNode op1 = call.getOperands().get(1);
-
-                    if (op0 instanceof RexInputRef && op1 instanceof RexInputRef) {
-                        RexInputRef ref0 = (RexInputRef) op0;
-                        RexInputRef ref1 = (RexInputRef) op1;
-
-                        RexInputRef leftRef, rightRef;
-                        if (ref0.getIndex() < leftFieldCount
-                            && ref1.getIndex() >= leftFieldCount) {
-                            leftRef = ref0;
-                            rightRef = ref1;
-                        } else if (ref1.getIndex() < leftFieldCount
-                            && ref0.getIndex() >= leftFieldCount) {
-                            leftRef = ref1;
-                            rightRef = ref0;
-                        } else {
-                            // Both from same side - treat as residual
-                            VeloxExprConverter converter = new VeloxExprConverter(
-                                mergeRowTypes(leftRowType, rightRowType)
-                            );
-                            this.residualFilter = converter.convert(condition);
-                            return;
-                        }
-
-                        RelDataTypeField leftField =
-                            leftRowType.getFieldList().get(leftRef.getIndex());
-                        Type leftType = VeloxTypeConverter.toVeloxType(leftField.getType());
-                        leftKeys.add(FieldAccessTypedExpr.create(leftType, leftField.getName()));
-
-                        int rightIndex = rightRef.getIndex() - leftFieldCount;
-                        RelDataTypeField rightField =
-                            rightRowType.getFieldList().get(rightIndex);
-                        Type rightType = VeloxTypeConverter.toVeloxType(rightField.getType());
-                        rightKeys.add(
-                            FieldAccessTypedExpr.create(rightType, rightField.getName())
-                        );
-                        return;
-                    }
-                }
-
-                if (call.getKind() == SqlKind.AND) {
-                    for (RexNode operand : call.getOperands()) {
-                        JoinKeyExtractor sub = new JoinKeyExtractor(
-                            leftRowType, rightRowType, operand
-                        );
-                        leftKeys.addAll(sub.leftKeys);
-                        rightKeys.addAll(sub.rightKeys);
-                        if (sub.residualFilter != null) {
-                            // TODO: combine residual filters with AND
-                            this.residualFilter = sub.residualFilter;
-                        }
-                    }
-                    return;
-                }
-            }
-
-            // Non-equi condition → residual filter
-            VeloxExprConverter converter = new VeloxExprConverter(
-                mergeRowTypes(leftRowType, rightRowType)
-            );
-            this.residualFilter = converter.convert(condition);
-        }
-
-        private RelDataType mergeRowTypes(RelDataType left, RelDataType right) {
-            // Create a combined row type for expression conversion
-            // The join's input is [left fields | right fields]
-            org.apache.calcite.rel.type.RelDataTypeFactory.Builder builder =
-                new org.apache.calcite.jdbc.JavaTypeFactoryImpl()
-                    .builder();
-            for (RelDataTypeField f : left.getFieldList()) {
-                builder.add(f.getName(), f.getType());
-            }
-            for (RelDataTypeField f : right.getFieldList()) {
-                builder.add(f.getName(), f.getType());
-            }
-            return builder.build();
-        }
+    List<FieldAccessTypedExpr> getRightKeys() {
+      return rightKeys;
     }
+
+    TypedExpr getResidualFilter() {
+      return residualFilter;
+    }
+
+    private void extract(RelDataType leftRowType, RelDataType rightRowType, RexNode condition) {
+      if (condition == null) {
+        return;
+      }
+
+      int leftFieldCount = leftRowType.getFieldCount();
+
+      if (condition instanceof org.apache.calcite.rex.RexCall) {
+        org.apache.calcite.rex.RexCall call = (org.apache.calcite.rex.RexCall) condition;
+
+        if (call.getKind() == SqlKind.EQUALS) {
+          RexNode op0 = call.getOperands().get(0);
+          RexNode op1 = call.getOperands().get(1);
+
+          if (op0 instanceof RexInputRef && op1 instanceof RexInputRef) {
+            RexInputRef ref0 = (RexInputRef) op0;
+            RexInputRef ref1 = (RexInputRef) op1;
+
+            RexInputRef leftRef, rightRef;
+            if (ref0.getIndex() < leftFieldCount && ref1.getIndex() >= leftFieldCount) {
+              leftRef = ref0;
+              rightRef = ref1;
+            } else if (ref1.getIndex() < leftFieldCount && ref0.getIndex() >= leftFieldCount) {
+              leftRef = ref1;
+              rightRef = ref0;
+            } else {
+              // Both from same side - treat as residual
+              VeloxExprConverter converter =
+                  new VeloxExprConverter(mergeRowTypes(leftRowType, rightRowType));
+              this.residualFilter = converter.convert(condition);
+              return;
+            }
+
+            RelDataTypeField leftField = leftRowType.getFieldList().get(leftRef.getIndex());
+            Type leftType = VeloxTypeConverter.toVeloxType(leftField.getType());
+            leftKeys.add(FieldAccessTypedExpr.create(leftType, leftField.getName()));
+
+            int rightIndex = rightRef.getIndex() - leftFieldCount;
+            RelDataTypeField rightField = rightRowType.getFieldList().get(rightIndex);
+            Type rightType = VeloxTypeConverter.toVeloxType(rightField.getType());
+            rightKeys.add(FieldAccessTypedExpr.create(rightType, rightField.getName()));
+            return;
+          }
+        }
+
+        if (call.getKind() == SqlKind.AND) {
+          for (RexNode operand : call.getOperands()) {
+            JoinKeyExtractor sub = new JoinKeyExtractor(leftRowType, rightRowType, operand);
+            leftKeys.addAll(sub.leftKeys);
+            rightKeys.addAll(sub.rightKeys);
+            if (sub.residualFilter != null) {
+              // TODO: combine residual filters with AND
+              this.residualFilter = sub.residualFilter;
+            }
+          }
+          return;
+        }
+      }
+
+      // Non-equi condition → residual filter
+      VeloxExprConverter converter =
+          new VeloxExprConverter(mergeRowTypes(leftRowType, rightRowType));
+      this.residualFilter = converter.convert(condition);
+    }
+
+    private RelDataType mergeRowTypes(RelDataType left, RelDataType right) {
+      // Create a combined row type for expression conversion
+      // The join's input is [left fields | right fields]
+      org.apache.calcite.rel.type.RelDataTypeFactory.Builder builder =
+          new org.apache.calcite.jdbc.JavaTypeFactoryImpl().builder();
+      for (RelDataTypeField f : left.getFieldList()) {
+        builder.add(f.getName(), f.getType());
+      }
+      for (RelDataTypeField f : right.getFieldList()) {
+        builder.add(f.getName(), f.getType());
+      }
+      return builder.build();
+    }
+  }
 }
