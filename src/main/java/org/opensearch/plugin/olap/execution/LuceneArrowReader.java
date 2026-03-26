@@ -8,7 +8,6 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import org.apache.arrow.memory.BufferAllocator;
-import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.types.FloatingPointPrecision;
 import org.apache.arrow.vector.types.pojo.ArrowType;
@@ -53,9 +52,9 @@ public class LuceneArrowReader {
   private final IndicesService indicesService;
   private final BufferAllocator allocator;
 
-  public LuceneArrowReader(IndicesService indicesService) {
+  public LuceneArrowReader(IndicesService indicesService, BufferAllocator allocator) {
     this.indicesService = indicesService;
-    this.allocator = new RootAllocator(Long.MAX_VALUE);
+    this.allocator = allocator;
   }
 
   /** Read all doc values from a shard and feed them into the ExternalStreamBridge. */
@@ -162,12 +161,12 @@ public class LuceneArrowReader {
       case "float":
       case "double":
       case "date":
-        return DocValueType.NUMERIC;
+        // OpenSearch stores all numeric types as SORTED_NUMERIC (supports multi-valued)
+        return DocValueType.SORTED_NUMERIC;
       case "keyword":
-        return DocValueType.SORTED;
       case "text":
-        // text fields may not have doc values by default
-        return DocValueType.SORTED;
+        // OpenSearch stores keyword/text as SORTED_SET (supports multi-valued)
+        return DocValueType.SORTED_SET;
       default:
         return null;
     }

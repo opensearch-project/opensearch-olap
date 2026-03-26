@@ -25,10 +25,7 @@ import org.apache.calcite.sql.SqlKind;
 import org.apache.calcite.util.ImmutableBitSet;
 import org.boostscale.velox4j.aggregate.Aggregate;
 import org.boostscale.velox4j.aggregate.AggregateStep;
-import org.boostscale.velox4j.connector.Assignment;
-import org.boostscale.velox4j.connector.ColumnType;
 import org.boostscale.velox4j.connector.ExternalStreamTableHandle;
-import org.boostscale.velox4j.connector.HiveColumnHandle;
 import org.boostscale.velox4j.expression.FieldAccessTypedExpr;
 import org.boostscale.velox4j.expression.TypedExpr;
 import org.boostscale.velox4j.join.JoinType;
@@ -99,24 +96,20 @@ public class VeloxPlanConverter {
   private PlanNode visitTableScan(TableScan scan) {
     String nodeId = idGenerator.next();
     RelDataType rowType = scan.getRowType();
+    // TODO: The scan's rowType includes metadata columns (_id, _index, _score, _maxscore, _sort,
+    //  _routing) from CalciteLogicalIndexScan that the query may not need. Consider trimming
+    //  outputType to only the columns actually referenced by upstream operators (Project/Filter)
+    //  to reduce data flowing through the Lucene → Arrow → ExternalStream pipeline.
     RowType outputType = VeloxTypeConverter.toVeloxRowType(rowType);
-    String tableName = String.join(".", scan.getTable().getQualifiedName());
 
     ExternalStreamTableHandle tableHandle =
         new ExternalStreamTableHandle(EXTERNAL_STREAM_CONNECTOR_ID);
 
-    List<Assignment> assignments = new ArrayList<>();
-    for (RelDataTypeField field : rowType.getFieldList()) {
-      Type colType = VeloxTypeConverter.toVeloxType(field.getType());
-      // Use HiveColumnHandle as the concrete ColumnHandle implementation.
-      // velox4j's ExternalStream connector uses the same handle format.
-      HiveColumnHandle columnHandle =
-          new HiveColumnHandle(
-              field.getName(), ColumnType.REGULAR, colType, colType, Collections.emptyList());
-      assignments.add(new Assignment(field.getName(), columnHandle));
-    }
-
-    return new TableScanNode(nodeId, outputType, tableHandle, assignments);
+    // ExternalStream is a pass-through connector — it reads pre-formed RowVectors from a
+    // BlockingQueue without column projection. The C++ side enforces empty assignments:
+    //   VELOX_CHECK(columnHandles.empty(), "ExternalStreamConnector doesn't accept column handles")
+    // The schema is defined solely by outputType.
+    return new TableScanNode(nodeId, outputType, tableHandle, Collections.emptyList());
   }
 
   private PlanNode visitFilter(LogicalFilter filter) {

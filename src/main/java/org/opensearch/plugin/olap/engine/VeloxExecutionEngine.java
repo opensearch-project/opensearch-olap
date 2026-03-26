@@ -172,6 +172,10 @@ public class VeloxExecutionEngine {
           for (int col = 0; col < fields.size(); col++) {
             String name = fields.get(col).getName();
             Object value = root.getVector(col).getObject(row);
+            // Arrow Utf8 vectors return Text objects; convert to String for ExprValueUtils
+            if (value instanceof org.apache.arrow.vector.util.Text) {
+              value = value.toString();
+            }
             tupleValues.put(name, value);
           }
           rows.add(ExprValueUtils.tupleValue(tupleValues));

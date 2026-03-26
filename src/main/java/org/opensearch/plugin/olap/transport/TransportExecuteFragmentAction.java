@@ -7,6 +7,12 @@ package org.opensearch.plugin.olap.transport;
 import java.util.List;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.boostscale.velox4j.plan.PlanNode;
+import org.boostscale.velox4j.plan.TableScanNode;
+import org.boostscale.velox4j.query.Query;
+import org.boostscale.velox4j.serde.Serde;
+import org.boostscale.velox4j.type.RowType;
+import org.boostscale.velox4j.type.Type;
 import org.opensearch.action.support.ActionFilters;
 import org.opensearch.action.support.HandledTransportAction;
 import org.opensearch.common.inject.Inject;
@@ -105,12 +111,17 @@ public class TransportExecuteFragmentAction
     ExternalStreamBridge bridge = new ExternalStreamBridge(veloxLifecycle.getSession());
 
     // Step 3: Read Lucene doc values and feed into ExternalStream
-    LuceneArrowReader reader = new LuceneArrowReader(indicesService);
+    LuceneArrowReader reader = new LuceneArrowReader(indicesService, bridge.getAllocator());
     long rowCount = 0;
 
     try {
       // Create the ExternalStream and get its connector ID for the plan
       bridge.open();
+
+      // Extract field names from the plan's TableScanNode output type so the
+      // LuceneArrowReader knows which columns to read from doc values
+      List<String> scanFields = extractScanFields(request.getPlanFragmentJson());
+      bridge.setRequestedFields(scanFields);
 
       // Start a background thread to feed data from Lucene into ExternalStream
       Thread feederThread =
@@ -148,5 +159,45 @@ public class TransportExecuteFragmentAction
     } finally {
       bridge.close();
     }
+  }
+
+  /**
+   * Extract field names from the plan's TableScanNode outputType. Deserializes the Query JSON and
+   * walks the plan tree to find the TableScanNode, then reads its output column names.
+   */
+  private List<String> extractScanFields(String planJson) {
+    Query query = Serde.fromJson(planJson, Query.class);
+    PlanNode scanNode = findTableScanNode(query.getPlan());
+    if (scanNode instanceof TableScanNode) {
+      TableScanNode tableScan = (TableScanNode) scanNode;
+      Type outputType = tableScan.getOutputType();
+      if (outputType instanceof RowType) {
+        return ((RowType) outputType).getNames();
+      }
+    }
+    return List.of();
+  }
+
+  private PlanNode findTableScanNode(PlanNode node) {
+    if (node instanceof TableScanNode) {
+      return node;
+    }
+    try {
+      java.lang.reflect.Method m = PlanNode.class.getDeclaredMethod("getSources");
+      m.setAccessible(true);
+      @SuppressWarnings("unchecked")
+      List<PlanNode> sources = (List<PlanNode>) m.invoke(node);
+      if (sources != null) {
+        for (PlanNode source : sources) {
+          PlanNode found = findTableScanNode(source);
+          if (found != null) {
+            return found;
+          }
+        }
+      }
+    } catch (Exception e) {
+      logger.warn("Cannot traverse plan node: {}", e.getMessage());
+    }
+    return null;
   }
 }

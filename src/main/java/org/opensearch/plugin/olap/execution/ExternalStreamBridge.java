@@ -117,6 +117,10 @@ public class ExternalStreamBridge implements AutoCloseable {
     return rowCount.get();
   }
 
+  public BufferAllocator getAllocator() {
+    return allocator;
+  }
+
   public List<String> getRequestedFields() {
     return requestedFields;
   }
