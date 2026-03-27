@@ -141,17 +141,29 @@ public class TransportExecuteFragmentAction
       feederThread.setDaemon(true);
       feederThread.start();
 
-      // Step 4: Execute the Velox plan, reading from the ExternalStream
-      byte[] resultData =
-          executor.execute(
-              request.getPlanFragmentJson(), bridge.getConnectorId(), bridge.getQueue());
+      // Step 4: Execute the Velox plan, reading from the ExternalStream.
+      // If the plan contains PARTIAL aggregation, use native serde to preserve intermediate
+      // accumulator state for the coordinator's FINAL aggregation.
+      boolean isPartialAgg = request.getPlanFragmentJson().contains("\"step\":\"PARTIAL\"");
 
-      // Wait for feeder to finish
-      feederThread.join(30_000);
+      ExecuteFragmentResponse response;
+      if (isPartialAgg) {
+        List<byte[]> nativeBatches =
+            executor.executeNative(
+                request.getPlanFragmentJson(), bridge.getConnectorId(), bridge.getQueue());
+        feederThread.join(30_000);
+        rowCount = bridge.getRowCount();
+        response = ExecuteFragmentResponse.successNative(rowCount, nativeBatches);
+      } else {
+        byte[] resultData =
+            executor.execute(
+                request.getPlanFragmentJson(), bridge.getConnectorId(), bridge.getQueue());
+        feederThread.join(30_000);
+        rowCount = bridge.getRowCount();
+        response = ExecuteFragmentResponse.success(rowCount, resultData);
+      }
 
-      rowCount = bridge.getRowCount();
-
-      return ExecuteFragmentResponse.success(rowCount, resultData);
+      return response;
 
     } catch (Exception e) {
       logger.error("Fragment execution failed for query {}", queryId, e);

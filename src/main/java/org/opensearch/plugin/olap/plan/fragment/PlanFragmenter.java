@@ -10,7 +10,10 @@ import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.boostscale.velox4j.aggregate.AggregateStep;
 import org.boostscale.velox4j.plan.AggregationNode;
+import org.boostscale.velox4j.plan.FilterNode;
+import org.boostscale.velox4j.plan.LimitNode;
 import org.boostscale.velox4j.plan.PlanNode;
+import org.boostscale.velox4j.plan.ProjectNode;
 
 /**
  * Splits a Velox plan tree into distributable fragments.
@@ -138,27 +141,54 @@ public class PlanFragmenter {
   }
 
   /**
-   * Creates a copy of the parent node with one source replaced. This is a simplified version - a
-   * full implementation would handle all node types.
+   * Creates a copy of the parent node with one source replaced by newSource. Reconstructs the
+   * parent node to preserve operators above the aggregation split point.
    */
   private PlanNode replaceSource(PlanNode parent, PlanNode oldSource, PlanNode newSource) {
-    // For the current two-stage model, the parent of an aggregation is typically
-    // a ProjectNode or the root itself. The final aggregation becomes the new source.
-    // Since we return the new root from findAndSplitAggregation, this is handled there.
+    if (parent instanceof ProjectNode) {
+      ProjectNode proj = (ProjectNode) parent;
+      return new ProjectNode(
+          proj.getId(), List.of(newSource), proj.getNames(), proj.getProjections());
+    } else if (parent instanceof LimitNode) {
+      LimitNode limit = (LimitNode) parent;
+      return new LimitNode(
+          limit.getId(),
+          List.of(newSource),
+          limit.getOffset(),
+          limit.getCount(),
+          limit.isPartial());
+    } else if (parent instanceof FilterNode) {
+      FilterNode filter = (FilterNode) parent;
+      return new FilterNode(filter.getId(), List.of(newSource), filter.getFilter());
+    } else if (parent instanceof AggregationNode) {
+      AggregationNode agg = (AggregationNode) parent;
+      return new AggregationNode(
+          agg.getId(),
+          agg.getStep(),
+          agg.getGroupingKeys(),
+          agg.getPreGroupedKeys(),
+          agg.getAggregateNames(),
+          agg.getAggregates(),
+          agg.isIgnoreNullKeys(),
+          agg.isNoGroupsSpanBatches(),
+          List.of(newSource),
+          null,
+          Collections.emptyList());
+    }
+    // Fallback: just return newSource (drops the parent — should not happen for known node types)
     return newSource;
   }
 
-  /**
-   * Get sources from a PlanNode. Uses getMethod() which only finds public methods. AggregationNode
-   * overrides getSources() as public.
-   */
+  /** Get sources from a PlanNode using reflection (getSources is protected in PlanNode). */
   @SuppressWarnings("unchecked")
   private List<PlanNode> getNodeSources(PlanNode node) {
     if (node instanceof AggregationNode) {
       return ((AggregationNode) node).getSources();
     }
     try {
-      return (List<PlanNode>) node.getClass().getMethod("getSources").invoke(node);
+      java.lang.reflect.Method m = PlanNode.class.getDeclaredMethod("getSources");
+      m.setAccessible(true);
+      return (List<PlanNode>) m.invoke(node);
     } catch (Exception e) {
       return Collections.emptyList();
     }

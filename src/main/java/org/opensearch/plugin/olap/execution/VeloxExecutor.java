@@ -6,6 +6,7 @@ package org.opensearch.plugin.olap.execution;
 
 import java.io.ByteArrayOutputStream;
 import java.nio.channels.Channels;
+import java.util.List;
 import java.util.Map;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
@@ -18,6 +19,7 @@ import org.boostscale.velox4j.config.Config;
 import org.boostscale.velox4j.config.ConnectorConfig;
 import org.boostscale.velox4j.connector.ExternalStreamConnectorSplit;
 import org.boostscale.velox4j.connector.ExternalStreams.BlockingQueue;
+import org.boostscale.velox4j.data.BaseVectors;
 import org.boostscale.velox4j.data.RowVector;
 import org.boostscale.velox4j.iterator.CloseableIterator;
 import org.boostscale.velox4j.iterator.UpIterators;
@@ -136,6 +138,51 @@ public class VeloxExecutor {
       throw new RuntimeException("Failed to execute Velox plan or serialize results", e);
     } finally {
       allocator.close();
+    }
+  }
+
+  /**
+   * Execute a Velox plan and return results as Velox native serialized bytes. Unlike {@link
+   * #execute(String, String, BlockingQueue)} which returns Arrow IPC, this method preserves Velox's
+   * internal intermediate format (e.g., accumulator state for PARTIAL aggregation). Used for
+   * coordinator exchange where FINAL aggregation needs exact intermediate types.
+   *
+   * @return List of Velox native serialized byte arrays, one per result batch
+   */
+  public List<byte[]> executeNative(String planJson, String connectorId, BlockingQueue queue) {
+    Queries queries = session.queryOps();
+
+    Query originalQuery = Serde.fromJson(planJson, Query.class);
+    ConnectorConfig connectorConfig = ConnectorConfig.create(Map.of(connectorId, Config.empty()));
+    Query query =
+        new Query(originalQuery.getPlan(), originalQuery.getQueryConfig(), connectorConfig);
+
+    SerialTask serialTask = queries.execute(query);
+
+    String scanNodeId = findTableScanNodeId(query.getPlan());
+    if (scanNodeId == null) {
+      throw new IllegalStateException("No TableScanNode found in plan");
+    }
+
+    ExternalStreamConnectorSplit split = new ExternalStreamConnectorSplit(connectorId, queue.id());
+    serialTask.addSplit(scanNodeId, split);
+    serialTask.noMoreSplits(scanNodeId);
+
+    CloseableIterator<RowVector> resultIterator = UpIterators.asJavaIterator(serialTask);
+    List<byte[]> results = new java.util.ArrayList<>();
+
+    try {
+      while (resultIterator.hasNext()) {
+        RowVector resultBatch = resultIterator.next();
+        if (resultBatch == null) break;
+        // Serialize using Velox native format — preserves intermediate accumulator state
+        results.add(BaseVectors.serializeOneToBuf(resultBatch));
+      }
+      resultIterator.close();
+      logger.debug("Velox native execution complete, {} batches", results.size());
+      return results;
+    } catch (Exception e) {
+      throw new RuntimeException("Failed to execute Velox plan (native serde)", e);
     }
   }
 
