@@ -28,6 +28,10 @@ public class ExecuteFragmentResponse extends ActionResponse implements ToXConten
   private Status status;
   private long rowCount;
   private byte[] resultData;
+
+  /** Velox native serialized partial results (preserves intermediate accumulator state). */
+  private java.util.List<byte[]> nativeResultBatches;
+
   private String errorMessage;
 
   public ExecuteFragmentResponse() {}
@@ -41,6 +45,14 @@ public class ExecuteFragmentResponse extends ActionResponse implements ToXConten
     } else {
       this.resultData = null;
     }
+    // Read native result batches
+    int nativeBatchCount = in.readVInt();
+    if (nativeBatchCount > 0) {
+      this.nativeResultBatches = new java.util.ArrayList<>(nativeBatchCount);
+      for (int i = 0; i < nativeBatchCount; i++) {
+        this.nativeResultBatches.add(in.readByteArray());
+      }
+    }
     this.errorMessage = in.readOptionalString();
   }
 
@@ -52,6 +64,13 @@ public class ExecuteFragmentResponse extends ActionResponse implements ToXConten
 
   public static ExecuteFragmentResponse success(long rowCount, byte[] resultData) {
     return new ExecuteFragmentResponse(Status.SUCCESS, rowCount, resultData);
+  }
+
+  public static ExecuteFragmentResponse successNative(
+      long rowCount, java.util.List<byte[]> nativeBatches) {
+    ExecuteFragmentResponse response = new ExecuteFragmentResponse(Status.SUCCESS, rowCount, null);
+    response.nativeResultBatches = nativeBatches;
+    return response;
   }
 
   public static ExecuteFragmentResponse failure(String errorMessage) {
@@ -71,6 +90,15 @@ public class ExecuteFragmentResponse extends ActionResponse implements ToXConten
       out.writeByteArray(resultData);
     } else {
       out.writeBoolean(false);
+    }
+    // Write native result batches
+    if (nativeResultBatches != null && !nativeResultBatches.isEmpty()) {
+      out.writeVInt(nativeResultBatches.size());
+      for (byte[] batch : nativeResultBatches) {
+        out.writeByteArray(batch);
+      }
+    } else {
+      out.writeVInt(0);
     }
     out.writeOptionalString(errorMessage);
   }
@@ -97,6 +125,14 @@ public class ExecuteFragmentResponse extends ActionResponse implements ToXConten
 
   public byte[] getResultData() {
     return resultData;
+  }
+
+  public java.util.List<byte[]> getNativeResultBatches() {
+    return nativeResultBatches;
+  }
+
+  public boolean hasNativeResults() {
+    return nativeResultBatches != null && !nativeResultBatches.isEmpty();
   }
 
   public String getErrorMessage() {

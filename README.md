@@ -107,7 +107,15 @@ This design keeps `QueryService` unchanged — it just calls `executionEngine.ex
    - Read doc values column-by-column into Arrow `VectorSchemaRoot` batches
    - Feed Arrow batches into velox4j `ExternalStream.BlockingQueue` (zero-copy via Arrow C Data Interface)
    - Velox `TableScanNode` reads from the queue and executes the plan fragment natively in C++
-8. **Result Collection** - Coordinator merges partial results from all data nodes into the final response
+   - For non-aggregation queries: results serialized as Arrow IPC bytes
+   - For PARTIAL aggregation: results serialized using Velox native format (`BaseVectors.serializeToBuf`) to preserve intermediate accumulator state
+8. **Coordinator FINAL Aggregation** (for aggregation queries):
+   - Receives Velox native serialized partial results from all data nodes
+   - Deserializes via `BaseVectors.deserializeOneFromBuf` (preserves intermediate types like avg's `{sum, count}`)
+   - Feeds deserialized RowVectors into a local ExternalStream BlockingQueue
+   - Executes FINAL aggregation plan through Velox C++ locally on the coordinator
+   - Results converted to Arrow IPC for the final response
+9. **Result Collection** - Arrow IPC results converted to SQL plugin's `QueryResponse` format
 
 ### Key Design Decisions
 
@@ -115,6 +123,7 @@ This design keeps `QueryService` unchanged — it just calls `executionEngine.ex
 - **`canVectorize(RelNode)` on `ExecutionEngine`**: A default method returning `false`. Extensions override it to advertise support for specific plan shapes. The `DelegatingExecutionEngine` routes based on this.
 - **Doc values over stored fields**: Doc values are columnar on disk, matching Arrow/Velox's columnar layout. Sequential iteration per segment is ideal for full-scan analytics.
 - **ExternalStream bridge**: velox4j's `BlockingQueue` eliminates the need for a custom C++ OpenSearch connector in Velox. Java pushes data, C++ pulls it.
+- **Velox native serde for exchange**: PARTIAL aggregation results are serialized using Velox's internal binary format (`BaseVectors.serializeToBuf/deserializeFromBuf`) instead of Arrow IPC. This preserves intermediate accumulator state (e.g., avg's `{sum, count}` pair) that would be lost in an Arrow round-trip. Arrow IPC is still used for final results to the SQL plugin.
 - **No core changes**: The plugin uses only public OpenSearch APIs (`Plugin`, `ActionPlugin`, `TransportService`, `IndicesService`, `IndexShard.acquireSearcher()`).
 - **Presto-inspired scheduler**: Stage/Task hierarchy and fragment dispatch modeled after Presto's `SqlStageExecution` and `RemoteTaskFactory`, adapted for OpenSearch's transport layer.
 - **Graceful degradation**: If Velox native libraries are unavailable (e.g. macOS/aarch64), the plugin logs a warning and disables itself. `canVectorize()` returns `false`, all queries fall back to the default engine.
@@ -264,7 +273,9 @@ All queries will fall back to the default OpenSearch execution engine.
 - SQL plugin installed
 - OLAP plugin built and installed (see [Building](#building) and [Installation](#installation))
 
-### 1. Start OpenSearch
+### Single-Node Testing
+
+#### 1. Start OpenSearch
 
 ```bash
 cd ../OpenSearch/build/distribution/local/opensearch-3.6.0-SNAPSHOT
@@ -282,7 +293,7 @@ grep "Velox engine" logs/opensearch.log | tail -1
 # Expected: Velox engine initialized successfully
 ```
 
-### 2. Create test index and insert data
+#### 2. Create test index and insert data
 
 ```bash
 # Create index with typed mappings
@@ -311,21 +322,31 @@ curl -s "http://localhost:9200/test_olap/_count"
 # Expected: {"count":5, ...}
 ```
 
-### 3. Run PPL queries through Velox
+#### 3. Run queries through Velox
 
 ```bash
-# Filter + projection
+# Aggregation - count by city
 curl -s -X POST "http://localhost:9200/_plugins/_ppl" \
   -H "Content-Type: application/json" \
-  -d '{"query": "source=test_olap | where age > 30 | fields name, age, salary"}'
+  -d '{"query": "source=test_olap | stats count() by city"}'
+
+# Aggregation - avg salary by city
+curl -s -X POST "http://localhost:9200/_plugins/_ppl" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "source=test_olap | stats avg(salary) by city"}'
+
+# Aggregation - sum and count (no group by)
+curl -s -X POST "http://localhost:9200/_plugins/_ppl" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "source=test_olap | stats sum(age), count()"}'
 
 # SQL query (same delegation path)
 curl -s -X POST "http://localhost:9200/_plugins/_sql" \
   -H "Content-Type: application/json" \
-  -d '{"query": "SELECT name, age, salary FROM test_olap WHERE age > 30"}'
+  -d '{"query": "SELECT city, COUNT(*) FROM test_olap GROUP BY city"}'
 ```
 
-### 4. Verify OLAP plugin handled the query
+#### 4. Verify OLAP plugin handled the query
 
 Check logs for the Velox execution path:
 
@@ -348,7 +369,7 @@ If the query falls back to the default engine, you will see:
 
 If no OLAP plugin log appears at all, `canVectorize()` returned `false` because Velox is unavailable — check for `Velox engine unavailable` at startup.
 
-### 5. Enable debug logging (optional)
+#### 5. Enable debug logging (optional)
 
 ```bash
 curl -s -X PUT "http://localhost:9200/_cluster/settings" \
@@ -356,7 +377,7 @@ curl -s -X PUT "http://localhost:9200/_cluster/settings" \
   -d '{"transient": {"logger.org.opensearch.plugin.olap": "DEBUG"}}'
 ```
 
-### 6. Reinstall after code changes
+#### 6. Reinstall after code changes
 
 ```bash
 # Stop OpenSearch
@@ -373,6 +394,158 @@ bin/opensearch-plugin install file:///absolute/path/to/opensearch-olap/build/dis
 
 # Restart
 bin/opensearch -d -p /tmp/opensearch.pid
+```
+
+### Multi-Node Testing
+
+Tests distributed execution where fragments are dispatched to remote data nodes via TransportService.
+
+#### 1. Set up a 2-node local cluster
+
+Copy the existing build to create a second node:
+
+```bash
+BASE=../OpenSearch/build/distribution/local
+cp -r "$BASE/opensearch-3.6.0-SNAPSHOT" "$BASE/opensearch-node2"
+```
+
+Configure node 1 (`$BASE/opensearch-3.6.0-SNAPSHOT/config/opensearch.yml`):
+
+```yaml
+cluster.name: olap-test-cluster
+node.name: node-1
+network.host: 127.0.0.1
+http.port: 9200
+transport.port: 9300
+discovery.seed_hosts: ["127.0.0.1:9300", "127.0.0.1:9301"]
+cluster.initial_cluster_manager_nodes: ["node-1", "node-2"]
+```
+
+Configure node 2 (`$BASE/opensearch-node2/config/opensearch.yml`):
+
+```yaml
+cluster.name: olap-test-cluster
+node.name: node-2
+network.host: 127.0.0.1
+http.port: 9201
+transport.port: 9301
+discovery.seed_hosts: ["127.0.0.1:9300", "127.0.0.1:9301"]
+cluster.initial_cluster_manager_nodes: ["node-1", "node-2"]
+```
+
+Clean old data from both nodes (important if they previously ran as single-node):
+
+```bash
+rm -rf $BASE/opensearch-3.6.0-SNAPSHOT/data/*
+rm -rf $BASE/opensearch-node2/data/*
+rm -rf /tmp/opensearch-*
+```
+
+#### 2. Start both nodes
+
+```bash
+cd $BASE/opensearch-3.6.0-SNAPSHOT && bin/opensearch -d -p /tmp/opensearch-node1.pid
+cd $BASE/opensearch-node2 && bin/opensearch -d -p /tmp/opensearch-node2.pid
+```
+
+Wait for the cluster to form and verify both nodes joined:
+
+```bash
+curl -s "http://localhost:9200/_cat/nodes?v"
+```
+
+Expected output (2 nodes):
+```
+ip        heap.percent ram.percent cpu node.role cluster_manager name
+127.0.0.1           14          92   5 dimr      *               node-1
+127.0.0.1           13          92   5 dimr      -               node-2
+```
+
+#### 3. Create test index with multiple shards
+
+Use 2 shards and 0 replicas so each shard goes to a different node:
+
+```bash
+curl -s -X PUT "http://localhost:9200/test_olap" \
+  -H "Content-Type: application/json" \
+  -d '{
+  "settings": {"number_of_shards": 2, "number_of_replicas": 0},
+  "mappings": {
+    "properties": {
+      "name": {"type": "keyword"},
+      "age": {"type": "integer"},
+      "city": {"type": "keyword"},
+      "salary": {"type": "double"}
+    }
+  }
+}'
+
+# Insert sample data
+curl -s -X POST "http://localhost:9200/test_olap/_doc" -H "Content-Type: application/json" -d '{"name":"Alice","age":35,"city":"Seattle","salary":120000}'
+curl -s -X POST "http://localhost:9200/test_olap/_doc" -H "Content-Type: application/json" -d '{"name":"Bob","age":28,"city":"Portland","salary":95000}'
+curl -s -X POST "http://localhost:9200/test_olap/_doc" -H "Content-Type: application/json" -d '{"name":"Charlie","age":42,"city":"Seattle","salary":150000}'
+curl -s -X POST "http://localhost:9200/test_olap/_doc" -H "Content-Type: application/json" -d '{"name":"Diana","age":31,"city":"Denver","salary":110000}'
+curl -s -X POST "http://localhost:9200/test_olap/_doc" -H "Content-Type: application/json" -d '{"name":"Eve","age":26,"city":"Portland","salary":88000}'
+
+# Verify shards are distributed across both nodes
+curl -s "http://localhost:9200/_cat/shards/test_olap?v"
+```
+
+Expected output (shards on different nodes):
+```
+index     shard prirep state   docs store ip        node
+test_olap 0     p      STARTED    3 5.1kb 127.0.0.1 node-2
+test_olap 1     p      STARTED    2 4.9kb 127.0.0.1 node-1
+```
+
+#### 4. Run distributed queries
+
+```bash
+# Aggregation - count by city (distributed across both nodes)
+curl -s -X POST "http://localhost:9200/_plugins/_ppl" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "source=test_olap | stats count() by city"}'
+
+# Aggregation - avg salary by city
+curl -s -X POST "http://localhost:9200/_plugins/_ppl" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "source=test_olap | stats avg(salary) by city"}'
+```
+
+Expected results:
+```json
+{"datarows": [[2,"Seattle"],[2,"Portland"],[1,"Denver"]], ...}
+{"datarows": [[135000.0,"Seattle"],[91500.0,"Portland"],[110000.0,"Denver"]], ...}
+```
+
+#### 5. Verify distributed execution in logs
+
+Check that both nodes participated in query execution:
+
+```bash
+# Node 1 (coordinator): should show routing + scheduling + local fragment execution
+grep -E "Routing query|Dispatching stage|Executing fragment" \
+  $BASE/opensearch-3.6.0-SNAPSHOT/logs/olap-test-cluster.log | tail -5
+
+# Node 2 (remote data node): should show fragment execution
+grep -E "Executing fragment" \
+  $BASE/opensearch-node2/logs/olap-test-cluster.log | tail -5
+```
+
+Expected: coordinator dispatches **2 tasks** (one per shard), each node executes a fragment:
+```
+[node-1] Dispatching stage <id> with 2 tasks
+[node-1] Executing fragment 0 for query <id> on 1 shards
+[node-2] Executing fragment 0 for query <id> on 1 shards
+```
+
+Note: the log file is named `olap-test-cluster.log` (matching `cluster.name` in the config), not `opensearch.log`.
+
+#### 6. Stop the cluster
+
+```bash
+kill $(cat /tmp/opensearch-node1.pid) $(cat /tmp/opensearch-node2.pid)
+rm -rf /tmp/opensearch-*
 ```
 
 ## SQL Plugin Changes Required

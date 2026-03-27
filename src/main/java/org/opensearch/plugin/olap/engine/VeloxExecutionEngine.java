@@ -7,8 +7,10 @@ package org.opensearch.plugin.olap.engine;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.VectorSchemaRoot;
@@ -21,7 +23,19 @@ import org.apache.calcite.rel.type.RelDataTypeField;
 import org.apache.calcite.sql.type.SqlTypeName;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.boostscale.velox4j.config.Config;
+import org.boostscale.velox4j.config.ConnectorConfig;
+import org.boostscale.velox4j.connector.ExternalStreamConnectorSplit;
+import org.boostscale.velox4j.connector.ExternalStreams.BlockingQueue;
+import org.boostscale.velox4j.data.RowVector;
+import org.boostscale.velox4j.iterator.CloseableIterator;
+import org.boostscale.velox4j.iterator.UpIterators;
 import org.boostscale.velox4j.plan.PlanNode;
+import org.boostscale.velox4j.plan.TableScanNode;
+import org.boostscale.velox4j.query.Query;
+import org.boostscale.velox4j.query.SerialTask;
+import org.boostscale.velox4j.serde.Serde;
+import org.boostscale.velox4j.session.Session;
 import org.opensearch.plugin.olap.common.QueryId;
 import org.opensearch.plugin.olap.execution.VeloxLifecycleService;
 import org.opensearch.plugin.olap.plan.convert.VeloxPlanConverter;
@@ -30,6 +44,7 @@ import org.opensearch.plugin.olap.plan.fragment.PlanFragmenter;
 import org.opensearch.plugin.olap.scheduler.ExecutionPolicy;
 import org.opensearch.plugin.olap.scheduler.QueryExecution;
 import org.opensearch.plugin.olap.scheduler.QueryScheduler;
+import org.opensearch.plugin.olap.scheduler.Stage;
 import org.opensearch.plugin.olap.transport.ExecuteFragmentResponse;
 import org.opensearch.plugin.olap.transport.NodeResultCollector;
 import org.opensearch.sql.data.model.ExprValue;
@@ -94,20 +109,358 @@ public class VeloxExecutionEngine {
       // Step 3: Fragment the plan for distributed execution
       List<PlanFragment> fragments = planFragmenter.fragment(veloxPlan, sourceIndex);
 
-      // Step 4: Schedule and execute fragments across data nodes
+      // Step 4: Schedule fragments
       QueryExecution execution = queryScheduler.schedule(fragments, ExecutionPolicy.PHASED);
-
-      // Step 5: Collect results from all nodes
       NodeResultCollector collector = new NodeResultCollector(transportService, queryScheduler);
-      List<ExecuteFragmentResponse> responses = collector.dispatchAndCollect(execution);
+
+      // Step 5: Phased execution
+      // Separate leaf stages (SOURCE on data nodes) from coordinator stages (FINAL agg)
+      List<Stage> leafStages = execution.getLeafStages();
+      List<PlanFragment> coordinatorFragments = new ArrayList<>();
+      for (PlanFragment f : fragments) {
+        if (f.isRoot() && !f.isLeaf()) {
+          coordinatorFragments.add(f);
+        }
+      }
+
+      // Phase 1: Dispatch leaf stages to data nodes and collect partial results
+      List<ExecuteFragmentResponse> leafResponses =
+          collector.dispatchAndCollect(execution, leafStages);
+
+      List<ExecuteFragmentResponse> finalResponses;
+      if (coordinatorFragments.isEmpty()) {
+        // Single-stage plan (no aggregation split) — leaf results are the final results
+        finalResponses = leafResponses;
+      } else {
+        // Phase 2: Execute coordinator fragment locally through Velox,
+        // feeding partial results from data nodes into an ExternalStream
+        logger.info(
+            "Executing coordinator fragment for query {} with {} partial results",
+            queryId,
+            leafResponses.size());
+        finalResponses = executeCoordinatorFragment(coordinatorFragments.get(0), leafResponses);
+      }
 
       // Step 6: Convert Arrow IPC results to SQL plugin's QueryResponse
-      return buildQueryResponse(relNode.getRowType(), responses);
+      return buildQueryResponse(relNode.getRowType(), finalResponses);
 
     } catch (Exception e) {
       logger.error("Velox execution failed for query {}", queryId, e);
       throw new RuntimeException("Velox execution failed: " + e.getMessage(), e);
     }
+  }
+
+  /**
+   * Execute a coordinator fragment (e.g. FINAL aggregation) locally through Velox. Partial results
+   * from data nodes (in Velox native serialization format) are deserialized and fed into an
+   * ExternalStream. The coordinator plan reads from it. This preserves Velox's intermediate
+   * accumulator state (e.g., avg's {sum, count} pair) which would be lost in an Arrow round-trip.
+   */
+  private List<ExecuteFragmentResponse> executeCoordinatorFragment(
+      PlanFragment coordinatorFragment, List<ExecuteFragmentResponse> partialResponses) {
+    Session session = veloxLifecycle.getSession();
+    String connectorId = "connector-external-stream";
+    org.boostscale.velox4j.data.BaseVectors baseVectorOps = session.baseVectorOps();
+
+    BlockingQueue queue = session.externalStreamOps().newBlockingQueue();
+    BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+
+    try {
+      // Get the intermediate output type from the first deserialized partial result
+      org.boostscale.velox4j.type.Type intermediateType = null;
+      for (ExecuteFragmentResponse response : partialResponses) {
+        if (response.hasNativeResults()) {
+          byte[] firstBatch = response.getNativeResultBatches().get(0);
+          org.boostscale.velox4j.data.BaseVector vec =
+              baseVectorOps.deserializeOneFromBuf(firstBatch);
+          intermediateType = vec.getType();
+          break;
+        }
+      }
+
+      if (intermediateType == null) {
+        logger.warn("No partial results to feed into coordinator fragment");
+        return List.of(ExecuteFragmentResponse.success(0, new byte[0]));
+      }
+
+      // Build the coordinator plan: wire a TableScanNode as the source of the FINAL agg
+      TableScanNode exchangeScan =
+          new TableScanNode(
+              "exchange_scan",
+              intermediateType,
+              new org.boostscale.velox4j.connector.ExternalStreamTableHandle(connectorId),
+              Collections.emptyList());
+
+      PlanNode coordinatorPlan =
+          wireSourceIntoPlan(coordinatorFragment.getPlanRoot(), exchangeScan);
+
+      // Execute through Velox
+      ConnectorConfig connectorConfig = ConnectorConfig.create(Map.of(connectorId, Config.empty()));
+      Query query = new Query(coordinatorPlan, Config.empty(), connectorConfig);
+
+      logger.info("Executing coordinator plan: {}", Serde.toJson(query));
+
+      SerialTask serialTask = session.queryOps().execute(query);
+
+      // Add split BEFORE starting feeder
+      ExternalStreamConnectorSplit split =
+          new ExternalStreamConnectorSplit(connectorId, queue.id());
+      serialTask.addSplit("exchange_scan", split);
+      serialTask.noMoreSplits("exchange_scan");
+
+      // Feeder thread: deserialize native batches and push into queue
+      Thread feederThread =
+          new Thread(
+              () -> {
+                try {
+                  int batchCount = 0;
+                  for (ExecuteFragmentResponse response : partialResponses) {
+                    if (response.getStatus() != ExecuteFragmentResponse.Status.SUCCESS) continue;
+                    if (!response.hasNativeResults()) continue;
+                    for (byte[] nativeBatch : response.getNativeResultBatches()) {
+                      org.boostscale.velox4j.data.BaseVector vec =
+                          baseVectorOps.deserializeOneFromBuf(nativeBatch);
+                      queue.put(vec.asRowVector());
+                      batchCount++;
+                    }
+                  }
+                  logger.info("Coordinator feeder: pushed {} native batches", batchCount);
+                  queue.noMoreInput();
+                } catch (Throwable e) {
+                  logger.error("Error feeding partial results to coordinator fragment", e);
+                  queue.noMoreInput();
+                }
+              },
+              "olap-coordinator-feeder");
+      feederThread.setDaemon(true);
+      feederThread.start();
+
+      // Collect results
+      logger.info("Coordinator: calling resultIterator.hasNext()...");
+      CloseableIterator<RowVector> resultIterator = UpIterators.asJavaIterator(serialTask);
+      java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
+      org.apache.arrow.vector.ipc.ArrowStreamWriter writer = null;
+      boolean hasData = false;
+
+      logger.info("Coordinator: entering result iteration loop");
+      // Run the Velox serial task with a timeout to detect deadlocks
+      java.util.concurrent.Future<byte[]> resultFuture =
+          java.util.concurrent.Executors.newSingleThreadExecutor()
+              .submit(
+                  () -> {
+                    java.io.ByteArrayOutputStream innerBaos = new java.io.ByteArrayOutputStream();
+                    org.apache.arrow.vector.ipc.ArrowStreamWriter innerWriter = null;
+                    boolean innerHasData = false;
+                    try {
+                      while (resultIterator.hasNext()) {
+                        logger.info("Coordinator: got result batch");
+                        RowVector batch = resultIterator.next();
+                        if (batch == null) break;
+
+                        VectorSchemaRoot arrowRoot =
+                            org.boostscale.velox4j.arrow.Arrow.toArrowVectorSchemaRoot(
+                                allocator, batch);
+                        if (innerWriter == null) {
+                          innerWriter =
+                              new org.apache.arrow.vector.ipc.ArrowStreamWriter(
+                                  arrowRoot,
+                                  null,
+                                  java.nio.channels.Channels.newChannel(innerBaos));
+                          innerWriter.start();
+                        }
+                        innerWriter.writeBatch();
+                        innerHasData = true;
+                        arrowRoot.close();
+                      }
+                      if (innerWriter != null) {
+                        innerWriter.end();
+                        innerWriter.close();
+                      }
+                      resultIterator.close();
+                    } catch (Exception e) {
+                      throw new RuntimeException("Coordinator Velox execution error", e);
+                    }
+                    return innerHasData ? innerBaos.toByteArray() : new byte[0];
+                  });
+
+      byte[] resultData;
+      try {
+        resultData = resultFuture.get(30, java.util.concurrent.TimeUnit.SECONDS);
+      } catch (java.util.concurrent.TimeoutException e) {
+        logger.error(
+            "Coordinator fragment execution timed out after 30s. " + "Feeder thread alive={}",
+            feederThread.isAlive());
+        resultFuture.cancel(true);
+        throw new RuntimeException("Coordinator fragment timed out");
+      }
+
+      feederThread.join(5_000);
+      return List.of(ExecuteFragmentResponse.success(0, resultData));
+
+    } catch (Exception e) {
+      throw new RuntimeException("Coordinator fragment execution failed", e);
+    } finally {
+      try {
+        allocator.close();
+      } catch (IllegalStateException e) {
+        logger.debug("Arrow allocator close warning: {}", e.getMessage());
+      }
+    }
+  }
+
+  /**
+   * Wire a source TableScanNode into a plan that has empty sources (e.g. FINAL AggregationNode).
+   * Recursively walks the plan tree, finds the AggregationNode with empty sources, and reconstructs
+   * the tree with the source wired in.
+   */
+  private PlanNode wireSourceIntoPlan(PlanNode node, TableScanNode source) {
+    if (node instanceof org.boostscale.velox4j.plan.AggregationNode) {
+      org.boostscale.velox4j.plan.AggregationNode agg =
+          (org.boostscale.velox4j.plan.AggregationNode) node;
+      if (agg.getSources().isEmpty()) {
+        return new org.boostscale.velox4j.plan.AggregationNode(
+            agg.getId(),
+            agg.getStep(),
+            agg.getGroupingKeys(),
+            agg.getPreGroupedKeys(),
+            agg.getAggregateNames(),
+            agg.getAggregates(),
+            agg.isIgnoreNullKeys(),
+            agg.isNoGroupsSpanBatches(),
+            List.of(source),
+            null,
+            Collections.emptyList());
+      }
+    }
+
+    // Recurse into children and reconstruct the node with wired sources
+    List<PlanNode> sources = getNodeSources(node);
+    if (sources != null && !sources.isEmpty()) {
+      List<PlanNode> newSources = new ArrayList<>();
+      boolean changed = false;
+      for (PlanNode child : sources) {
+        PlanNode wired = wireSourceIntoPlan(child, source);
+        newSources.add(wired);
+        if (wired != child) changed = true;
+      }
+      if (changed) {
+        return reconstructNode(node, newSources);
+      }
+    }
+    return node;
+  }
+
+  /** Reconstruct a PlanNode with new sources. */
+  private PlanNode reconstructNode(PlanNode node, List<PlanNode> newSources) {
+    if (node instanceof org.boostscale.velox4j.plan.ProjectNode) {
+      org.boostscale.velox4j.plan.ProjectNode p = (org.boostscale.velox4j.plan.ProjectNode) node;
+      return new org.boostscale.velox4j.plan.ProjectNode(
+          p.getId(), newSources, p.getNames(), p.getProjections());
+    } else if (node instanceof org.boostscale.velox4j.plan.LimitNode) {
+      org.boostscale.velox4j.plan.LimitNode l = (org.boostscale.velox4j.plan.LimitNode) node;
+      return new org.boostscale.velox4j.plan.LimitNode(
+          l.getId(), newSources, l.getOffset(), l.getCount(), l.isPartial());
+    } else if (node instanceof org.boostscale.velox4j.plan.FilterNode) {
+      org.boostscale.velox4j.plan.FilterNode f = (org.boostscale.velox4j.plan.FilterNode) node;
+      return new org.boostscale.velox4j.plan.FilterNode(f.getId(), newSources, f.getFilter());
+    } else if (node instanceof org.boostscale.velox4j.plan.AggregationNode) {
+      org.boostscale.velox4j.plan.AggregationNode a =
+          (org.boostscale.velox4j.plan.AggregationNode) node;
+      return new org.boostscale.velox4j.plan.AggregationNode(
+          a.getId(),
+          a.getStep(),
+          a.getGroupingKeys(),
+          a.getPreGroupedKeys(),
+          a.getAggregateNames(),
+          a.getAggregates(),
+          a.isIgnoreNullKeys(),
+          a.isNoGroupsSpanBatches(),
+          newSources,
+          null,
+          Collections.emptyList());
+    }
+    return node;
+  }
+
+  @SuppressWarnings("unchecked")
+  private List<PlanNode> getNodeSources(PlanNode node) {
+    if (node instanceof org.boostscale.velox4j.plan.AggregationNode) {
+      return ((org.boostscale.velox4j.plan.AggregationNode) node).getSources();
+    }
+    try {
+      java.lang.reflect.Method m = PlanNode.class.getDeclaredMethod("getSources");
+      m.setAccessible(true);
+      return (List<PlanNode>) m.invoke(node);
+    } catch (Exception e) {
+      return Collections.emptyList();
+    }
+  }
+
+  /** Convert an Arrow Schema to a velox4j RowType. */
+  private org.boostscale.velox4j.type.RowType arrowSchemaToVeloxRowType(
+      org.apache.arrow.vector.types.pojo.Schema schema) {
+    List<String> names = new ArrayList<>();
+    List<org.boostscale.velox4j.type.Type> types = new ArrayList<>();
+    for (Field field : schema.getFields()) {
+      names.add(field.getName());
+      types.add(arrowTypeToVeloxType(field));
+    }
+    return new org.boostscale.velox4j.type.RowType(names, types);
+  }
+
+  /** Convert an Arrow Field to a velox4j Type. */
+  private org.boostscale.velox4j.type.Type arrowTypeToVeloxType(Field field) {
+    org.apache.arrow.vector.types.pojo.ArrowType arrowType = field.getType();
+    if (arrowType instanceof org.apache.arrow.vector.types.pojo.ArrowType.Bool) {
+      return new org.boostscale.velox4j.type.BooleanType();
+    } else if (arrowType instanceof org.apache.arrow.vector.types.pojo.ArrowType.Int) {
+      int bitWidth = ((org.apache.arrow.vector.types.pojo.ArrowType.Int) arrowType).getBitWidth();
+      if (bitWidth <= 32) return new org.boostscale.velox4j.type.IntegerType();
+      return new org.boostscale.velox4j.type.BigIntType();
+    } else if (arrowType instanceof org.apache.arrow.vector.types.pojo.ArrowType.FloatingPoint) {
+      var precision =
+          ((org.apache.arrow.vector.types.pojo.ArrowType.FloatingPoint) arrowType).getPrecision();
+      if (precision == org.apache.arrow.vector.types.FloatingPointPrecision.SINGLE) {
+        return new org.boostscale.velox4j.type.RealType();
+      }
+      return new org.boostscale.velox4j.type.DoubleType();
+    } else if (arrowType instanceof org.apache.arrow.vector.types.pojo.ArrowType.Utf8) {
+      return new org.boostscale.velox4j.type.VarCharType();
+    } else if (arrowType instanceof org.apache.arrow.vector.types.pojo.ArrowType.Binary) {
+      return new org.boostscale.velox4j.type.VarbinaryType();
+    } else if (arrowType instanceof org.apache.arrow.vector.types.pojo.ArrowType.Struct) {
+      // Nested row type — recurse into children
+      List<String> childNames = new ArrayList<>();
+      List<org.boostscale.velox4j.type.Type> childTypes = new ArrayList<>();
+      for (Field child : field.getChildren()) {
+        childNames.add(child.getName());
+        childTypes.add(arrowTypeToVeloxType(child));
+      }
+      return new org.boostscale.velox4j.type.RowType(childNames, childTypes);
+    }
+    // Fallback
+    return new org.boostscale.velox4j.type.VarbinaryType();
+  }
+
+  private String findScanNodeId(PlanNode node) {
+    if (node instanceof TableScanNode) {
+      return node.getId();
+    }
+    try {
+      java.lang.reflect.Method m = PlanNode.class.getDeclaredMethod("getSources");
+      m.setAccessible(true);
+      @SuppressWarnings("unchecked")
+      List<PlanNode> sources = (List<PlanNode>) m.invoke(node);
+      if (sources != null) {
+        for (PlanNode source : sources) {
+          String id = findScanNodeId(source);
+          if (id != null) return id;
+        }
+      }
+    } catch (Exception e) {
+      // ignore
+    }
+    return null;
   }
 
   public void setTransportService(TransportService transportService) {

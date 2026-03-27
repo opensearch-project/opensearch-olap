@@ -45,9 +45,15 @@ public class NodeResultCollector {
 
   /** Dispatch all tasks for a query execution and collect results. */
   public List<ExecuteFragmentResponse> dispatchAndCollect(QueryExecution execution) {
+    return dispatchAndCollect(execution, execution.getStages());
+  }
+
+  /** Dispatch tasks for specific stages and collect results. */
+  public List<ExecuteFragmentResponse> dispatchAndCollect(
+      QueryExecution execution, List<org.opensearch.plugin.olap.scheduler.Stage> stages) {
     QueryId queryId = execution.getQueryId();
     List<TaskDescriptor> allTasks = new ArrayList<>();
-    for (var stage : execution.getStages()) {
+    for (var stage : stages) {
       allTasks.addAll(stage.getTasks());
     }
 

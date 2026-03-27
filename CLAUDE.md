@@ -80,7 +80,36 @@ The SQL plugin uses custom Calcite RelNode subclasses, not always the standard `
 - **ExternalStream split wiring**: `SerialTask.addSplit(planNodeId, split)` takes the **plan node ID** of the `TableScanNode` (not the connector ID). The `ExternalStreamConnectorSplit` takes `(connectorId, queueId)` where `queueId` is `BlockingQueue.id()`.
 - **Query construction**: A velox4j `Query` wraps `PlanNode` + `Config` + `ConnectorConfig`. The `ConnectorConfig` must register the connector ID with `ConnectorConfig.create(Map.of("connector-external-stream", Config.empty()))`. Plan serialization uses `Serde.toJson(query)` / `Serde.fromJson(json, Query.class)`.
 - **Calcite DECIMAL literals**: Calcite represents integer literals (e.g. `30`) as `DECIMAL` type with scale 0. Velox requires exact type match in expressions, so `VeloxExprConverter` must produce `IntegerValue`/`BigIntValue` (not `DoubleValue`) for zero-scale decimals.
+- **PARTIAL/FINAL aggregation exchange**: Arrow IPC does NOT preserve Velox's intermediate accumulator state (e.g., avg's `{sum, count}`). The coordinator exchange must use Velox native serialization (`BaseVectors.serializeToBuf/deserializeFromBuf`) — added to velox4j as a custom extension. Without this, the FINAL aggregation hangs because it can't interpret Arrow-deserialized data as valid intermediate state.
+- **ExternalStream empty assignments**: `ExternalStreamConnector` enforces `columnHandles.empty()` in C++. `TableScanNode` for ExternalStream must have empty assignments list — the schema is defined solely by `outputType`.
 - **velox4j source**: `../velox4j`
+
+## Distributed aggregation execution flow
+For aggregation queries on multi-node clusters, the execution is phased:
+
+1. **PlanFragmenter** splits `AggregationNode(SINGLE)` into two fragments:
+   - Leaf fragment: `TableScan → ... → AggregationNode(PARTIAL)` — runs on data nodes
+   - Root fragment: `AggregationNode(FINAL) → Project → Limit` — runs on coordinator
+2. **Phase 1 (data nodes)**: `NodeResultCollector` dispatches only leaf-stage tasks. Each data node runs PARTIAL aggregation via Velox C++. Results serialized with `BaseVectors.serializeToBuf()` (Velox native binary format, NOT Arrow IPC).
+3. **Phase 2 (coordinator)**: `VeloxExecutionEngine.executeCoordinatorFragment()`:
+   - Deserializes partial results via `BaseVectors.deserializeOneFromBuf()` — preserves intermediate accumulator types
+   - Pushes deserialized RowVectors into a local `ExternalStream.BlockingQueue`
+   - Dynamically wires a `TableScanNode(exchange_scan)` as the source of the FINAL `AggregationNode` (since the FINAL node was created with empty sources)
+   - Executes the FINAL plan through Velox C++ locally on the coordinator
+   - Converts final results to Arrow IPC for the SQL plugin response
+
+Key implementation details:
+- `PlanFragmenter.replaceSource()` reconstructs parent nodes (LimitNode, ProjectNode) when replacing the aggregation split point
+- `PlanFragmenter.getNodeSources()` uses reflection (`setAccessible(true)`) because `PlanNode.getSources()` is `protected`
+- `TransportExecuteFragmentAction` detects PARTIAL plans via `planJson.contains("\"step\":\"PARTIAL\"")` to decide Arrow IPC vs native serde
+- The feeder thread must start AFTER `serialTask.addSplit()` + `noMoreSplits()` to avoid race conditions
+
+## Known issues / TODOs
+- **Filter + projection data correctness**: Non-aggregation queries (`where age > 30 | fields name, age, salary`) return incorrect data. The `TableScanNode` outputType includes 10 columns (4 user columns + 6 metadata: `_id`, `_index`, `_score`, `_maxscore`, `_sort`, `_routing`) but `LuceneArrowReader` only reads the 4 user columns that have doc values. Column positions mismatch causes Velox to read wrong data. Fix: trim outputType to only columns actually referenced by the query (see TODO in `VeloxPlanConverter.visitTableScan()`).
+- **OpenSearch doc values types**: OpenSearch stores all numeric types as `SORTED_NUMERIC` (not `NUMERIC`) and keyword/text as `SORTED_SET` (not `SORTED`). `LuceneArrowReader.mapToDocValueType()` handles this.
+- **Arrow Text → String**: Arrow Utf8 vectors return `org.apache.arrow.vector.util.Text` objects. Must convert to `String` before passing to `ExprValueUtils.tupleValue()` in `VeloxExecutionEngine.readArrowIpcToExprValues()`.
+- **Velox temp dirs in /tmp**: Each Velox initialization creates ~490MB temp dir under `/tmp`. Multiple restarts or multi-node clusters on the same host can fill `/tmp` (tmpfs). Clean with `rm -rf /tmp/opensearch-*`.
+- **velox4j `PlanNode.getSources()` is protected**: Cannot traverse plan trees without reflection. Affects `PlanFragmenter`, `VeloxExecutor.findTableScanNodeId()`, `VeloxExecutionEngine.wireSourceIntoPlan()`, and `TransportExecuteFragmentAction.findTableScanNode()`.
 
 ## Graceful degradation
 `VeloxLifecycleService` catches native library load failures and disables itself (logs a warning). This allows the plugin to install on unsupported platforms (e.g. macOS/aarch64) without crashing OpenSearch. `canVectorize()` returns `false` when Velox is unavailable.
@@ -99,3 +128,4 @@ All repositories are siblings under the same parent directory (`../`):
 - OpenSearch core: `../OpenSearch`
 - Presto: `../presto` — scheduler design reference
 - velox4j: `../velox4j` — Velox JNI bridge (C++ connector init in `src/main/cpp/main/velox4j/init/Init.cc`)
+- Gluten-Flink: `../gluten` — reference for how Flink uses velox4j (different architecture: streaming, uses custom `StatefulPlanNode`, Flink handles shuffle)
