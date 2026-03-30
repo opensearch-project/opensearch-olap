@@ -14,6 +14,8 @@ import org.opensearch.action.ActionRequest;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.settings.Setting;
+import org.opensearch.common.settings.Settings;
+import org.opensearch.common.util.concurrent.OpenSearchExecutors;
 import org.opensearch.core.action.ActionResponse;
 import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
@@ -29,6 +31,8 @@ import org.opensearch.plugins.ActionPlugin;
 import org.opensearch.plugins.Plugin;
 import org.opensearch.repositories.RepositoriesService;
 import org.opensearch.script.ScriptService;
+import org.opensearch.threadpool.ExecutorBuilder;
+import org.opensearch.threadpool.ScalingExecutorBuilder;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.client.Client;
 import org.opensearch.watcher.ResourceWatcherService;
@@ -54,6 +58,9 @@ import org.opensearch.watcher.ResourceWatcherService;
  * VectorizedEngineExtension} extension point using OpenSearch's {@code ExtensiblePlugin} mechanism.
  */
 public class OlapPlugin extends Plugin implements ActionPlugin {
+
+  /** Thread pool name for Lucene-to-Arrow feeder threads on data nodes. */
+  public static final String OLAP_FEEDER_THREAD_POOL_NAME = "olap_feeder";
 
   private VeloxLifecycleService veloxLifecycleService;
   private QueryScheduler queryScheduler;
@@ -92,6 +99,19 @@ public class OlapPlugin extends Plugin implements ActionPlugin {
   public List<ActionHandler<? extends ActionRequest, ? extends ActionResponse>> getActions() {
     return Collections.singletonList(
         new ActionHandler<>(ExecuteFragmentAction.INSTANCE, TransportExecuteFragmentAction.class));
+  }
+
+  @Override
+  public List<ExecutorBuilder<?>> getExecutorBuilders(Settings settings) {
+    // Scaling pool for feeder threads that read Lucene doc values into Arrow batches.
+    // These threads are I/O-bound (reading doc values) so a scaling pool is appropriate.
+    // Core=1, max=allocatedProcessors: one feeder per concurrent query, up to CPU count.
+    return List.of(
+        new ScalingExecutorBuilder(
+            OLAP_FEEDER_THREAD_POOL_NAME,
+            1,
+            OpenSearchExecutors.allocatedProcessors(settings),
+            org.opensearch.common.unit.TimeValue.timeValueMinutes(5)));
   }
 
   @Override
