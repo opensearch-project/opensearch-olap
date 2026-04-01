@@ -246,6 +246,18 @@ The OLAP plugin extends the SQL plugin's classloader (`extendedPlugins = ['opens
 
 The plugin ZIP will be generated at `build/distributions/opensearch-olap-3.6.0-SNAPSHOT.zip`.
 
+## Integration Tests
+
+Integration tests run against a real single-node OpenSearch cluster with the job-scheduler, SQL, and OLAP plugins installed. The cluster is managed by Gradle's `testClusters` infrastructure — it starts automatically, waits for Velox engine initialization (~30-40s), runs the tests, and shuts down.
+
+```bash
+./gradlew integTest
+```
+
+Test sources live in `src/integTest/java/`. The base class `OlapRestTestCase` provides helpers for creating test indices, executing PPL queries, and asserting results via the OpenSearch REST API.
+
+**Note:** Integration tests require the Velox native libraries (`libvelox.so`) to be compatible with the host OS. The Maven-published `velox4j` jar bundles libraries built on CentOS 7. If the host is incompatible, Velox will fail to initialize and the OLAP plugin will disable itself — queries will fall back to the default SQL engine and the tests will fail. See [Multi-Node Testing (Docker)](#multi-node-testing-docker) for an alternative.
+
 ## Installation
 
 The OLAP plugin requires the SQL plugin to be installed first:
