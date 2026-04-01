@@ -192,7 +192,10 @@ public class VeloxExecutionEngine {
               Collections.emptyList());
 
       PlanNode coordinatorPlan =
-          wireSourceIntoPlan(coordinatorFragment.getPlanRoot(), exchangeScan);
+          wireSourceIntoPlan(
+              coordinatorFragment.getPlanRoot(),
+              exchangeScan,
+              (org.boostscale.velox4j.type.RowType) intermediateType);
 
       // Execute through Velox
       ConnectorConfig connectorConfig = ConnectorConfig.create(Map.of(connectorId, Config.empty()));
@@ -311,20 +314,30 @@ public class VeloxExecutionEngine {
   /**
    * Wire a source TableScanNode into a plan that has empty sources (e.g. FINAL AggregationNode).
    * Recursively walks the plan tree, finds the AggregationNode with empty sources, and reconstructs
-   * the tree with the source wired in.
+   * the tree with the source wired in. Also fixes the FINAL aggregate call input types to match the
+   * actual intermediate accumulator types from the PARTIAL output.
    */
-  private PlanNode wireSourceIntoPlan(PlanNode node, TableScanNode source) {
+  private PlanNode wireSourceIntoPlan(
+      PlanNode node,
+      TableScanNode source,
+      org.boostscale.velox4j.type.RowType intermediateRowType) {
     if (node instanceof org.boostscale.velox4j.plan.AggregationNode) {
       org.boostscale.velox4j.plan.AggregationNode agg =
           (org.boostscale.velox4j.plan.AggregationNode) node;
       if (agg.getSources().isEmpty()) {
+        // Fix aggregate call input types using the actual intermediate types.
+        // The intermediate RowType columns after the grouping keys correspond
+        // to the aggregate accumulators, one per aggregate.
+        List<org.boostscale.velox4j.aggregate.Aggregate> fixedAggregates =
+            fixFinalAggregateTypes(agg, intermediateRowType);
+
         return new org.boostscale.velox4j.plan.AggregationNode(
             agg.getId(),
             agg.getStep(),
             agg.getGroupingKeys(),
             agg.getPreGroupedKeys(),
             agg.getAggregateNames(),
-            agg.getAggregates(),
+            fixedAggregates,
             agg.isIgnoreNullKeys(),
             agg.isNoGroupsSpanBatches(),
             List.of(source),
@@ -339,7 +352,7 @@ public class VeloxExecutionEngine {
       List<PlanNode> newSources = new ArrayList<>();
       boolean changed = false;
       for (PlanNode child : sources) {
-        PlanNode wired = wireSourceIntoPlan(child, source);
+        PlanNode wired = wireSourceIntoPlan(child, source, intermediateRowType);
         newSources.add(wired);
         if (wired != child) changed = true;
       }
@@ -348,6 +361,48 @@ public class VeloxExecutionEngine {
       }
     }
     return node;
+  }
+
+  /**
+   * Fix the FINAL aggregate call input types using the actual intermediate RowType from
+   * deserialized partial results. The intermediate RowType has columns: [grouping_keys...,
+   * accumulators...]. For each aggregate, the FieldAccessTypedExpr input type must match the actual
+   * accumulator type (e.g. ROW(DOUBLE, BIGINT) for avg, not DOUBLE).
+   */
+  private List<org.boostscale.velox4j.aggregate.Aggregate> fixFinalAggregateTypes(
+      org.boostscale.velox4j.plan.AggregationNode agg,
+      org.boostscale.velox4j.type.RowType intermediateRowType) {
+    int groupKeyCount = agg.getGroupingKeys().size();
+    List<org.boostscale.velox4j.aggregate.Aggregate> origAggs = agg.getAggregates();
+    List<String> aggNames = agg.getAggregateNames();
+    List<org.boostscale.velox4j.aggregate.Aggregate> fixed = new ArrayList<>(origAggs.size());
+
+    for (int i = 0; i < origAggs.size(); i++) {
+      org.boostscale.velox4j.aggregate.Aggregate orig = origAggs.get(i);
+      // The intermediate column for this aggregate is at position (groupKeyCount + i)
+      org.boostscale.velox4j.type.Type intermediateColType =
+          intermediateRowType.getChildren().get(groupKeyCount + i);
+      String intermediateName = aggNames.get(i);
+
+      org.boostscale.velox4j.expression.TypedExpr intermediateRef =
+          org.boostscale.velox4j.expression.FieldAccessTypedExpr.create(
+              intermediateColType, intermediateName);
+      org.boostscale.velox4j.expression.CallTypedExpr fixedCall =
+          new org.boostscale.velox4j.expression.CallTypedExpr(
+              orig.getCall().getReturnType(),
+              List.of(intermediateRef),
+              orig.getCall().getFunctionName());
+
+      fixed.add(
+          new org.boostscale.velox4j.aggregate.Aggregate(
+              fixedCall,
+              orig.getRawInputTypes(),
+              orig.getMask(),
+              orig.getSortingKeys(),
+              orig.getSortingOrders(),
+              orig.isDistinct()));
+    }
+    return fixed;
   }
 
   /** Reconstruct a PlanNode with new sources. */
