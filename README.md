@@ -548,6 +548,113 @@ kill $(cat /tmp/opensearch-node1.pid) $(cat /tmp/opensearch-node2.pid)
 rm -rf /tmp/opensearch-*
 ```
 
+### Multi-Node Testing (Docker)
+
+When the host platform cannot run the Velox native libraries (e.g., the `libvelox.so` in the Maven-published velox4j jar was built on CentOS 7), use a CentOS 7 Docker container to run the cluster. This ensures the native libraries are compatible with the runtime environment.
+
+#### 1. Build the OLAP plugin on the host
+
+```bash
+./gradlew clean assemble
+```
+
+#### 2. Start a CentOS 7 container with volume mounts
+
+```bash
+docker run --init -d --name olap-test \
+  -v /path/to/OpenSearch/build/distribution/local/opensearch-3.6.0-SNAPSHOT:/opensearch-src:ro \
+  -v /path/to/opensearch-olap/build/distributions:/olap-plugin:ro \
+  -v /path/to/search-plugins-sql/plugin/build/distributions:/sql-plugin:ro \
+  -v /path/to/job-scheduler/build/distributions:/job-scheduler-plugin:ro \
+  -p 9200:9200 -p 9201:9201 \
+  centos:7 sleep infinity
+```
+
+#### 3. Install Java and set up the cluster inside the container
+
+```bash
+docker exec olap-test bash -c '
+  # Fix CentOS 7 EOL mirrors
+  sed -i -e "s|mirrorlist=|#mirrorlist=|g" /etc/yum.repos.d/CentOS-*.repo
+  sed -i -e "s|#baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|g" /etc/yum.repos.d/CentOS-*.repo
+  yum install -y tar
+
+  # Install Amazon Corretto 21
+  rpm --import https://yum.corretto.aws/corretto.key
+  curl -sLo /etc/yum.repos.d/corretto.repo https://yum.corretto.aws/corretto.repo
+  yum install -y java-21-amazon-corretto-devel
+
+  # Copy OpenSearch for 2 nodes
+  cp -r /opensearch-src /opensearch-node1
+  cp -r /opensearch-src /opensearch-node2
+
+  # Install plugins on both nodes
+  for node in /opensearch-node1 /opensearch-node2; do
+    rm -rf "$node/plugins/opensearch-sql" "$node/plugins/opensearch-olap" \
+           "$node/plugins/opensearch-job-scheduler" "$node/data"
+    "$node/bin/opensearch-plugin" install -b file:///job-scheduler-plugin/opensearch-job-scheduler-3.6.0.0-SNAPSHOT.zip
+    "$node/bin/opensearch-plugin" install -b file:///sql-plugin/opensearch-sql-3.6.0.0-SNAPSHOT.zip
+    "$node/bin/opensearch-plugin" install -b file:///olap-plugin/opensearch-olap-3.6.0-SNAPSHOT.zip
+  done
+
+  # Configure node 1
+  cat > /opensearch-node1/config/opensearch.yml << EOF
+cluster.name: olap-test-cluster
+node.name: node-1
+network.host: 0.0.0.0
+http.port: 9200
+transport.port: 9300
+discovery.seed_hosts: ["127.0.0.1:9300", "127.0.0.1:9301"]
+cluster.initial_cluster_manager_nodes: ["node-1", "node-2"]
+EOF
+
+  # Configure node 2
+  cat > /opensearch-node2/config/opensearch.yml << EOF
+cluster.name: olap-test-cluster
+node.name: node-2
+network.host: 0.0.0.0
+http.port: 9201
+transport.port: 9301
+discovery.seed_hosts: ["127.0.0.1:9300", "127.0.0.1:9301"]
+cluster.initial_cluster_manager_nodes: ["node-1", "node-2"]
+EOF
+
+  # Create non-root user (OpenSearch refuses to run as root)
+  useradd -m opensearch
+  chown -R opensearch:opensearch /opensearch-node1 /opensearch-node2
+
+  # Start nodes with staggered timing
+  su opensearch -c "/opensearch-node1/bin/opensearch -d -p /tmp/node1.pid"
+  sleep 10
+  su opensearch -c "/opensearch-node2/bin/opensearch -d -p /tmp/node2.pid"
+'
+```
+
+#### 4. Wait for cluster and run queries
+
+```bash
+# Wait for both nodes
+curl -s "http://localhost:9200/_cat/nodes?v"
+
+# Create index, insert data, and run queries (same as local multi-node testing steps 3-4)
+```
+
+#### 5. Verified test results (2-node CentOS 7 Docker cluster)
+
+| Query | Result | Status |
+|-------|--------|--------|
+| `source=test_olap \| stats count() by city` | Seattle=2, Portland=2, Denver=1 | PASS |
+| `source=test_olap \| stats avg(salary) by city` | Seattle=135000, Portland=91500, Denver=110000 | PASS |
+| `source=test_olap \| stats sum(age), count()` | sum=162, count=5 | PASS |
+
+All queries executed as distributed PARTIAL+FINAL aggregation across 2 nodes with shards on different data nodes.
+
+#### 6. Clean up
+
+```bash
+docker rm -f olap-test
+```
+
 ## SQL Plugin Changes Required
 
 The following changes are needed in the SQL plugin (`opensearch-sql`) for the OLAP plugin to work:

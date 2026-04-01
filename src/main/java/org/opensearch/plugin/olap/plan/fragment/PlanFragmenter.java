@@ -8,12 +8,20 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
+import org.boostscale.velox4j.aggregate.Aggregate;
 import org.boostscale.velox4j.aggregate.AggregateStep;
+import org.boostscale.velox4j.expression.CallTypedExpr;
+import org.boostscale.velox4j.expression.FieldAccessTypedExpr;
+import org.boostscale.velox4j.expression.TypedExpr;
 import org.boostscale.velox4j.plan.AggregationNode;
 import org.boostscale.velox4j.plan.FilterNode;
 import org.boostscale.velox4j.plan.LimitNode;
 import org.boostscale.velox4j.plan.PlanNode;
 import org.boostscale.velox4j.plan.ProjectNode;
+import org.boostscale.velox4j.type.BigIntType;
+import org.boostscale.velox4j.type.DoubleType;
+import org.boostscale.velox4j.type.RowType;
+import org.boostscale.velox4j.type.Type;
 
 /**
  * Splits a Velox plan tree into distributable fragments.
@@ -105,7 +113,14 @@ public class PlanFragmenter {
   }
 
   private AggregationSplit splitAggregation(AggregationNode aggNode) {
-    // Create PARTIAL aggregation (runs on each data node)
+    // Create PARTIAL aggregation (runs on each data node).
+    // The PARTIAL aggregate call's return type must be the intermediate accumulator type,
+    // not the final result type. Velox uses call->type() to determine the output column
+    // type for PARTIAL aggregation. If the type is wrong (e.g., DOUBLE instead of
+    // ROW(DOUBLE, BIGINT) for avg), Velox creates the wrong output vector type and
+    // crashes in extractAccumulators when casting to RowVector.
+    List<Aggregate> partialAggregates = rewriteAggregatesForPartial(aggNode.getAggregates());
+
     AggregationNode partialAgg =
         new AggregationNode(
             aggNode.getId() + "_partial",
@@ -113,7 +128,7 @@ public class PlanFragmenter {
             aggNode.getGroupingKeys(),
             aggNode.getPreGroupedKeys(),
             aggNode.getAggregateNames(),
-            aggNode.getAggregates(),
+            partialAggregates,
             aggNode.isIgnoreNullKeys(),
             aggNode.isNoGroupsSpanBatches(),
             aggNode.getSources(),
@@ -121,8 +136,13 @@ public class PlanFragmenter {
             Collections.emptyList());
 
     // Create FINAL aggregation (runs on coordinator, reads from ExternalStream)
-    // The source of the final agg is a TableScanNode that reads from ExternalStream
-    // carrying the partial aggregation results. This will be wired during execution.
+    // The FINAL aggregate calls must reference the intermediate accumulator columns
+    // from the PARTIAL output by name (via FieldAccessTypedExpr). Without this,
+    // Velox C++ cannot locate the intermediate data and crashes in
+    // addIntermediateResults with a null pointer dereference.
+    List<Aggregate> finalAggregates =
+        rewriteAggregatesForFinal(aggNode.getAggregates(), aggNode.getAggregateNames());
+
     AggregationNode finalAgg =
         new AggregationNode(
             aggNode.getId() + "_final",
@@ -130,7 +150,7 @@ public class PlanFragmenter {
             aggNode.getGroupingKeys(),
             aggNode.getPreGroupedKeys(),
             aggNode.getAggregateNames(),
-            aggNode.getAggregates(),
+            finalAggregates,
             aggNode.isIgnoreNullKeys(),
             aggNode.isNoGroupsSpanBatches(),
             Collections.emptyList(), // source will be wired during execution
@@ -138,6 +158,93 @@ public class PlanFragmenter {
             Collections.emptyList());
 
     return new AggregationSplit(partialAgg, finalAgg);
+  }
+
+  /**
+   * Rewrite aggregate calls for a PARTIAL aggregation step. The call's return type must be set to
+   * the intermediate accumulator type, because Velox uses call->type() to determine the output
+   * column type for PARTIAL aggregation (via AggregationNode::outputType()).
+   */
+  private List<Aggregate> rewriteAggregatesForPartial(List<Aggregate> originalAggregates) {
+    List<Aggregate> partialAggregates = new ArrayList<>(originalAggregates.size());
+    for (Aggregate orig : originalAggregates) {
+      Type intermediateType =
+          resolveIntermediateType(orig.getCall().getFunctionName(), orig.getCall().getReturnType());
+      CallTypedExpr partialCall =
+          new CallTypedExpr(
+              intermediateType, orig.getCall().getInputs(), orig.getCall().getFunctionName());
+
+      partialAggregates.add(
+          new Aggregate(
+              partialCall,
+              orig.getRawInputTypes(),
+              orig.getMask(),
+              orig.getSortingKeys(),
+              orig.getSortingOrders(),
+              orig.isDistinct()));
+    }
+    return partialAggregates;
+  }
+
+  /**
+   * Resolve the intermediate accumulator type for a given aggregate function. Mirrors the
+   * intermediate types registered in Velox's aggregate function signatures.
+   *
+   * @see velox/functions/prestosql/aggregates/AverageAggregate.cpp —
+   *     intermediateType("row(double,bigint)")
+   * @see velox/functions/prestosql/aggregates/CountAggregate.cpp — intermediateType("bigint")
+   */
+  private Type resolveIntermediateType(String functionName, Type finalType) {
+    switch (functionName) {
+      case "avg":
+        // avg intermediate is always ROW(DOUBLE, BIGINT) for non-decimal types
+        return new RowType(List.of("sum", "count"), List.of(new DoubleType(), new BigIntType()));
+      case "count":
+        return new BigIntType();
+      case "sum":
+      case "min":
+      case "max":
+        // sum/min/max intermediate type is the same as the final result type
+        return finalType;
+      default:
+        // For unknown functions, use the final type as a fallback
+        return finalType;
+    }
+  }
+
+  /**
+   * Rewrite aggregate calls for a FINAL aggregation step. Each aggregate's call must have an input
+   * FieldAccessTypedExpr that references the corresponding intermediate accumulator column from the
+   * PARTIAL output. The intermediate column names match the aggregate output names.
+   */
+  private List<Aggregate> rewriteAggregatesForFinal(
+      List<Aggregate> originalAggregates, List<String> aggregateNames) {
+    List<Aggregate> finalAggregates = new ArrayList<>(originalAggregates.size());
+    for (int i = 0; i < originalAggregates.size(); i++) {
+      Aggregate orig = originalAggregates.get(i);
+      String intermediateName = aggregateNames.get(i);
+
+      // The FINAL call references the intermediate column by name.
+      // Use the original call's return type — Velox resolves the actual intermediate
+      // accumulator type from the function signature and rawInputTypes.
+      TypedExpr intermediateRef =
+          FieldAccessTypedExpr.create(orig.getCall().getReturnType(), intermediateName);
+      CallTypedExpr finalCall =
+          new CallTypedExpr(
+              orig.getCall().getReturnType(),
+              List.of(intermediateRef),
+              orig.getCall().getFunctionName());
+
+      finalAggregates.add(
+          new Aggregate(
+              finalCall,
+              orig.getRawInputTypes(),
+              orig.getMask(),
+              orig.getSortingKeys(),
+              orig.getSortingOrders(),
+              orig.isDistinct()));
+    }
+    return finalAggregates;
   }
 
   /**

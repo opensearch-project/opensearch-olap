@@ -93,14 +93,31 @@ public class VeloxPlanConverter {
         "Unsupported RelNode type: " + relNode.getClass().getSimpleName());
   }
 
+  /**
+   * OpenSearch metadata columns added by CalciteLogicalIndexScan. These have no doc values and
+   * cannot be read by LuceneArrowReader, so they must be excluded from the TableScanNode's
+   * outputType. Otherwise the Velox RowVector (with only user columns) won't match the declared
+   * schema, causing SIGSEGV in RowVector::childAt when Velox accesses missing children.
+   */
+  private static final java.util.Set<String> METADATA_COLUMNS =
+      java.util.Set.of("_id", "_index", "_score", "_maxscore", "_sort", "_routing");
+
   private PlanNode visitTableScan(TableScan scan) {
     String nodeId = idGenerator.next();
     RelDataType rowType = scan.getRowType();
-    // TODO: The scan's rowType includes metadata columns (_id, _index, _score, _maxscore, _sort,
-    //  _routing) from CalciteLogicalIndexScan that the query may not need. Consider trimming
-    //  outputType to only the columns actually referenced by upstream operators (Project/Filter)
-    //  to reduce data flowing through the Lucene → Arrow → ExternalStream pipeline.
-    RowType outputType = VeloxTypeConverter.toVeloxRowType(rowType);
+
+    // Filter out OpenSearch metadata columns that have no doc values.
+    // LuceneArrowReader skips these, so the Arrow batch only contains user columns.
+    // The outputType must match exactly, or Velox crashes accessing null children.
+    List<String> names = new ArrayList<>();
+    List<Type> types = new ArrayList<>();
+    for (RelDataTypeField field : rowType.getFieldList()) {
+      if (!METADATA_COLUMNS.contains(field.getName())) {
+        names.add(field.getName());
+        types.add(VeloxTypeConverter.toVeloxType(field.getType()));
+      }
+    }
+    RowType outputType = new RowType(names, types);
 
     ExternalStreamTableHandle tableHandle =
         new ExternalStreamTableHandle(EXTERNAL_STREAM_CONNECTOR_ID);

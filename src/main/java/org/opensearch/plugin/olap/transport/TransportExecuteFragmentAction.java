@@ -5,9 +5,6 @@
 package org.opensearch.plugin.olap.transport;
 
 import java.util.List;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicReference;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.boostscale.velox4j.plan.PlanNode;
@@ -22,7 +19,6 @@ import org.opensearch.common.inject.Inject;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.indices.IndicesService;
-import org.opensearch.plugin.olap.OlapPlugin;
 import org.opensearch.plugin.olap.engine.VeloxExecutionEngine;
 import org.opensearch.plugin.olap.execution.ExternalStreamBridge;
 import org.opensearch.plugin.olap.execution.LuceneArrowReader;
@@ -76,7 +72,6 @@ public class TransportExecuteFragmentAction
     veloxExecutionEngine.setTransportService(transportService);
   }
 
-  @SuppressWarnings("resource") // ExecutorService is managed by OpenSearch's ThreadPool
   @Override
   protected void doExecute(
       Task task, ExecuteFragmentRequest request, ActionListener<ExecuteFragmentResponse> listener) {
@@ -99,7 +94,6 @@ public class TransportExecuteFragmentAction
             });
   }
 
-  @SuppressWarnings("resource")
   private ExecuteFragmentResponse executeFragment(ExecuteFragmentRequest request) {
     String queryId = request.getQueryId();
     List<ShardId> shardIds = request.getShardIds();
@@ -117,10 +111,10 @@ public class TransportExecuteFragmentAction
     ExternalStreamBridge bridge = new ExternalStreamBridge(veloxLifecycle.getSession());
 
     // Step 3: Read Lucene doc values and feed into ExternalStream
+    LuceneArrowReader reader = new LuceneArrowReader(indicesService, bridge.getAllocator());
+    long rowCount = 0;
 
-    try (bridge) {
-      LuceneArrowReader reader = new LuceneArrowReader(indicesService, bridge.getAllocator());
-      long rowCount;
+    try {
       // Create the ExternalStream and get its connector ID for the plan
       bridge.open();
 
@@ -129,12 +123,9 @@ public class TransportExecuteFragmentAction
       List<String> scanFields = extractScanFields(request.getPlanFragmentJson());
       bridge.setRequestedFields(scanFields);
 
-      // Start a feeder task on the OLAP feeder thread pool to read Lucene into ExternalStream
-      CountDownLatch feederDone = new CountDownLatch(1);
-      AtomicReference<Throwable> feederError = new AtomicReference<>();
-      threadPool
-          .executor(OlapPlugin.OLAP_FEEDER_THREAD_POOL_NAME)
-          .execute(
+      // Start a background thread to feed data from Lucene into ExternalStream
+      Thread feederThread =
+          new Thread(
               () -> {
                 try {
                   for (ShardId shardId : shardIds) {
@@ -143,12 +134,12 @@ public class TransportExecuteFragmentAction
                   bridge.noMoreInput();
                 } catch (Throwable e) {
                   logger.error("Error feeding data for query {}", queryId, e);
-                  feederError.set(e);
                   bridge.abort(e instanceof Exception ? (Exception) e : new RuntimeException(e));
-                } finally {
-                  feederDone.countDown();
                 }
-              });
+              },
+              "olap-feeder-" + queryId + "-" + request.getFragmentId());
+      feederThread.setDaemon(true);
+      feederThread.start();
 
       // Step 4: Execute the Velox plan, reading from the ExternalStream.
       // If the plan contains PARTIAL aggregation, use native serde to preserve intermediate
@@ -160,18 +151,14 @@ public class TransportExecuteFragmentAction
         List<byte[]> nativeBatches =
             executor.executeNative(
                 request.getPlanFragmentJson(), bridge.getConnectorId(), bridge.getQueue());
-        if (!feederDone.await(30, TimeUnit.SECONDS)) {
-          throw new RuntimeException("Feeder thread timed out for query " + queryId);
-        }
+        feederThread.join(30_000);
         rowCount = bridge.getRowCount();
         response = ExecuteFragmentResponse.successNative(rowCount, nativeBatches);
       } else {
         byte[] resultData =
             executor.execute(
                 request.getPlanFragmentJson(), bridge.getConnectorId(), bridge.getQueue());
-        if (!feederDone.await(30, TimeUnit.SECONDS)) {
-          throw new RuntimeException("Feeder thread timed out for query " + queryId);
-        }
+        feederThread.join(30_000);
         rowCount = bridge.getRowCount();
         response = ExecuteFragmentResponse.success(rowCount, resultData);
       }
@@ -181,6 +168,8 @@ public class TransportExecuteFragmentAction
     } catch (Exception e) {
       logger.error("Fragment execution failed for query {}", queryId, e);
       return ExecuteFragmentResponse.failure(e.getMessage());
+    } finally {
+      bridge.close();
     }
   }
 
