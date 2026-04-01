@@ -169,7 +169,10 @@ public class PlanFragmenter {
     List<Aggregate> partialAggregates = new ArrayList<>(originalAggregates.size());
     for (Aggregate orig : originalAggregates) {
       Type intermediateType =
-          resolveIntermediateType(orig.getCall().getFunctionName(), orig.getCall().getReturnType());
+          resolveIntermediateType(
+              orig.getCall().getFunctionName(),
+              orig.getCall().getReturnType(),
+              orig.getRawInputTypes());
       CallTypedExpr partialCall =
           new CallTypedExpr(
               intermediateType, orig.getCall().getInputs(), orig.getCall().getFunctionName());
@@ -190,24 +193,37 @@ public class PlanFragmenter {
    * Resolve the intermediate accumulator type for a given aggregate function. Mirrors the
    * intermediate types registered in Velox's aggregate function signatures.
    *
-   * @see velox/functions/prestosql/aggregates/AverageAggregate.cpp —
-   *     intermediateType("row(double,bigint)")
-   * @see velox/functions/prestosql/aggregates/CountAggregate.cpp — intermediateType("bigint")
+   * @see velox/functions/prestosql/aggregates/AverageAggregate.cpp
+   * @see velox/functions/prestosql/aggregates/CountAggregate.cpp
+   * @see velox/functions/prestosql/aggregates/SumAggregate.cpp
+   * @see velox/functions/prestosql/aggregates/MinMaxAggregates.cpp
    */
-  private Type resolveIntermediateType(String functionName, Type finalType) {
+  private Type resolveIntermediateType(
+      String functionName, Type finalType, List<Type> rawInputTypes) {
     switch (functionName) {
       case "avg":
         // avg intermediate is always ROW(DOUBLE, BIGINT) for non-decimal types
         return new RowType(List.of("sum", "count"), List.of(new DoubleType(), new BigIntType()));
       case "count":
+        // count intermediate is always BIGINT
         return new BigIntType();
       case "sum":
+        // sum(real) → intermediate DOUBLE; sum(double) → DOUBLE;
+        // sum(tinyint/smallint/integer/bigint) → BIGINT
+        if (!rawInputTypes.isEmpty()) {
+          Type inputType = rawInputTypes.get(0);
+          if (inputType instanceof org.boostscale.velox4j.type.RealType
+              || inputType instanceof DoubleType) {
+            return new DoubleType();
+          }
+        }
+        // Integer types: intermediate is BIGINT
+        return new BigIntType();
       case "min":
       case "max":
-        // sum/min/max intermediate type is the same as the final result type
+        // min/max intermediate type is the same as the input type
         return finalType;
       default:
-        // For unknown functions, use the final type as a fallback
         return finalType;
     }
   }

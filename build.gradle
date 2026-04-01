@@ -25,6 +25,8 @@ plugins {
     id 'com.diffplug.spotless' version '8.1.0'
 }
 
+import java.util.stream.Collectors
+
 apply plugin: 'java'
 apply plugin: 'opensearch.opensearchplugin'
 apply plugin: 'opensearch.pluginzip'
@@ -73,8 +75,6 @@ spotless {
 }
 
 configurations.all {
-    // velox4j bundles slf4j classes; exclude the separate jar to avoid jar hell
-    exclude group: 'org.slf4j', module: 'slf4j-api'
     // jsr305 (javax.annotation) is provided by the SQL plugin; exclude to avoid jar hell
     exclude group: 'com.google.code.findbugs', module: 'jsr305'
     // Override OpenSearch's failOnVersionConflict() - prefer highest version
@@ -108,6 +108,14 @@ configurations {
     }
     testCompileClasspath {
         exclude group: 'org.boostscale', module: 'velox4j'
+    }
+}
+
+// velox4j bundles slf4j classes; exclude from plugin classpath to avoid jar hell at runtime.
+// NOT excluded from integTest — the REST test client needs slf4j.
+['compileClasspath', 'runtimeClasspath', 'testCompileClasspath', 'testRuntimeClasspath'].each { name ->
+    configurations.named(name).configure {
+        exclude group: 'org.slf4j', module: 'slf4j-api'
     }
 }
 
@@ -159,6 +167,94 @@ dependencies {
     testImplementation "org.opensearch:opensearch-agent:${opensearch_version}"
     testImplementation "junit:junit:4.13.2"
     testImplementation "org.mockito:mockito-core:5.20.0"
+}
+
+// =============================================================================
+// Integration Test Framework
+// =============================================================================
+
+sourceSets {
+    integTest {
+        java.srcDir 'src/integTest/java'
+        resources.srcDir 'src/integTest/resources'
+        compileClasspath += sourceSets.main.output
+        runtimeClasspath += output + compileClasspath
+    }
+}
+
+configurations {
+    // Plugin ZIP archives needed for the test cluster
+    integTestPluginArchive
+}
+
+configurations.integTestRuntimeClasspath {
+    exclude group: 'org.hamcrest', module: 'hamcrest-core'
+}
+configurations.integTestCompileClasspath {
+    exclude group: 'org.hamcrest', module: 'hamcrest-core'
+}
+
+dependencies {
+    integTestImplementation "org.opensearch.test:framework:${opensearch_version}"
+    integTestImplementation "junit:junit:4.13.2"
+    integTestImplementation "org.json:json:20250107"
+    // slf4j is excluded from plugin classpath (for velox4j repackaging) but needed by the REST
+    // test client (Apache HttpClient 5 → TLS). Must use matching versions — framework pulls 2.0.x.
+    integTestImplementation "org.slf4j:slf4j-api:2.0.17"
+    integTestRuntimeOnly "org.slf4j:slf4j-simple:2.0.17"
+
+    // SQL plugin + job-scheduler ZIP for the test cluster
+    integTestPluginArchive "org.opensearch.plugin:opensearch-sql-plugin:${sql_plugin_version}@zip"
+    integTestPluginArchive "org.opensearch.plugin:opensearch-job-scheduler:${sql_plugin_version}@zip"
+}
+
+def getSqlPluginProvider() {
+    provider { (org.gradle.api.file.RegularFile) (() ->
+        configurations.integTestPluginArchive.asFileTree.matching {
+            include '**/opensearch-sql*'
+        }.singleFile)
+    }
+}
+
+def getJobSchedulerPluginProvider() {
+    provider { (org.gradle.api.file.RegularFile) (() ->
+        configurations.integTestPluginArchive.asFileTree.matching {
+            include '**/opensearch-job-scheduler*'
+        }.singleFile)
+    }
+}
+
+import org.opensearch.gradle.testclusters.StandaloneRestIntegTestTask
+
+testClusters {
+    integTest {
+        testDistribution = 'archive'
+        plugin(getJobSchedulerPluginProvider())
+        plugin(getSqlPluginProvider())
+        plugin(project.tasks.bundlePlugin.archiveFile)
+        jvmArgs '-Xms1g', '-Xmx1g'
+    }
+}
+
+tasks.register('integTest', StandaloneRestIntegTestTask) {
+    description = 'Run integration tests against a cluster with SQL + OLAP plugins'
+    group = 'verification'
+
+    testClassesDirs = sourceSets.integTest.output.classesDirs
+    classpath = sourceSets.integTest.runtimeClasspath
+
+    useCluster testClusters.integTest
+
+    nonInputProperties.systemProperty('tests.rest.cluster', "${-> testClusters.integTest.allHttpSocketURI.join(",")}")
+    nonInputProperties.systemProperty('tests.clustername', "${-> testClusters.integTest.getName()}")
+    systemProperty 'tests.security.manager', 'false'
+
+    testLogging {
+        events "passed", "failed", "skipped"
+        showStandardStreams = true
+    }
+
+    dependsOn 'bundlePlugin'
 }
 
 publishing {
