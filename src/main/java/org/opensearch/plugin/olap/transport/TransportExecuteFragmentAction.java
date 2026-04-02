@@ -7,6 +7,8 @@ package org.opensearch.plugin.olap.transport;
 import java.util.List;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.boostscale.velox4j.expression.TypedExpr;
+import org.boostscale.velox4j.plan.FilterNode;
 import org.boostscale.velox4j.plan.PlanNode;
 import org.boostscale.velox4j.plan.TableScanNode;
 import org.boostscale.velox4j.query.Query;
@@ -22,6 +24,7 @@ import org.opensearch.indices.IndicesService;
 import org.opensearch.plugin.olap.engine.VeloxExecutionEngine;
 import org.opensearch.plugin.olap.execution.ExternalStreamBridge;
 import org.opensearch.plugin.olap.execution.LuceneArrowReader;
+import org.opensearch.plugin.olap.execution.LuceneFilterConverter;
 import org.opensearch.plugin.olap.execution.VeloxExecutor;
 import org.opensearch.plugin.olap.execution.VeloxLifecycleService;
 import org.opensearch.tasks.Task;
@@ -123,13 +126,22 @@ public class TransportExecuteFragmentAction
       List<String> scanFields = extractScanFields(request.getPlanFragmentJson());
       bridge.setRequestedFields(scanFields);
 
+      // Attempt predicate pushdown: extract filter from Velox plan and convert to Lucene query
+      org.apache.lucene.search.Query pushdownQuery =
+          extractPushdownQuery(request.getPlanFragmentJson());
+      if (pushdownQuery != null) {
+        logger.info("Predicate pushdown enabled for query {}: {}", queryId, pushdownQuery);
+      }
+
       // Start a background thread to feed data from Lucene into ExternalStream
+      final org.apache.lucene.search.Query finalPushdownQuery = pushdownQuery;
       Thread feederThread =
           new Thread(
               () -> {
                 try {
                   for (ShardId shardId : shardIds) {
-                    reader.readShardIntoStream(shardId, request.getSourceIndex(), bridge);
+                    reader.readShardIntoStream(
+                        shardId, request.getSourceIndex(), bridge, finalPushdownQuery);
                   }
                   bridge.noMoreInput();
                 } catch (Throwable e) {
@@ -188,6 +200,63 @@ public class TransportExecuteFragmentAction
       }
     }
     return List.of();
+  }
+
+  /**
+   * Extract a Lucene pushdown query from the plan's FilterNode, if present. Deserializes the plan,
+   * finds the FilterNode closest to the TableScan (i.e. the scan-level filter), and converts its
+   * filter expression to a Lucene Query via {@link LuceneFilterConverter}.
+   *
+   * @return a Lucene Query for predicate pushdown, or null if no filter or not pushable
+   */
+  private org.apache.lucene.search.Query extractPushdownQuery(String planJson) {
+    try {
+      Query query = Serde.fromJson(planJson, Query.class);
+      FilterNode filterNode = findFilterNode(query.getPlan());
+      if (filterNode == null) {
+        return null;
+      }
+      TypedExpr filterExpr = filterNode.getFilter();
+      LuceneFilterConverter converter = new LuceneFilterConverter();
+      return converter.convert(filterExpr);
+    } catch (Exception e) {
+      logger.warn(
+          "Failed to extract pushdown query, falling back to full scan: {}", e.getMessage());
+      return null;
+    }
+  }
+
+  /**
+   * Find the deepest FilterNode in the plan tree (closest to the TableScan). This is the scan-level
+   * filter most suitable for pushdown. An upper filter may sit above projections or other derived
+   * symbols and reference names that don't exist in the index.
+   *
+   * <p>Recurses depth-first: if a deeper FilterNode exists in the children, return that; otherwise
+   * return the current FilterNode.
+   */
+  private FilterNode findFilterNode(PlanNode node) {
+    // First, recurse into children to find a deeper FilterNode
+    try {
+      java.lang.reflect.Method m = PlanNode.class.getDeclaredMethod("getSources");
+      m.setAccessible(true);
+      @SuppressWarnings("unchecked")
+      List<PlanNode> sources = (List<PlanNode>) m.invoke(node);
+      if (sources != null) {
+        for (PlanNode source : sources) {
+          FilterNode deeper = findFilterNode(source);
+          if (deeper != null) {
+            return deeper;
+          }
+        }
+      }
+    } catch (Exception e) {
+      logger.warn("Cannot traverse plan node for filter extraction: {}", e.getMessage());
+    }
+    // No deeper FilterNode found — return this node if it's a FilterNode
+    if (node instanceof FilterNode) {
+      return (FilterNode) node;
+    }
+    return null;
   }
 
   private PlanNode findTableScanNode(PlanNode node) {

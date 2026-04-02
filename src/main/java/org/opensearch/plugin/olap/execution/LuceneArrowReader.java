@@ -14,6 +14,11 @@ import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.lucene.index.LeafReaderContext;
+import org.apache.lucene.search.DocIdSetIterator;
+import org.apache.lucene.search.Query;
+import org.apache.lucene.search.ScoreMode;
+import org.apache.lucene.search.Scorer;
+import org.apache.lucene.search.Weight;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.index.IndexService;
 import org.opensearch.index.engine.Engine;
@@ -57,8 +62,25 @@ public class LuceneArrowReader {
     this.allocator = allocator;
   }
 
-  /** Read all doc values from a shard and feed them into the ExternalStreamBridge. */
+  /** Read all doc values from a shard and feed them into the ExternalStreamBridge (full scan). */
   public void readShardIntoStream(ShardId shardId, String indexName, ExternalStreamBridge bridge)
+      throws IOException {
+    readShardIntoStream(shardId, indexName, bridge, null);
+  }
+
+  /**
+   * Read doc values from a shard and feed them into the ExternalStreamBridge.
+   *
+   * <p>When a Lucene {@code pushdownQuery} is provided, only matching documents are read — the
+   * query is evaluated per-segment via {@link Weight}/{@link Scorer} to obtain a {@link
+   * DocIdSetIterator} of matching doc IDs. This drastically reduces I/O for selective filters.
+   *
+   * <p>When {@code pushdownQuery} is null, falls back to a full scan of all documents.
+   *
+   * @param pushdownQuery optional Lucene query for predicate pushdown; null means full scan
+   */
+  public void readShardIntoStream(
+      ShardId shardId, String indexName, ExternalStreamBridge bridge, Query pushdownQuery)
       throws IOException {
     IndexService indexService = indicesService.indexServiceSafe(shardId.getIndex());
     IndexShard shard = indexService.getShard(shardId.id());
@@ -69,28 +91,91 @@ public class LuceneArrowReader {
 
       ArrowBatchBuilder batchBuilder = new ArrowBatchBuilder(allocator, columnSpecs, BATCH_SIZE);
 
-      // Iterate over all leaf readers (segments)
-      for (LeafReaderContext leafCtx : searcher.getIndexReader().leaves()) {
-        int maxDoc = leafCtx.reader().maxDoc();
-
-        // Process documents in batches
-        for (int startDoc = 0; startDoc < maxDoc; startDoc += BATCH_SIZE) {
-          int endDoc = Math.min(startDoc + BATCH_SIZE, maxDoc);
-
-          VectorSchemaRoot batch = batchBuilder.buildBatch(leafCtx.reader(), startDoc, endDoc);
-
-          bridge.feedBatch(batch);
-
-          logger.trace(
-              "Fed batch [{}-{}) from shard {} segment {}", startDoc, endDoc, shardId, leafCtx.ord);
-        }
+      if (pushdownQuery != null) {
+        readWithPushdown(searcher, batchBuilder, bridge, shardId, pushdownQuery);
+      } else {
+        readFullScan(searcher, batchBuilder, bridge, shardId);
       }
 
       logger.debug(
-          "Finished reading shard {}: segments={}",
+          "Finished reading shard {}: segments={}, pushdown={}",
           shardId,
-          searcher.getIndexReader().leaves().size());
+          searcher.getIndexReader().leaves().size(),
+          pushdownQuery != null);
     }
+  }
+
+  /** Full scan: iterate every document in every segment. */
+  private void readFullScan(
+      Engine.Searcher searcher,
+      ArrowBatchBuilder batchBuilder,
+      ExternalStreamBridge bridge,
+      ShardId shardId)
+      throws IOException {
+    for (LeafReaderContext leafCtx : searcher.getIndexReader().leaves()) {
+      int maxDoc = leafCtx.reader().maxDoc();
+
+      for (int startDoc = 0; startDoc < maxDoc; startDoc += BATCH_SIZE) {
+        int endDoc = Math.min(startDoc + BATCH_SIZE, maxDoc);
+
+        VectorSchemaRoot batch = batchBuilder.buildBatch(leafCtx.reader(), startDoc, endDoc);
+        bridge.feedBatch(batch);
+
+        logger.trace(
+            "Fed batch [{}-{}) from shard {} segment {}", startDoc, endDoc, shardId, leafCtx.ord);
+      }
+    }
+  }
+
+  /** Filtered scan: use a Lucene query to read only matching documents per segment. */
+  private void readWithPushdown(
+      Engine.Searcher searcher,
+      ArrowBatchBuilder batchBuilder,
+      ExternalStreamBridge bridge,
+      ShardId shardId,
+      Query pushdownQuery)
+      throws IOException {
+    // Engine.Searcher extends IndexSearcher — use it directly
+    Query rewritten = searcher.rewrite(pushdownQuery);
+    Weight weight = searcher.createWeight(rewritten, ScoreMode.COMPLETE_NO_SCORES, 1.0f);
+
+    long totalMatched = 0;
+
+    for (LeafReaderContext leafCtx : searcher.getIndexReader().leaves()) {
+      Scorer scorer = weight.scorer(leafCtx);
+      if (scorer == null) {
+        // No matches in this segment — skip entirely
+        logger.trace("Pushdown: no matches in shard {} segment {}", shardId, leafCtx.ord);
+        continue;
+      }
+
+      DocIdSetIterator docIdIter = scorer.iterator();
+      int[] batch = new int[BATCH_SIZE];
+      int count = 0;
+
+      for (int docId = docIdIter.nextDoc();
+          docId != DocIdSetIterator.NO_MORE_DOCS;
+          docId = docIdIter.nextDoc()) {
+        batch[count++] = docId;
+        if (count == BATCH_SIZE) {
+          VectorSchemaRoot arrowBatch = batchBuilder.buildBatch(leafCtx.reader(), batch, count);
+          bridge.feedBatch(arrowBatch);
+          totalMatched += count;
+          count = 0;
+        }
+      }
+
+      // Flush remaining docs in this segment
+      if (count > 0) {
+        VectorSchemaRoot arrowBatch = batchBuilder.buildBatch(leafCtx.reader(), batch, count);
+        bridge.feedBatch(arrowBatch);
+        totalMatched += count;
+      }
+
+      logger.trace("Pushdown: shard {} segment {} matched docs", shardId, leafCtx.ord);
+    }
+
+    logger.debug("Pushdown scan completed for shard {}: {} docs matched", shardId, totalMatched);
   }
 
   /**
