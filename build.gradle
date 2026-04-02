@@ -271,6 +271,9 @@ tasks.register('integTest', StandaloneRestIntegTestTask) {
 
     nonInputProperties.systemProperty('tests.rest.cluster', "${-> testClusters.integTest.allHttpSocketURI.join(",")}")
     nonInputProperties.systemProperty('tests.clustername', "${-> testClusters.integTest.getName()}")
+    // Pass the cluster log path so tests can verify pushdown log entries
+    nonInputProperties.systemProperty('tests.cluster.logfile',
+        "${-> testClusters.integTest.nodes.first().getServerLog()}")
     systemProperty 'tests.security.manager', 'false'
 
     testLogging {
