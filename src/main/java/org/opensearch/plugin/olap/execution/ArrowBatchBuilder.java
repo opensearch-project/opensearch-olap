@@ -77,7 +77,7 @@ public class ArrowBatchBuilder {
   }
 
   /**
-   * Read a batch of documents from the given leaf reader.
+   * Read a batch of documents from the given leaf reader (contiguous range).
    *
    * @param reader Lucene leaf reader for one segment
    * @param startDoc First document ID in this batch
@@ -88,6 +88,24 @@ public class ArrowBatchBuilder {
       throws IOException {
 
     int numDocs = Math.min(endDoc - startDoc, batchSize);
+    int[] docIds = new int[numDocs];
+    for (int i = 0; i < numDocs; i++) {
+      docIds[i] = startDoc + i;
+    }
+    return buildBatch(reader, docIds, numDocs);
+  }
+
+  /**
+   * Read a batch of documents at arbitrary (sparse) doc ID positions. Used by predicate pushdown
+   * where a Lucene query pre-filters doc IDs and only matching documents need to be read.
+   *
+   * @param reader Lucene leaf reader for one segment
+   * @param docIds array of document IDs to read (need not be contiguous)
+   * @param count number of valid entries in the docIds array
+   * @return VectorSchemaRoot with populated Arrow vectors
+   */
+  public VectorSchemaRoot buildBatch(LeafReader reader, int[] docIds, int count)
+      throws IOException {
 
     // Create Arrow schema and vectors
     List<Field> fields = new ArrayList<>(columns.size());
@@ -96,7 +114,7 @@ public class ArrowBatchBuilder {
     }
     Schema schema = new Schema(fields);
     VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator);
-    root.setRowCount(numDocs);
+    root.setRowCount(count);
 
     // Open doc value readers for each column
     List<DocValueColumnReader> readers = new ArrayList<>(columns.size());
@@ -113,12 +131,11 @@ public class ArrowBatchBuilder {
       FieldVector vector = root.getVector(col);
       vector.allocateNew();
 
-      for (int row = 0; row < numDocs; row++) {
-        int docId = startDoc + row;
-        populateValue(vector, row, docId, dvReader, spec.arrowType);
+      for (int row = 0; row < count; row++) {
+        populateValue(vector, row, docIds[row], dvReader, spec.arrowType);
       }
 
-      vector.setValueCount(numDocs);
+      vector.setValueCount(count);
     }
 
     return root;
