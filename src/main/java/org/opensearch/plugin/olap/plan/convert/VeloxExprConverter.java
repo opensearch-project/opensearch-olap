@@ -12,10 +12,12 @@ import java.util.List;
 import java.util.Map;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rel.type.RelDataTypeField;
+import org.apache.calcite.rex.RexBuilder;
 import org.apache.calcite.rex.RexCall;
 import org.apache.calcite.rex.RexInputRef;
 import org.apache.calcite.rex.RexLiteral;
 import org.apache.calcite.rex.RexNode;
+import org.apache.calcite.rex.RexUtil;
 import org.apache.calcite.sql.SqlKind;
 import org.apache.calcite.sql.type.SqlTypeName;
 import org.apache.calcite.util.NlsString;
@@ -69,9 +71,11 @@ public class VeloxExprConverter {
   }
 
   private final RelDataType inputRowType;
+  private final RexBuilder rexBuilder;
 
   public VeloxExprConverter(RelDataType inputRowType) {
     this.inputRowType = inputRowType;
+    this.rexBuilder = new RexBuilder(new org.apache.calcite.jdbc.JavaTypeFactoryImpl());
   }
 
   public TypedExpr convert(RexNode rexNode) {
@@ -80,7 +84,14 @@ public class VeloxExprConverter {
     } else if (rexNode instanceof RexLiteral) {
       return convertLiteral((RexLiteral) rexNode);
     } else if (rexNode instanceof RexCall) {
-      return convertCall((RexCall) rexNode);
+      RexCall call = (RexCall) rexNode;
+      // Calcite rewrites OR conditions on the same column (e.g. city='A' OR city='B')
+      // into SEARCH(ref, Sarg[...]) which uses SARG literals. Expand back to OR/AND.
+      if (call.getKind() == SqlKind.SEARCH) {
+        RexNode expanded = RexUtil.expandSearch(rexBuilder, null, call);
+        return convert(expanded);
+      }
+      return convertCall(call);
     }
     throw new UnsupportedOperationException(
         "Unsupported RexNode type: " + rexNode.getClass().getSimpleName());
@@ -203,6 +214,13 @@ public class VeloxExprConverter {
       inputs.add(convert(operand));
     }
 
+    // Velox requires exact type match for comparison operators. When comparing a
+    // DOUBLE field against an INTEGER literal (from Calcite's DECIMAL-with-scale-0),
+    // insert an implicit cast on the mismatched operand.
+    if (isComparison(kind) && inputs.size() == 2) {
+      inputs = coerceComparisonTypes(inputs);
+    }
+
     Type returnType = VeloxTypeConverter.toVeloxType(call.getType());
     return new CallTypedExpr(returnType, inputs, functionName);
   }
@@ -233,5 +251,66 @@ public class VeloxExprConverter {
     TypedExpr gte = new CallTypedExpr(new BooleanType(), List.of(value, lower), "gte");
     TypedExpr lte = new CallTypedExpr(new BooleanType(), List.of(value, upper), "lte");
     return new CallTypedExpr(new BooleanType(), List.of(gte, lte), "and");
+  }
+
+  private static boolean isComparison(SqlKind kind) {
+    return kind == SqlKind.EQUALS
+        || kind == SqlKind.NOT_EQUALS
+        || kind == SqlKind.GREATER_THAN
+        || kind == SqlKind.GREATER_THAN_OR_EQUAL
+        || kind == SqlKind.LESS_THAN
+        || kind == SqlKind.LESS_THAN_OR_EQUAL;
+  }
+
+  /**
+   * Coerce mismatched types in binary comparisons by inserting a CAST on the narrower operand.
+   * Velox requires exact type match for comparison functions. Calcite represents integer literals
+   * as DECIMAL(scale=0) which our converter turns into IntegerValue/BigIntValue, but the column may
+   * be DOUBLE — causing a type mismatch crash in Velox.
+   */
+  private List<TypedExpr> coerceComparisonTypes(List<TypedExpr> inputs) {
+    TypedExpr left = inputs.get(0);
+    TypedExpr right = inputs.get(1);
+    Type leftType = left.getReturnType();
+    Type rightType = right.getReturnType();
+
+    if (leftType.getClass().equals(rightType.getClass())) {
+      return inputs; // types match, no coercion needed
+    }
+
+    // Determine the wider type and cast the other operand
+    Type wider = widerNumericType(leftType, rightType);
+    if (wider == null) {
+      return inputs; // non-numeric or unknown types, leave as-is
+    }
+
+    List<TypedExpr> coerced = new ArrayList<>(2);
+    coerced.add(
+        leftType.getClass().equals(wider.getClass())
+            ? left
+            : CastTypedExpr.create(wider, left, false));
+    coerced.add(
+        rightType.getClass().equals(wider.getClass())
+            ? right
+            : CastTypedExpr.create(wider, right, false));
+    return coerced;
+  }
+
+  /** Return the wider of two numeric types, or null if not both numeric. */
+  private Type widerNumericType(Type a, Type b) {
+    int rankA = numericRank(a);
+    int rankB = numericRank(b);
+    if (rankA < 0 || rankB < 0) return null;
+    return rankA >= rankB ? a : b;
+  }
+
+  private int numericRank(Type t) {
+    if (t instanceof org.boostscale.velox4j.type.TinyIntType) return 0;
+    if (t instanceof org.boostscale.velox4j.type.SmallIntType) return 1;
+    if (t instanceof org.boostscale.velox4j.type.IntegerType) return 2;
+    if (t instanceof org.boostscale.velox4j.type.BigIntType) return 3;
+    if (t instanceof org.boostscale.velox4j.type.RealType) return 4;
+    if (t instanceof org.boostscale.velox4j.type.DoubleType) return 5;
+    return -1;
   }
 }
