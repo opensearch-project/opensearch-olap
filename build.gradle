@@ -28,6 +28,7 @@ plugins {
 import java.util.stream.Collectors
 
 apply plugin: 'java'
+apply plugin: 'jacoco'
 apply plugin: 'opensearch.opensearchplugin'
 apply plugin: 'opensearch.pluginzip'
 
@@ -112,8 +113,8 @@ configurations {
 }
 
 // velox4j bundles slf4j classes; exclude from plugin classpath to avoid jar hell at runtime.
-// NOT excluded from integTest — the REST test client needs slf4j.
-['compileClasspath', 'runtimeClasspath', 'testCompileClasspath', 'testRuntimeClasspath'].each { name ->
+// NOT excluded from test/integTest — Calcite and the REST client need slf4j.
+['compileClasspath', 'runtimeClasspath'].each { name ->
     configurations.named(name).configure {
         exclude group: 'org.slf4j', module: 'slf4j-api'
     }
@@ -167,6 +168,29 @@ dependencies {
     testImplementation "org.opensearch:opensearch-agent:${opensearch_version}"
     testImplementation "junit:junit:4.13.2"
     testImplementation "org.mockito:mockito-core:5.20.0"
+    testRuntimeOnly "org.slf4j:slf4j-api:2.0.17"
+    testRuntimeOnly "org.slf4j:slf4j-nop:2.0.17"
+    // Calcite + SQL plugin classes are compileOnly but needed at test time for plan conversion tests
+    testImplementation "org.apache.calcite:calcite-core:${calcite_version}"
+    testImplementation "org.apache.calcite:calcite-linq4j:${calcite_version}"
+    testImplementation "org.jooq:joou-java-6:0.9.4"
+    testRuntimeOnly "com.jayway.jsonpath:json-path:2.9.0"
+    testRuntimeOnly "org.codehaus.janino:janino:3.1.12"
+    testRuntimeOnly "org.codehaus.janino:commons-compiler:3.1.12"
+    testImplementation "com.google.guava:failureaccess:1.0.2"
+    testImplementation("org.opensearch.query:unified-query-core:${sql_plugin_version}") { transitive = false }
+    testImplementation("org.opensearch.query:unified-query-common:${sql_plugin_version}") { transitive = false }
+    testImplementation("org.opensearch.query:unified-query-opensearch:${sql_plugin_version}") { transitive = false }
+    // Add the repackaged velox4j jar to test compile and runtime classpath.
+    // The original velox4j is excluded from test configs (see configurations block above)
+    // to avoid jar hell; use the repackaged jar (javax.annotation/slf4j stripped) instead.
+    testImplementation files(tasks.named('repackageVelox4j').map { it.archiveFile })
+    // Calcite is compileOnly (provided by SQL plugin at runtime), but tests need it directly
+    testImplementation "org.apache.calcite:calcite-core:${calcite_version}"
+    // avatica-core is a transitive dep of calcite-core; needed for NlsString (ByteString) in tests
+    testImplementation "org.apache.calcite.avatica:avatica-core:1.27.0"
+    // Guava is required at test runtime by Calcite (SqlTypeName uses ImmutableMap, etc.)
+    testImplementation "com.google.guava:guava:33.4.8-jre"
 }
 
 // =============================================================================
@@ -282,13 +306,73 @@ publishing {
 
 // Disable loggerUsageCheck — requires logger-usage artifact from full OpenSearch build
 tasks.named('loggerUsageCheck').configure { enabled = false }
+// Disable forbidden API check for integTest sources (REST client uses internal APIs)
+tasks.matching { it.name == 'forbiddenApisIntegTest' }.configureEach { enabled = false }
 
 test {
     systemProperty 'io.netty.tryReflectionSetAccessible', 'true'
     jvmArgs += ["--add-opens", "java.base/java.nio=ALL-UNNAMED"]
     // Attach OpenSearch security agent required by test framework
     jvmArgs += ["-javaagent:${configurations.testRuntimeClasspath.files.find { it.name.startsWith('opensearch-agent-') && !it.name.contains('bootstrap') && !it.name.contains('policy') }}"]
+    finalizedBy jacocoTestReport
 }
+
+// =============================================================================
+// JaCoCo Test Coverage
+// =============================================================================
+
+jacoco {
+    toolVersion = "0.8.12"
+}
+
+jacocoTestReport {
+    dependsOn test
+    reports {
+        html.required = true
+        xml.required = true
+        csv.required = false
+    }
+    afterEvaluate {
+        classDirectories.setFrom(files(classDirectories.files.collect {
+            fileTree(dir: it, exclude: [
+                // Exclude classes that depend on Velox native libraries (untestable without C++)
+                '**/execution/VeloxExecutor*',
+                '**/execution/VeloxLifecycleService*',
+                '**/execution/ExternalStreamBridge*',
+                '**/execution/ArrowBatchBuilder*',
+                '**/execution/DocValueColumnReader*',
+                '**/execution/LuceneArrowReader*',
+                // Exclude classes requiring full OpenSearch runtime (TransportService, IndicesService)
+                '**/transport/TransportExecuteFragmentAction*',
+                '**/transport/NodeResultCollector*',
+                '**/scheduler/QueryScheduler*',
+                '**/scheduler/ShardRouter*',
+                // Exclude engine classes requiring Velox session or SQL plugin runtime
+                '**/engine/VeloxExecutionEngine*',
+                '**/engine/VectorizedEngineExtension*',
+                '**/engine/VeloxQueryResult*',
+                // Exclude plugin entry point (requires OpenSearch bootstrap)
+                '**/OlapPlugin*',
+            ])
+        }))
+    }
+}
+
+jacocoTestCoverageVerification {
+    dependsOn jacocoTestReport
+    violationRules {
+        rule {
+            limit {
+                minimum = 0.5
+            }
+        }
+    }
+    afterEvaluate {
+        classDirectories.setFrom(jacocoTestReport.classDirectories)
+    }
+}
+
+check.dependsOn jacocoTestCoverageVerification
 
 // Third-party audit: only Arrow and velox4j are bundled; Calcite/Guava/Jackson are compileOnly
 thirdPartyAudit.ignoreMissingClasses(

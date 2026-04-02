@@ -246,7 +246,24 @@ The OLAP plugin extends the SQL plugin's classloader (`extendedPlugins = ['opens
 
 The plugin ZIP will be generated at `build/distributions/opensearch-olap-3.6.0-SNAPSHOT.zip`.
 
-## Integration Tests
+## Testing
+
+### Unit Tests
+
+```bash
+# Run unit tests
+./gradlew test
+
+# Run unit tests with coverage verification (fails if below 50%)
+./gradlew test jacocoTestCoverageVerification
+
+# Auto-fix import ordering / formatting
+./gradlew spotlessApply
+```
+
+Coverage reports are generated at `build/reports/jacoco/test/html/index.html`. Classes that require Velox native libraries or full OpenSearch runtime (e.g., `VeloxExecutor`, `VeloxExecutionEngine`, `QueryScheduler`) are excluded from coverage verification since they cannot be unit tested without the C++ runtime.
+
+### Integration Tests
 
 Integration tests run against a real single-node OpenSearch cluster with the job-scheduler, SQL, and OLAP plugins installed. The cluster is managed by Gradle's `testClusters` infrastructure — it starts automatically, waits for Velox engine initialization (~30-40s), runs the tests, and shuts down.
 
