@@ -5,7 +5,11 @@
 package org.opensearch.plugin.olap;
 
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.Arrays;
+import java.util.List;
+import java.util.stream.Collectors;
 import org.apache.hc.core5.http.HttpHost;
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -117,5 +121,28 @@ public abstract class OlapRestTestCase extends OpenSearchTestCase {
   /** Get datarows from a PPL response as a JSONArray. */
   protected JSONArray getDataRows(JSONObject response) {
     return response.getJSONArray("datarows");
+  }
+
+  /**
+   * Read lines from the cluster log file that match the given substring. Used to verify that
+   * predicate pushdown actually reached Lucene (vs being evaluated by Velox after a full scan).
+   */
+  protected List<String> getLogLines(String substring) throws IOException {
+    String logPath = System.getProperty("tests.cluster.logfile");
+    if (logPath == null || logPath.isEmpty()) {
+      return List.of();
+    }
+    Path path = Path.of(logPath);
+    if (!Files.exists(path)) {
+      return List.of();
+    }
+    return Files.readAllLines(path).stream()
+        .filter(line -> line.contains(substring))
+        .collect(Collectors.toList());
+  }
+
+  /** Count how many log lines contain the given substring. */
+  protected long countLogLines(String substring) throws IOException {
+    return getLogLines(substring).size();
   }
 }

@@ -9,6 +9,7 @@ import java.util.HashSet;
 import java.util.Set;
 import org.json.JSONArray;
 import org.json.JSONObject;
+import org.opensearch.client.Request;
 
 /**
  * Integration tests for predicate pushdown to Lucene. These queries include WHERE filters that the
@@ -251,6 +252,52 @@ public class PredicatePushdownIT extends OlapRestTestCase {
     assertEquals(42, rows.getJSONArray(0).getInt(1));
     assertEquals("Alice", rows.getJSONArray(1).getString(0));
     assertEquals(35, rows.getJSONArray(1).getInt(1));
+  }
+
+  // --- Pushdown verification via cluster logs ---
+
+  public void testPushdownAppearsInLogs() throws IOException {
+    // Record log line count before query
+    long beforeCount = countLogLines("Predicate pushdown enabled");
+
+    // Run a filter query that should trigger pushdown
+    executePPLQuery("source=test_olap | where age > 30 | fields name");
+
+    // The cluster log should contain a "Predicate pushdown enabled" entry
+    long afterCount = countLogLines("Predicate pushdown enabled");
+    assertTrue(
+        "Expected 'Predicate pushdown enabled' log entry after filter query",
+        afterCount > beforeCount);
+  }
+
+  public void testPushdownScansFewerDocsThanTotal() throws IOException {
+    // Enable DEBUG logging so the pushdown scan detail is captured
+    Request debugLog = new Request("PUT", "/_cluster/settings");
+    debugLog.setJsonEntity(
+        "{\"transient\":{\"logger.org.opensearch.plugin.olap.execution\":\"DEBUG\"}}");
+    client().performRequest(debugLog);
+
+    // Record log state before query
+    long beforeCount = countLogLines("Pushdown scan completed");
+
+    // city = 'Denver' matches only 1 of 5 docs — pushdown should read far fewer
+    executePPLQuery("source=test_olap | where city = 'Denver' | fields name");
+
+    // Verify the pushdown scan log appeared with a doc count
+    java.util.List<String> pushdownLogs = getLogLines("Pushdown scan completed");
+    long afterCount = pushdownLogs.size();
+    assertTrue(
+        "Expected 'Pushdown scan completed' log entry after filter query",
+        afterCount > beforeCount);
+
+    // Extract the doc count from the latest log line: "... {} docs matched"
+    String latestLog = pushdownLogs.get(pushdownLogs.size() - 1);
+    java.util.regex.Matcher m =
+        java.util.regex.Pattern.compile("(\\d+) docs matched").matcher(latestLog);
+    assertTrue("Log should contain doc count", m.find());
+    int docsMatched = Integer.parseInt(m.group(1));
+    assertTrue(
+        "Pushdown should scan fewer docs than total (5), got " + docsMatched, docsMatched < 5);
   }
 
   // --- Helper ---
