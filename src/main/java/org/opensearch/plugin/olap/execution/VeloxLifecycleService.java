@@ -46,13 +46,37 @@ public class VeloxLifecycleService implements Closeable {
   public static final Setting<Integer> VELOX_NUM_THREADS =
       Setting.intSetting("plugins.velox.num_threads", 4, 1, Setting.Property.NodeScope);
 
+  /** Enable MPP (massively parallel processing) join strategies (broadcast + hash shuffle). */
+  public static final Setting<Boolean> MPP_ENABLED =
+      Setting.boolSetting("plugins.velox.mpp_enabled", false, Setting.Property.NodeScope);
+
+  /**
+   * Max primary shard count for the smaller join side to qualify for broadcast. If the smaller side
+   * has more shards than this, hash shuffle is used instead.
+   */
+  public static final Setting<Integer> BROADCAST_MAX_SHARDS =
+      Setting.intSetting("plugins.velox.broadcast_max_shards", 2, 1, Setting.Property.NodeScope);
+
+  /**
+   * Number of shuffle partitions for hash shuffle join. Defaults to 0 which means auto (use the
+   * number of data nodes).
+   */
+  public static final Setting<Integer> SHUFFLE_PARTITIONS =
+      Setting.intSetting("plugins.velox.shuffle_partitions", 0, 0, Setting.Property.NodeScope);
+
   private volatile boolean enabled;
+  private volatile boolean mppEnabled;
+  private volatile int broadcastMaxShards;
+  private volatile int shufflePartitions;
   private volatile MemoryManager memoryManager;
   private volatile Session session;
   private volatile boolean initialized = false;
 
   public VeloxLifecycleService(Settings settings) {
     this.enabled = OLAP_ENABLED.get(settings);
+    this.mppEnabled = MPP_ENABLED.get(settings);
+    this.broadcastMaxShards = BROADCAST_MAX_SHARDS.get(settings);
+    this.shufflePartitions = SHUFFLE_PARTITIONS.get(settings);
 
     if (enabled) {
       try {
@@ -102,11 +126,16 @@ public class VeloxLifecycleService implements Closeable {
     logger.info("Velox engine initialized successfully");
   }
 
+  /**
+   * Create a new Session for each query execution. Each Session has its own memory pool namespace,
+   * avoiding "Leaf child memory pool already exists" collisions when multiple queries run
+   * sequentially on the same JVM.
+   */
   public Session getSession() {
     if (!initialized) {
       throw new IllegalStateException("Velox engine not initialized");
     }
-    return session;
+    return Velox4j.newSession(memoryManager);
   }
 
   public MemoryManager getMemoryManager() {
@@ -117,8 +146,26 @@ public class VeloxLifecycleService implements Closeable {
     return enabled;
   }
 
+  public boolean isMppEnabled() {
+    return mppEnabled;
+  }
+
+  public int getBroadcastMaxShards() {
+    return broadcastMaxShards;
+  }
+
+  public int getShufflePartitions() {
+    return shufflePartitions;
+  }
+
   public static List<Setting<?>> getSettings() {
-    return List.of(OLAP_ENABLED, VELOX_MEMORY_LIMIT, VELOX_NUM_THREADS);
+    return List.of(
+        OLAP_ENABLED,
+        VELOX_MEMORY_LIMIT,
+        VELOX_NUM_THREADS,
+        MPP_ENABLED,
+        BROADCAST_MAX_SHARDS,
+        SHUFFLE_PARTITIONS);
   }
 
   @Override

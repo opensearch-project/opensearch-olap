@@ -20,6 +20,14 @@ import org.boostscale.velox4j.plan.PlanNode;
  *   <li>Fragment 0 (leaf): TableScan + Filter + partial Aggregation → runs on data nodes
  *   <li>Fragment 1 (root): final Aggregation + Project → runs on coordinator
  * </ul>
+ *
+ * <p>For join queries, additional fragment types are used:
+ *
+ * <ul>
+ *   <li>Coordinator-centric: left scan, right scan, coordinator join
+ *   <li>Broadcast: build scan (collected), probe+join (on probe nodes)
+ *   <li>Hash shuffle: left scan+partition, right scan+partition, join on workers
+ * </ul>
  */
 public class PlanFragment {
 
@@ -27,6 +35,12 @@ public class PlanFragment {
   private final PlanNode planRoot;
   private final FragmentProperties properties;
   private final List<Integer> inputFragmentIds;
+
+  /**
+   * Serialized build-side batches for broadcast join. Set on probe-side fragments that need to
+   * receive broadcast data. Null for non-broadcast fragments.
+   */
+  private List<byte[]> broadcastData;
 
   public PlanFragment(
       int fragmentId,
@@ -61,5 +75,13 @@ public class PlanFragment {
 
   public boolean isRoot() {
     return properties.getDistribution() == FragmentProperties.Distribution.COORDINATOR;
+  }
+
+  public List<byte[]> getBroadcastData() {
+    return broadcastData;
+  }
+
+  public void setBroadcastData(List<byte[]> broadcastData) {
+    this.broadcastData = broadcastData;
   }
 }

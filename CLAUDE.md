@@ -5,27 +5,50 @@ An OpenSearch plugin integrating Apache Velox (via velox4j) as a vectorized exec
 
 ## Architecture
 ```
-SQL Plugin: SQL/PPL → Calcite Analyzer → RelNode
+SQL Plugin: SQL/PPL → Calcite Analyzer → RelNode (Convention.NONE)
                                            │
                               DelegatingExecutionEngine
                               checks canVectorize(plan)
                                            │
                          ┌─── true ────────┴──── false ───┐
                          ▼                                 ▼
-OLAP Plugin: OlapExecutionExtensionImpl     OpenSearchExecutionEngine
-             → VeloxExecutionEngine              (default)
-             → VeloxPlanConverter
-             → PlanFragmenter
-             → QueryScheduler
-             → Data Nodes (Lucene → Arrow → Velox C++)
+OLAP Plugin: VeloxExecutionEngine           OpenSearchExecutionEngine
+             │                                   (default)
+             ▼
+  PhysicalOptimizer
+    1. ClusterCopyShuttle: deep-copies plan into new VolcanoPlanner
+       - Strips CalciteLogicalIndexScan → plain LogicalTableScan
+       - New cluster has RelDistributionTraitDef from start
+    2. HepPlanner: FilterMergeRule (lightweight logical cleanup)
+    3. VolcanoPlanner with ConverterRules:
+       - Convention.NONE → PhysicalConvention
+       - PhysicalAggregateRule inserts PhysicalExchange(SINGLETON) before agg
+       - PhysicalJoinRule inserts PhysicalExchange(SINGLETON) for both join inputs
+       - MPP rules: HASH distribution alternatives (when mpp_enabled=true)
+             │
+             ▼
+  VeloxPlanGenerator
+    - Walks physical plan, splits at PhysicalExchange boundaries
+    - Two-stage agg split: Aggregate(SINGLE)+Exchange → PARTIAL+FINAL
+    - Converts to Velox PlanNodes (reuses plan/convert/ utilities)
+    - Produces List<PlanFragment>
+             │
+             ▼
+  QueryScheduler → NodeResultCollector → Velox C++
 ```
 
 ## Key packages
-- `engine/` - SQL plugin integration: `VeloxExecutionEngine` (orchestrates full pipeline), `OlapExecutionExtensionImpl` (implements `ExecutionEngine` with `canVectorize()`)
-- `plan/convert/` - Calcite RelNode → velox4j PlanNode conversion (TableScan, Filter, Project, Aggregate, Join, Sort)
-- `plan/fragment/` - Splits plan at aggregation boundaries (PARTIAL on data nodes, FINAL on coordinator)
-- `scheduler/` - Presto-inspired Stage/Task scheduler using OpenSearch ClusterState for shard routing
-- `transport/` - Inter-node communication via OpenSearch TransportService (`ExecuteFragmentAction`)
+- `engine/` - SQL plugin integration: `VeloxExecutionEngine` (orchestrates full pipeline), `VectorizedEngineExtension` (implements `ExecutionEngine` with `canVectorize()`)
+- `plan/convert/` - Calcite → Velox expression/type/aggregate converters (reused by both paths)
+- `plan/fragment/` - PlanFragment, FragmentProperties data classes + PlanFragmenter (current path)
+- `plan/physical/` - Calcite Convention-based physical planning framework
+  - Physical RelNode classes: `PhysicalTableScan`, `PhysicalFilter`, `PhysicalProject`, `PhysicalAggregate`, `PhysicalJoin`, `PhysicalSort`, `PhysicalExchange`
+  - `PhysicalConvention` with `enforce()` for auto Exchange insertion
+  - `PhysicalOptimizer` runs VolcanoPlanner with distribution traits
+  - `VeloxPlanGenerator` converts physical plan → Velox PlanNodes + PlanFragments
+  - `rules/` - ConverterRules (NONE→PHYSICAL), MPP rules, TwoStageAggRule
+- `scheduler/` - Presto-inspired Stage/Task scheduler using OpenSearch ClusterState for shard routing. Also contains `CostEstimator` and `JoinStrategy` for MPP join selection.
+- `transport/` - Inter-node communication: `ExecuteFragmentAction` for fragment dispatch, `ShuffleDataAction` for P2P shuffle data exchange, `ShuffleManager` for shuffle buffer management
 - `execution/` - Lucene DocValues → Arrow → velox4j ExternalStream.BlockingQueue → Velox C++ execution
 - `result/` - Interface stubs for result collection (not yet implemented)
 
@@ -104,12 +127,46 @@ Key implementation details:
 - `TransportExecuteFragmentAction` detects PARTIAL plans via `planJson.contains("\"step\":\"PARTIAL\"")` to decide Arrow IPC vs native serde
 - The feeder thread must start AFTER `serialTask.addSplit()` + `noMoreSplits()` to avoid race conditions
 
+## MPP join support
+Three join strategies controlled by `plugins.velox.mpp_enabled` (default false):
+- **Coordinator-centric** (mpp_enabled=false): Both sides gathered to coordinator, join runs locally
+- **Broadcast** (mpp_enabled=true, small build side): Small table broadcast to all probe nodes
+- **Hash shuffle** (mpp_enabled=true, both large): Both sides hash-partitioned by join key, shuffled P2P via `ShuffleDataAction`
+
+Cost estimator uses shard count heuristic (`plugins.velox.broadcast_max_shards`, default 2). `plugins.velox.shuffle_partitions` controls partition count (0 = auto, uses number of data nodes).
+
+### Join column name conflict
+Velox validates that left and right output types have no duplicate names. The SQL plugin's `CalciteRelNodeVisitor.visitJoin()` adds a rename Project above the join (e.g. `dept_id0` → `d.dept_id`). The converter inserts a `ProjectNode` around the right side to rename conflicting columns. The scan keeps original names (for `LuceneArrowReader`), and ExternalStream maps by position, so the rename is transparent.
+
+## Calcite physical planning framework (plan/physical/)
+Uses Calcite's Convention + VolcanoPlanner, wired into `VeloxExecutionEngine.execute()`:
+- `PhysicalConvention` — custom Convention with `enforce()` for auto Exchange insertion
+- `PhysicalConvention.useAbstractConvertersForConversion()` returns `true` for distribution enforcement
+- Physical nodes extend Calcite base classes (Filter, Project, etc.) and implement `PhysicalRel` marker interface
+- `PhysicalTableScan` overrides `deriveRowType()` to preserve the SQL plugin's scan row type
+- ConverterRules convert Convention.NONE → PhysicalConvention with explicit PhysicalExchange insertion
+- MPP rules (MppAggregateRule, MppJoinRule) registered only when mpp_enabled=true
+- `PhysicalOptimizer` creates a **new VolcanoPlanner + RelOptCluster** with `RelDistributionTraitDef`. Deep-copies the incoming plan via `ClusterCopyShuttle` to decouple from the SQL plugin's planner. Runs `FilterMergeRule` via HepPlanner before VolcanoPlanner.
+- `VeloxPlanGenerator` walks the physical plan, splits at PhysicalExchange nodes, handles two-stage aggregation split (PARTIAL/FINAL with Velox-specific intermediate types)
+- Reuses Calcite's built-in `RelDistribution` (SINGLETON, HASH_DISTRIBUTED, RANDOM_DISTRIBUTED, ANY)
+- **Guava is compileOnly** in build.gradle — needed because Calcite base classes use `ImmutableList` in constructors
+
+### ClusterCopyShuttle design
+The SQL plugin's `CalciteLogicalIndexScan.register()` adds pushdown rules (`FilterIndexScanRule`, `AggregateIndexScanRule`, etc.) to whatever planner it's registered with. If the OLAP plugin reused the SQL plugin's planner, these rules would fire and fold operators into the scan — eliminating the LogicalAggregate/LogicalFilter that Velox needs.
+
+Solution: `PhysicalOptimizer` creates its own `VolcanoPlanner` + `RelOptCluster` and deep-copies the plan into it. `ClusterCopyShuttle` converts `CalciteLogicalIndexScan` → plain `LogicalTableScan` (stripping PushDownContext), so the pushdown rules are never registered. All logical operators remain in the plan tree.
+
+### Two-stage aggregation in VeloxPlanGenerator
+The PARTIAL/FINAL split requires Velox-specific intermediate accumulator types (e.g., avg → ROW(DOUBLE, BIGINT)) that don't map to Calcite's type system. The `TwoStageAggRule` Calcite rule can't produce these types. Instead, `VeloxPlanGenerator.convertTwoStageAggregate()` detects `Aggregate(SINGLE) → Exchange` and splits it with proper Velox accumulator types.
+
+## Per-query session creation
+`VeloxLifecycleService.getSession()` creates a new `Session` per call (not a shared singleton). Each session gets its own memory pool namespace, preventing "Leaf child memory pool already exists" collisions between sequential queries. The `MemoryManager` is shared across sessions.
+
 ## Known issues / TODOs
-- **Filter + projection data correctness**: Non-aggregation queries (`where age > 30 | fields name, age, salary`) return incorrect data. The `TableScanNode` outputType includes 10 columns (4 user columns + 6 metadata: `_id`, `_index`, `_score`, `_maxscore`, `_sort`, `_routing`) but `LuceneArrowReader` only reads the 4 user columns that have doc values. Column positions mismatch causes Velox to read wrong data. Fix: trim outputType to only columns actually referenced by the query (see TODO in `VeloxPlanConverter.visitTableScan()`).
 - **OpenSearch doc values types**: OpenSearch stores all numeric types as `SORTED_NUMERIC` (not `NUMERIC`) and keyword/text as `SORTED_SET` (not `SORTED`). `LuceneArrowReader.mapToDocValueType()` handles this.
 - **Arrow Text → String**: Arrow Utf8 vectors return `org.apache.arrow.vector.util.Text` objects. Must convert to `String` before passing to `ExprValueUtils.tupleValue()` in `VeloxExecutionEngine.readArrowIpcToExprValues()`.
 - **Velox temp dirs in /tmp**: Each Velox initialization creates ~490MB temp dir under `/tmp`. Multiple restarts or multi-node clusters on the same host can fill `/tmp` (tmpfs). Clean with `rm -rf /tmp/opensearch-*`.
-- **velox4j `PlanNode.getSources()` is protected**: Cannot traverse plan trees without reflection. Affects `PlanFragmenter`, `VeloxExecutor.findTableScanNodeId()`, `VeloxExecutionEngine.wireSourceIntoPlan()`, and `TransportExecuteFragmentAction.findTableScanNode()`.
+- **velox4j `PlanNode.getSources()` is protected**: Cannot traverse plan trees without reflection. A fix to make it `public` is pending in velox4j (branch `fix/unique-memory-pool-names`). Once merged, remove all reflection hacks in PlanFragmenter, VeloxExecutor, VeloxExecutionEngine, TransportExecuteFragmentAction.
 
 ## Graceful degradation
 `VeloxLifecycleService` catches native library load failures and disables itself (logs a warning). This allows the plugin to install on unsupported platforms (e.g. macOS/aarch64) without crashing OpenSearch. `canVectorize()` returns `false` when Velox is unavailable.
@@ -120,12 +177,17 @@ bin/opensearch-plugin install opensearch-sql
 bin/opensearch-plugin install file:///path/to/opensearch-olap-3.6.0-SNAPSHOT.zip
 ```
 
+## Design reference
+RFC 4812: https://github.com/opensearch-project/sql/issues/4812
+- Summary folder: `../RFC_4812`
+
 ## API reference repositories
 All repositories are siblings under the same parent directory (`../`):
 - SQL plugin: `../search-plugins-sql`
   - `ExecutionEngine` interface: `core/src/main/java/org/opensearch/sql/executor/ExecutionEngine.java`
   - `DelegatingExecutionEngine`: `core/src/main/java/org/opensearch/sql/executor/DelegatingExecutionEngine.java`
 - OpenSearch core: `../OpenSearch`
+- Calcite: `../calcite`
 - Presto: `../presto` — scheduler design reference
 - velox4j: `../velox4j` — Velox JNI bridge (C++ connector init in `src/main/cpp/main/velox4j/init/Init.cc`)
 - Gluten-Flink: `../gluten` — reference for how Flink uses velox4j (different architecture: streaming, uses custom `StatefulPlanNode`, Flink handles shuffle)

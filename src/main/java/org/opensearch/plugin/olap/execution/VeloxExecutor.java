@@ -34,18 +34,13 @@ import org.boostscale.velox4j.session.Session;
 /**
  * Executes a Velox plan fragment via velox4j and returns results as Arrow IPC bytes.
  *
- * <p>The executor:
+ * <p>Supports three execution modes:
  *
- * <ol>
- *   <li>Deserializes the plan JSON into a velox4j PlanNode
- *   <li>Creates a Query with ConnectorConfig registering the ExternalStream connector
- *   <li>Executes the query and adds a split referencing the local BlockingQueue
- *   <li>Iterates over the SerialTask to collect result RowVectors
- *   <li>Converts results to Arrow IPC format for transport back to coordinator
- * </ol>
- *
- * <p>The plan's TableScanNode reads from an ExternalStream (BlockingQueue) that is being fed by the
- * LuceneArrowReader on a separate thread.
+ * <ul>
+ *   <li><b>Single-input</b>: Standard scan execution with one ExternalStream
+ *   <li><b>Dual-input</b>: Join execution with two ExternalStreams (left + right)
+ *   <li><b>Iterator</b>: Returns raw RowVector iterator for shuffle partitioning
+ * </ul>
  */
 public class VeloxExecutor {
 
@@ -68,84 +63,30 @@ public class VeloxExecutor {
   public byte[] execute(String planJson, String connectorId, BlockingQueue queue) {
     Queries queries = session.queryOps();
 
-    // Deserialize the plan from JSON
     Query originalQuery = Serde.fromJson(planJson, Query.class);
-
-    // Rebuild the query with ConnectorConfig registering the ExternalStream connector
     ConnectorConfig connectorConfig = ConnectorConfig.create(Map.of(connectorId, Config.empty()));
     Query query =
         new Query(originalQuery.getPlan(), originalQuery.getQueryConfig(), connectorConfig);
 
-    // Log the query for debugging
     logger.info("Executing Velox query: {}", Serde.toJson(query));
 
-    // Create a serial task (does not start execution until splits are added)
     SerialTask serialTask = queries.execute(query);
 
-    // Find the TableScanNode ID in the plan tree
     String scanNodeId = findTableScanNodeId(query.getPlan());
     if (scanNodeId == null) {
       throw new IllegalStateException("No TableScanNode found in plan");
     }
 
-    // Add a split referencing the local BlockingQueue, keyed by the scan node ID
     ExternalStreamConnectorSplit split = new ExternalStreamConnectorSplit(connectorId, queue.id());
     serialTask.addSplit(scanNodeId, split);
     serialTask.noMoreSplits(scanNodeId);
 
-    // Wrap in Java iterator for hasNext()/next() pattern
-    CloseableIterator<RowVector> resultIterator = UpIterators.asJavaIterator(serialTask);
-
-    // Collect results
-    BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE);
-
-    try (ByteArrayOutputStream baos = new ByteArrayOutputStream()) {
-      ArrowStreamWriter writer = null;
-      boolean hasData = false;
-
-      // Iterate over result batches from the Velox task
-      while (resultIterator.hasNext()) {
-        RowVector resultBatch = resultIterator.next();
-        if (resultBatch == null) {
-          break;
-        }
-
-        // Convert Velox RowVector → Arrow VectorSchemaRoot (static method)
-        VectorSchemaRoot arrowRoot = Arrow.toArrowVectorSchemaRoot(allocator, resultBatch);
-
-        if (writer == null) {
-          writer = new ArrowStreamWriter(arrowRoot, null, Channels.newChannel(baos));
-          writer.start();
-        }
-
-        writer.writeBatch();
-        hasData = true;
-
-        arrowRoot.close();
-      }
-
-      if (writer != null) {
-        writer.end();
-        writer.close();
-      }
-
-      resultIterator.close();
-
-      logger.debug("Velox execution complete, result size={} bytes", baos.size());
-      return hasData ? baos.toByteArray() : new byte[0];
-
-    } catch (Exception e) {
-      throw new RuntimeException("Failed to execute Velox plan or serialize results", e);
-    } finally {
-      allocator.close();
-    }
+    return collectArrowIpc(serialTask);
   }
 
   /**
-   * Execute a Velox plan and return results as Velox native serialized bytes. Unlike {@link
-   * #execute(String, String, BlockingQueue)} which returns Arrow IPC, this method preserves Velox's
-   * internal intermediate format (e.g., accumulator state for PARTIAL aggregation). Used for
-   * coordinator exchange where FINAL aggregation needs exact intermediate types.
+   * Execute a Velox plan and return results as Velox native serialized bytes. Preserves Velox's
+   * internal intermediate format (e.g., accumulator state for PARTIAL aggregation).
    *
    * @return List of Velox native serialized byte arrays, one per result batch
    */
@@ -175,7 +116,6 @@ public class VeloxExecutor {
       while (resultIterator.hasNext()) {
         RowVector resultBatch = resultIterator.next();
         if (resultBatch == null) break;
-        // Serialize using Velox native format — preserves intermediate accumulator state
         results.add(BaseVectors.serializeOneToBuf(resultBatch));
       }
       resultIterator.close();
@@ -186,7 +126,159 @@ public class VeloxExecutor {
     }
   }
 
-  /** Recursively find the TableScanNode ID in the plan tree. */
+  /**
+   * Execute a Velox plan with two ExternalStream inputs (for join operations). Returns results as
+   * Arrow IPC bytes.
+   *
+   * @param planJson Serialized plan JSON containing a HashJoinNode with two TableScanNode sources
+   * @param connectorId The ExternalStream connector ID
+   * @param leftQueue BlockingQueue for the left (probe) side data
+   * @param leftScanNodeId Plan node ID of the left TableScanNode
+   * @param rightQueue BlockingQueue for the right (build) side data
+   * @param rightScanNodeId Plan node ID of the right TableScanNode
+   * @return Arrow IPC serialized result batches
+   */
+  public byte[] executeDualInput(
+      String planJson,
+      String connectorId,
+      BlockingQueue leftQueue,
+      String leftScanNodeId,
+      BlockingQueue rightQueue,
+      String rightScanNodeId) {
+    Queries queries = session.queryOps();
+
+    Query originalQuery = Serde.fromJson(planJson, Query.class);
+    ConnectorConfig connectorConfig = ConnectorConfig.create(Map.of(connectorId, Config.empty()));
+    Query query =
+        new Query(originalQuery.getPlan(), originalQuery.getQueryConfig(), connectorConfig);
+
+    logger.info("Executing dual-input Velox join query");
+
+    SerialTask serialTask = queries.execute(query);
+
+    // Add splits for both input sides
+    serialTask.addSplit(
+        leftScanNodeId, new ExternalStreamConnectorSplit(connectorId, leftQueue.id()));
+    serialTask.addSplit(
+        rightScanNodeId, new ExternalStreamConnectorSplit(connectorId, rightQueue.id()));
+    serialTask.noMoreSplits(leftScanNodeId);
+    serialTask.noMoreSplits(rightScanNodeId);
+
+    return collectArrowIpc(serialTask);
+  }
+
+  /**
+   * Execute a Velox plan with two ExternalStream inputs and return Velox native serialized results.
+   * Used for broadcast/shuffle join with PARTIAL aggregation above the join.
+   */
+  public List<byte[]> executeDualInputNative(
+      String planJson,
+      String connectorId,
+      BlockingQueue leftQueue,
+      String leftScanNodeId,
+      BlockingQueue rightQueue,
+      String rightScanNodeId) {
+    Queries queries = session.queryOps();
+
+    Query originalQuery = Serde.fromJson(planJson, Query.class);
+    ConnectorConfig connectorConfig = ConnectorConfig.create(Map.of(connectorId, Config.empty()));
+    Query query =
+        new Query(originalQuery.getPlan(), originalQuery.getQueryConfig(), connectorConfig);
+
+    SerialTask serialTask = queries.execute(query);
+
+    serialTask.addSplit(
+        leftScanNodeId, new ExternalStreamConnectorSplit(connectorId, leftQueue.id()));
+    serialTask.addSplit(
+        rightScanNodeId, new ExternalStreamConnectorSplit(connectorId, rightQueue.id()));
+    serialTask.noMoreSplits(leftScanNodeId);
+    serialTask.noMoreSplits(rightScanNodeId);
+
+    CloseableIterator<RowVector> resultIterator = UpIterators.asJavaIterator(serialTask);
+    List<byte[]> results = new java.util.ArrayList<>();
+
+    try {
+      while (resultIterator.hasNext()) {
+        RowVector resultBatch = resultIterator.next();
+        if (resultBatch == null) break;
+        results.add(BaseVectors.serializeOneToBuf(resultBatch));
+      }
+      resultIterator.close();
+      return results;
+    } catch (Exception e) {
+      throw new RuntimeException("Failed to execute dual-input Velox plan (native serde)", e);
+    }
+  }
+
+  /**
+   * Execute a Velox plan and return a raw RowVector iterator. Used for shuffle scans where the
+   * caller needs to hash-partition each batch before serializing.
+   */
+  public CloseableIterator<RowVector> executeToIterator(
+      String planJson, String connectorId, BlockingQueue queue) {
+    Queries queries = session.queryOps();
+
+    Query originalQuery = Serde.fromJson(planJson, Query.class);
+    ConnectorConfig connectorConfig = ConnectorConfig.create(Map.of(connectorId, Config.empty()));
+    Query query =
+        new Query(originalQuery.getPlan(), originalQuery.getQueryConfig(), connectorConfig);
+
+    SerialTask serialTask = queries.execute(query);
+
+    String scanNodeId = findTableScanNodeId(query.getPlan());
+    if (scanNodeId == null) {
+      throw new IllegalStateException("No TableScanNode found in plan");
+    }
+
+    ExternalStreamConnectorSplit split = new ExternalStreamConnectorSplit(connectorId, queue.id());
+    serialTask.addSplit(scanNodeId, split);
+    serialTask.noMoreSplits(scanNodeId);
+
+    return UpIterators.asJavaIterator(serialTask);
+  }
+
+  // ---- Internal Helpers ----
+
+  /** Collect all result batches from a serial task as Arrow IPC bytes. */
+  private byte[] collectArrowIpc(SerialTask serialTask) {
+    CloseableIterator<RowVector> resultIterator = UpIterators.asJavaIterator(serialTask);
+    BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+
+    try (ByteArrayOutputStream baos = new ByteArrayOutputStream()) {
+      ArrowStreamWriter writer = null;
+      boolean hasData = false;
+
+      while (resultIterator.hasNext()) {
+        RowVector resultBatch = resultIterator.next();
+        if (resultBatch == null) break;
+
+        VectorSchemaRoot arrowRoot = Arrow.toArrowVectorSchemaRoot(allocator, resultBatch);
+        if (writer == null) {
+          writer = new ArrowStreamWriter(arrowRoot, null, Channels.newChannel(baos));
+          writer.start();
+        }
+        writer.writeBatch();
+        hasData = true;
+        arrowRoot.close();
+      }
+
+      if (writer != null) {
+        writer.end();
+        writer.close();
+      }
+      resultIterator.close();
+
+      logger.debug("Velox execution complete, result size={} bytes", baos.size());
+      return hasData ? baos.toByteArray() : new byte[0];
+
+    } catch (Exception e) {
+      throw new RuntimeException("Failed to execute Velox plan or serialize results", e);
+    } finally {
+      allocator.close();
+    }
+  }
+
+  /** Recursively find the first TableScanNode ID in the plan tree. */
   private String findTableScanNodeId(PlanNode node) {
     if (node instanceof TableScanNode) {
       return node.getId();
@@ -209,5 +301,35 @@ public class VeloxExecutor {
           "Cannot traverse plan node {}: {}", node.getClass().getSimpleName(), e.getMessage());
     }
     return null;
+  }
+
+  /**
+   * Find all TableScanNode IDs in the plan tree, ordered left-to-right (depth-first). For join
+   * plans, returns [leftScanId, rightScanId].
+   */
+  public java.util.List<String> findAllTableScanNodeIds(PlanNode node) {
+    java.util.List<String> ids = new java.util.ArrayList<>();
+    collectTableScanNodeIds(node, ids);
+    return ids;
+  }
+
+  private void collectTableScanNodeIds(PlanNode node, java.util.List<String> ids) {
+    if (node instanceof TableScanNode) {
+      ids.add(node.getId());
+      return;
+    }
+    try {
+      java.lang.reflect.Method m = PlanNode.class.getDeclaredMethod("getSources");
+      m.setAccessible(true);
+      @SuppressWarnings("unchecked")
+      java.util.List<PlanNode> sources = (java.util.List<PlanNode>) m.invoke(node);
+      if (sources != null) {
+        for (PlanNode source : sources) {
+          collectTableScanNodeIds(source, ids);
+        }
+      }
+    } catch (Exception e) {
+      logger.warn("Cannot traverse plan node: {}", e.getMessage());
+    }
   }
 }
