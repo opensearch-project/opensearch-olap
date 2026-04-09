@@ -145,6 +145,9 @@ dependencies {
 
     // Apache Calcite for plan conversion (provided at runtime by the SQL plugin)
     compileOnly "org.apache.calcite:calcite-core:${calcite_version}"
+    // Guava: required at compile time for extending Calcite RelNode classes (provided at runtime
+    // by the SQL plugin). Calcite uses ImmutableList/ImmutableSet in its base class constructors.
+    compileOnly "com.google.guava:guava:33.4.8-jre"
 
     // Apache Arrow for columnar in-memory data
     implementation "org.apache.arrow:arrow-vector:${arrow_version}"

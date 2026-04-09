@@ -23,6 +23,8 @@ import org.apache.calcite.rex.RexLiteral;
 import org.apache.calcite.rex.RexNode;
 import org.apache.calcite.sql.SqlKind;
 import org.apache.calcite.util.ImmutableBitSet;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.boostscale.velox4j.aggregate.Aggregate;
 import org.boostscale.velox4j.aggregate.AggregateStep;
 import org.boostscale.velox4j.connector.ExternalStreamTableHandle;
@@ -60,6 +62,7 @@ import org.boostscale.velox4j.type.Type;
  */
 public class VeloxPlanConverter {
 
+  private static final Logger logger = LogManager.getLogger(VeloxPlanConverter.class);
   private static final String EXTERNAL_STREAM_CONNECTOR_ID = "connector-external-stream";
 
   private final PlanIdGenerator idGenerator;
@@ -203,23 +206,92 @@ public class VeloxPlanConverter {
 
   private PlanNode visitJoin(LogicalJoin join) {
     String nodeId = idGenerator.next();
+
+    // Convert both sides normally first (using their original column names)
     PlanNode left = visitNode(join.getLeft());
     PlanNode right = visitNode(join.getRight());
 
     JoinType veloxJoinType = convertJoinType(join.getJoinType());
-    RowType outputType = VeloxTypeConverter.toVeloxRowType(join.getRowType());
 
-    // Extract join keys from the condition.
-    // For equi-joins, the condition is typically AND(EQ(left.col, right.col), ...).
+    // Velox validates that left and right output types have no duplicate column names.
+    // Calcite's join row type already deduplicates: e.g. [name, dept_id, salary, emp_id,
+    // dept_id0, dept_name] — the right side's "dept_id" becomes "dept_id0".
+    //
+    // Strategy: keep the left scan with original names. For the right scan, rename only
+    // the conflicting columns to Calcite's dedup names. This way:
+    // - LuceneArrowReader reads using original field names (the scan output names are only
+    //   used by Velox after ExternalStream feeds the data by position, not by name)
+    // - The right scan's Velox RowType uses the dedup names so the join validation passes
+    //
+    // But there's a catch: the scan output type names ARE used by extractScanFields() on the
+    // data node to tell LuceneArrowReader which columns to read. So we can't change them.
+    //
+    // Solution: wrap the right scan in a ProjectNode that renames conflicting columns.
+    // The scan keeps original names (for Lucene reading), and the project renames for Velox.
+    RelDataType joinRowType = join.getRowType();
+    int leftFieldCount = join.getLeft().getRowType().getFieldCount();
+    RelDataType rightInputType = join.getRight().getRowType();
+
+    // Build a rename map: original right column name → Calcite dedup name (if different)
+    java.util.Map<String, String> rightRenames = new java.util.LinkedHashMap<>();
+    boolean hasConflict = false;
+    for (int i = 0; i < rightInputType.getFieldCount(); i++) {
+      String originalName = rightInputType.getFieldList().get(i).getName();
+      String dedupName = joinRowType.getFieldList().get(leftFieldCount + i).getName();
+      rightRenames.put(originalName, dedupName);
+      if (!originalName.equals(dedupName)) {
+        hasConflict = true;
+      }
+    }
+
+    if (hasConflict) {
+      // Wrap the right side in a ProjectNode that renames conflicting columns
+      List<String> projNames = new ArrayList<>();
+      List<org.boostscale.velox4j.expression.TypedExpr> projExprs = new ArrayList<>();
+      for (int i = 0; i < rightInputType.getFieldCount(); i++) {
+        String originalName = rightInputType.getFieldList().get(i).getName();
+        String dedupName = rightRenames.get(originalName);
+        if (METADATA_COLUMNS.contains(originalName)) continue;
+        projNames.add(dedupName);
+        Type veloxType =
+            VeloxTypeConverter.toVeloxType(rightInputType.getFieldList().get(i).getType());
+        projExprs.add(FieldAccessTypedExpr.create(veloxType, originalName));
+      }
+      String projId = idGenerator.next();
+      right = new ProjectNode(projId, Collections.singletonList(right), projNames, projExprs);
+    }
+
+    // Build the join output type from the Calcite join row type (already deduplicated)
+    RowType outputType = VeloxTypeConverter.toVeloxRowType(joinRowType);
+
+    // Extract join keys from the condition
     JoinKeyExtractor keyExtractor =
         new JoinKeyExtractor(
             join.getLeft().getRowType(), join.getRight().getRowType(), join.getCondition());
 
+    // Left keys use original names (no conflicts on the left side)
+    List<FieldAccessTypedExpr> leftKeys = keyExtractor.getLeftKeys();
+
+    // Right keys must use the dedup names (matching the ProjectNode output)
+    List<FieldAccessTypedExpr> rightKeys = keyExtractor.getRightKeys();
+    if (hasConflict) {
+      List<FieldAccessTypedExpr> remappedRightKeys = new ArrayList<>();
+      for (FieldAccessTypedExpr key : rightKeys) {
+        String dedupName = rightRenames.get(key.getFieldName());
+        if (dedupName != null && !dedupName.equals(key.getFieldName())) {
+          remappedRightKeys.add(FieldAccessTypedExpr.create(key.getReturnType(), dedupName));
+        } else {
+          remappedRightKeys.add(key);
+        }
+      }
+      rightKeys = remappedRightKeys;
+    }
+
     return new HashJoinNode(
         nodeId,
         veloxJoinType,
-        keyExtractor.getLeftKeys(),
-        keyExtractor.getRightKeys(),
+        leftKeys,
+        rightKeys,
         keyExtractor.getResidualFilter(),
         left,
         right,

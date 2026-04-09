@@ -4,6 +4,7 @@
 
 package org.opensearch.plugin.olap.scheduler;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -20,26 +21,13 @@ import org.opensearch.threadpool.ThreadPool;
 /**
  * Central query scheduler that orchestrates distributed query execution.
  *
- * <p>The scheduler converts plan fragments into stages, creates tasks for each stage based on shard
- * routing, and dispatches tasks to target data nodes.
- *
- * <p>Execution flow:
- *
- * <ol>
- *   <li>Receive fragmented plan from VeloxPlanConverter + PlanFragmenter
- *   <li>Build stages and create tasks via ShardRouter
- *   <li>Dispatch leaf-stage tasks to data nodes (via TransportService)
- *   <li>When leaf tasks complete, dispatch dependent stages
- *   <li>Collect final results from root stage
- * </ol>
- *
- * <p>Inspired by Presto's SqlQueryScheduler which manages stage lifecycle and coordinates task
- * creation across nodes. Key differences:
+ * <p>Supports scheduling for:
  *
  * <ul>
- *   <li>Uses OpenSearch TransportService instead of HTTP for task dispatch
- *   <li>Shard routing is derived from OpenSearch ClusterState
- *   <li>Tasks feed Lucene data via ExternalStream (no Hive splits)
+ *   <li>SOURCE: route to nodes owning index shards
+ *   <li>COORDINATOR: single task on local coordinator node
+ *   <li>BROADCAST: route to nodes owning probe-side shards (with broadcast data)
+ *   <li>HASH_PARTITIONED: create N worker tasks distributed across data nodes
  * </ul>
  */
 public class QueryScheduler {
@@ -58,13 +46,6 @@ public class QueryScheduler {
     this.activeQueries = new ConcurrentHashMap<>();
   }
 
-  /**
-   * Schedule a fragmented query for execution.
-   *
-   * @param fragments Ordered list of plan fragments (leaf-first, root-last)
-   * @param policy Execution ordering policy
-   * @return QueryExecution handle for tracking progress
-   */
   public QueryExecution schedule(List<PlanFragment> fragments, ExecutionPolicy policy) {
     QueryId queryId = QueryId.generate();
     QueryExecution execution = new QueryExecution(queryId, fragments);
@@ -74,14 +55,12 @@ public class QueryScheduler {
       execution.buildStages();
       execution.setState(QueryExecution.State.SCHEDULING);
 
-      // Create tasks for each stage based on shard routing
       for (Stage stage : execution.getStages()) {
         createTasksForStage(execution, stage);
       }
 
       execution.setState(QueryExecution.State.RUNNING);
 
-      // Dispatch tasks according to execution policy
       if (policy == ExecutionPolicy.ALL_AT_ONCE) {
         dispatchAllStages(execution);
       } else {
@@ -96,10 +75,6 @@ public class QueryScheduler {
     return execution;
   }
 
-  /**
-   * Called when a task completes on a data node. Advances the query execution by dispatching ready
-   * stages.
-   */
   public void onTaskCompleted(QueryId queryId, TaskId taskId) {
     QueryExecution execution = activeQueries.get(queryId);
     if (execution == null) {
@@ -109,12 +84,10 @@ public class QueryScheduler {
 
     execution.getTaskTracker().updateState(taskId, TaskState.FINISHED);
 
-    // Update stage state
     Stage stage = execution.getStage(taskId.getStageId().getStageNumber());
     if (stage != null) {
       stage.updateStateFromTasks();
 
-      // If stage finished, check if downstream stages are ready
       if (stage.getState() == Stage.StageState.FINISHED) {
         List<Stage> readyStages = execution.getReadyStages();
         for (Stage readyStage : readyStages) {
@@ -123,14 +96,12 @@ public class QueryScheduler {
       }
     }
 
-    // Check if all stages are done
     if (execution.getStages().stream().allMatch(s -> s.getState() == Stage.StageState.FINISHED)) {
       execution.setState(QueryExecution.State.FINISHED);
       activeQueries.remove(queryId);
     }
   }
 
-  /** Called when a task fails on a data node. */
   public void onTaskFailed(QueryId queryId, TaskId taskId, String reason) {
     QueryExecution execution = activeQueries.get(queryId);
     if (execution == null) {
@@ -146,34 +117,102 @@ public class QueryScheduler {
     return activeQueries.get(queryId);
   }
 
+  public ClusterService getClusterService() {
+    return clusterService;
+  }
+
+  /**
+   * Get all data node IDs from the cluster. Used for assigning shuffle workers.
+   *
+   * @return list of data node IDs
+   */
+  public List<String> getDataNodeIds() {
+    List<String> nodeIds = new ArrayList<>();
+    for (DiscoveryNode node : clusterService.state().nodes().getDataNodes().values()) {
+      nodeIds.add(node.getId());
+    }
+    return nodeIds;
+  }
+
+  /**
+   * Get the shard routing for an index.
+   *
+   * @return map of node to shard IDs
+   */
+  public Map<DiscoveryNode, List<ShardId>> routeShards(String indexName) {
+    return shardRouter.routeShards(clusterService.state(), indexName);
+  }
+
   private void createTasksForStage(QueryExecution execution, Stage stage) {
     PlanFragment fragment = stage.getFragment();
     FragmentProperties props = fragment.getProperties();
 
-    if (props.getDistribution() == FragmentProperties.Distribution.SOURCE) {
-      // Route to nodes owning the source index shards
-      String indexName = props.getSourceIndex();
-      Map<DiscoveryNode, List<ShardId>> routing =
-          shardRouter.routeShards(clusterService.state(), indexName);
-
-      int partitionId = 0;
-      for (Map.Entry<DiscoveryNode, List<ShardId>> entry : routing.entrySet()) {
-        TaskId taskId = new TaskId(stage.getStageId(), partitionId++);
-        TaskDescriptor task =
-            new TaskDescriptor(taskId, fragment, entry.getKey(), entry.getValue());
-        stage.addTask(task);
-        execution.getTaskTracker().register(task);
-      }
-    } else if (props.getDistribution() == FragmentProperties.Distribution.COORDINATOR) {
-      // Single task on the coordinator node
-      DiscoveryNode localNode = clusterService.localNode();
-      TaskId taskId = new TaskId(stage.getStageId(), 0);
-      TaskDescriptor task = new TaskDescriptor(taskId, fragment, localNode, List.of());
-      stage.addTask(task);
-      execution.getTaskTracker().register(task);
+    switch (props.getDistribution()) {
+      case SOURCE:
+        createSourceTasks(execution, stage, props.getSourceIndex());
+        break;
+      case COORDINATOR:
+        createCoordinatorTask(execution, stage);
+        break;
+      case BROADCAST:
+        // Broadcast fragments run on probe-side shard-owning nodes
+        createSourceTasks(execution, stage, props.getSourceIndex());
+        break;
+      case HASH_PARTITIONED:
+        createHashPartitionedTasks(execution, stage, props.getPartitionCount());
+        break;
+      case ANY:
+        createCoordinatorTask(execution, stage);
+        break;
     }
 
     logger.debug("Created {} tasks for stage {}", stage.getTasks().size(), stage.getStageId());
+  }
+
+  private void createSourceTasks(QueryExecution execution, Stage stage, String indexName) {
+    Map<DiscoveryNode, List<ShardId>> routing =
+        shardRouter.routeShards(clusterService.state(), indexName);
+
+    int partitionId = 0;
+    for (Map.Entry<DiscoveryNode, List<ShardId>> entry : routing.entrySet()) {
+      TaskId taskId = new TaskId(stage.getStageId(), partitionId++);
+      TaskDescriptor task =
+          new TaskDescriptor(taskId, stage.getFragment(), entry.getKey(), entry.getValue());
+      stage.addTask(task);
+      execution.getTaskTracker().register(task);
+    }
+  }
+
+  private void createCoordinatorTask(QueryExecution execution, Stage stage) {
+    DiscoveryNode localNode = clusterService.localNode();
+    TaskId taskId = new TaskId(stage.getStageId(), 0);
+    TaskDescriptor task = new TaskDescriptor(taskId, stage.getFragment(), localNode, List.of());
+    stage.addTask(task);
+    execution.getTaskTracker().register(task);
+  }
+
+  /**
+   * Create tasks for a hash-partitioned stage (shuffle join). Distributes N partitions across data
+   * nodes round-robin.
+   */
+  private void createHashPartitionedTasks(
+      QueryExecution execution, Stage stage, int partitionCount) {
+    List<DiscoveryNode> dataNodes =
+        new ArrayList<>(clusterService.state().nodes().getDataNodes().values());
+    if (dataNodes.isEmpty()) {
+      throw new IllegalStateException("No data nodes available for hash-partitioned execution");
+    }
+
+    // If partitionCount == 0, use number of data nodes
+    int actualPartitions = partitionCount > 0 ? partitionCount : dataNodes.size();
+
+    for (int i = 0; i < actualPartitions; i++) {
+      DiscoveryNode targetNode = dataNodes.get(i % dataNodes.size());
+      TaskId taskId = new TaskId(stage.getStageId(), i);
+      TaskDescriptor task = new TaskDescriptor(taskId, stage.getFragment(), targetNode, List.of());
+      stage.addTask(task);
+      execution.getTaskTracker().register(task);
+    }
   }
 
   private void dispatchAllStages(QueryExecution execution) {
@@ -202,19 +241,8 @@ public class QueryScheduler {
     stage.transitionTo(Stage.StageState.RUNNING);
   }
 
-  /**
-   * Dispatch a task to its target node via TransportService. This method is called from the
-   * scheduler and sends ExecuteFragmentRequest to the target data node.
-   *
-   * <p>The actual transport dispatch is handled by NodeResultCollector which holds a reference to
-   * TransportService.
-   */
   private void dispatchTask(QueryId queryId, TaskDescriptor task) {
     task.setState(TaskState.RUNNING);
-
-    // The actual dispatch is performed by the transport layer.
-    // This will be wired via NodeResultCollector.dispatch() which sends
-    // ExecuteFragmentRequest via TransportService to the target node.
     logger.debug(
         "Dispatching task {} to node {}", task.getTaskId(), task.getTargetNode().getName());
   }

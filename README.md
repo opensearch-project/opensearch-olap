@@ -128,6 +128,28 @@ This design keeps `QueryService` unchanged — it just calls `executionEngine.ex
 - **Presto-inspired scheduler**: Stage/Task hierarchy and fragment dispatch modeled after Presto's `SqlStageExecution` and `RemoteTaskFactory`, adapted for OpenSearch's transport layer.
 - **Graceful degradation**: If Velox native libraries are unavailable (e.g. macOS/aarch64), the plugin logs a warning and disables itself. `canVectorize()` returns `false`, all queries fall back to the default engine.
 
+### MPP Join Strategies
+
+When `plugins.velox.mpp_enabled=true`, the plugin selects between three join strategies based on cost:
+
+| Strategy | When Used | How It Works |
+|----------|-----------|-------------|
+| **Coordinator-Centric** | Default (`mpp_enabled=false`) | Both sides gathered to coordinator, join runs locally |
+| **Broadcast** | Small build side (shard count ≤ threshold) | Small table broadcast to all probe-side nodes, each runs local join in parallel |
+| **Hash Shuffle** | Both sides large | Both sides hash-partitioned by join key, shuffled P2P via `ShuffleDataAction` to workers |
+
+### Calcite Physical Planning
+
+The execution pipeline uses a Calcite Convention-based physical planning framework under `plan/physical/`. When a query arrives:
+
+1. **`PhysicalOptimizer`** creates a fresh `VolcanoPlanner` and deep-copies the SQL plugin's plan into it (stripping `CalciteLogicalIndexScan`'s pushdown context). Runs `FilterMergeRule` via HepPlanner, then VolcanoPlanner with `PhysicalConvention` converter rules.
+
+2. **ConverterRules** transform each logical operator to its physical equivalent (`PhysicalTableScan`, `PhysicalFilter`, `PhysicalProject`, `PhysicalAggregate`, `PhysicalJoin`, `PhysicalSort`), inserting `PhysicalExchange(SINGLETON)` nodes at distribution boundaries.
+
+3. **`VeloxPlanGenerator`** walks the physical plan, splits at `PhysicalExchange` boundaries into `PlanFragment`s, and converts to Velox PlanNodes. Two-stage aggregation (PARTIAL + FINAL) is split here with Velox-specific intermediate accumulator types.
+
+4. The downstream scheduling infrastructure (`QueryScheduler`, `NodeResultCollector`, `TransportExecuteFragmentAction`) executes the fragments on data nodes via Velox C++.
+
 ## Project Structure
 
 ```
@@ -137,23 +159,42 @@ src/main/java/org/opensearch/plugin/olap/
 │   └── QueryId.java                   # Query identifier
 ├── engine/                            # SQL plugin integration
 │   ├── VeloxExecutionEngine.java      #   RelNode → Velox pipeline orchestration
-│   └── OlapExecutionExtensionImpl.java#   ExecutionEngine impl (canVectorize + execute)
+│   └── VectorizedEngineExtension.java #   ExecutionEngine impl (canVectorize + execute)
 ├── plan/
-│   ├── convert/                       # Calcite → Velox plan conversion
-│   │   ├── VeloxPlanConverter.java    #   RelNode → PlanNode tree
+│   ├── convert/                       # Calcite → Velox expression/type converters
+│   │   ├── VeloxPlanConverter.java    #   RelNode → PlanNode tree (current path)
 │   │   ├── VeloxExprConverter.java    #   RexNode → TypedExpr
 │   │   ├── VeloxTypeConverter.java    #   RelDataType → velox4j Type
 │   │   ├── VeloxAggConverter.java     #   AggregateCall → Aggregate
 │   │   └── PlanIdGenerator.java       #   Unique plan node IDs
-│   └── fragment/                      # Distributed plan fragmentation
-│       ├── PlanFragmenter.java        #   Split at exchange boundaries
-│       ├── PlanFragment.java          #   Fragment with plan subtree
-│       └── FragmentProperties.java    #   Distribution metadata
+│   ├── fragment/                      # Distributed plan fragmentation
+│   │   ├── PlanFragmenter.java        #   Manual split at agg/join boundaries (current path)
+│   │   ├── PlanFragment.java          #   Fragment with plan subtree + properties
+│   │   └── FragmentProperties.java    #   Distribution metadata (SOURCE, COORDINATOR, BROADCAST, HASH_PARTITIONED)
+│   └── physical/                      # Calcite physical planning framework
+│       ├── PhysicalConvention.java    #   Convention with enforce() for auto Exchange insertion
+│       ├── PhysicalRel.java           #   Marker interface for physical nodes
+│       ├── PhysicalTableScan.java     #   Physical scan (dist=RANDOM)
+│       ├── PhysicalFilter.java        #   Physical filter (inherits child dist)
+│       ├── PhysicalProject.java       #   Physical project
+│       ├── PhysicalAggregate.java     #   Physical aggregate (SINGLE/PARTIAL/FINAL)
+│       ├── PhysicalJoin.java          #   Physical hash join
+│       ├── PhysicalSort.java          #   Physical sort/limit (dist=SINGLETON)
+│       ├── PhysicalExchange.java      #   Redistribution boundary
+│       ├── PhysicalOptimizer.java     #   VolcanoPlanner setup + optimization
+│       ├── VeloxPlanGenerator.java    #   Physical plan → Velox PlanNodes + PlanFragments
+│       └── rules/                     #   Conversion + optimization rules
+│           ├── PhysicalRules.java     #     All rule lists
+│           ├── Physical*Rule.java     #     ConverterRules (NONE → PHYSICAL)
+│           ├── Mpp*Rule.java          #     MPP rules (HASH distribution)
+│           └── TwoStageAggRule.java   #     SINGLE → PARTIAL + Exchange + FINAL
 ├── scheduler/                         # Query scheduling
 │   ├── QueryScheduler.java            #   Orchestrates distributed execution
 │   ├── QueryExecution.java            #   Single query lifecycle
 │   ├── Stage.java                     #   Execution stage (1 fragment → N tasks)
 │   ├── ShardRouter.java               #   Routes to nodes by shard assignment
+│   ├── CostEstimator.java             #   Shard-count-based join strategy selection
+│   ├── JoinStrategy.java              #   COORDINATOR_CENTRIC / BROADCAST / HASH_SHUFFLE
 │   ├── TaskDescriptor.java            #   Task metadata for a node
 │   ├── TaskTracker.java               #   Tracks task states
 │   ├── StageId.java / TaskId.java     #   Identifiers
@@ -161,17 +202,22 @@ src/main/java/org/opensearch/plugin/olap/
 │   └── ExecutionPolicy.java           #   ALL_AT_ONCE vs PHASED
 ├── transport/                         # Inter-node communication
 │   ├── ExecuteFragmentAction.java     #   Action type definition
-│   ├── ExecuteFragmentRequest.java    #   Plan + shard IDs (serializable)
-│   ├── ExecuteFragmentResponse.java   #   Status + Arrow IPC results
-│   ├── TransportExecuteFragmentAction.java  # Data node handler
-│   └── NodeResultCollector.java       #   Fan-out + collect results
+│   ├── ExecuteFragmentRequest.java    #   Plan + shard IDs + broadcast/shuffle config
+│   ├── ExecuteFragmentResponse.java   #   Status + Arrow IPC / native serde results
+│   ├── TransportExecuteFragmentAction.java  # Data node handler (scan, broadcast join, shuffle)
+│   ├── NodeResultCollector.java       #   Fan-out + collect results (normal, broadcast, shuffle)
+│   ├── ShuffleDataAction.java         #   P2P shuffle transport action
+│   ├── ShuffleDataRequest.java        #   Shuffle partition data
+│   ├── ShuffleDataResponse.java       #   Shuffle acknowledgement
+│   ├── ShuffleManager.java            #   Thread-safe shuffle buffer management
+│   └── TransportShuffleDataAction.java#   Shuffle data receiver
 ├── execution/                         # Lucene → Arrow → Velox pipeline
 │   ├── LuceneArrowReader.java         #   Reads shards into Arrow batches
 │   ├── DocValueColumnReader.java      #   Single column from DocValues
 │   ├── ArrowBatchBuilder.java         #   Builds VectorSchemaRoot
 │   ├── ExternalStreamBridge.java      #   Arrow → velox4j BlockingQueue
-│   ├── VeloxExecutor.java             #   Executes plan via velox4j
-│   └── VeloxLifecycleService.java     #   Velox engine init/shutdown
+│   ├── VeloxExecutor.java             #   Executes plan via velox4j (single/dual input)
+│   └── VeloxLifecycleService.java     #   Velox engine init/shutdown + MPP settings
 └── result/                            # Result handling (interfaces)
     ├── QueryResult.java               #   Query result interface
     └── ResultCollector.java           #   Merge partial results
@@ -213,6 +259,9 @@ COUNT, SUM, AVG, MIN, MAX (with DISTINCT support)
 | `plugins.velox.enabled` | `true` | Enable/disable the OLAP plugin |
 | `plugins.velox.memory_limit_bytes` | `4294967296` (4 GB) | Velox engine memory limit |
 | `plugins.velox.num_threads` | `4` | Velox execution threads |
+| `plugins.velox.mpp_enabled` | `false` | Enable MPP join strategies (broadcast + hash shuffle). When false, joins use coordinator-centric execution. |
+| `plugins.velox.broadcast_max_shards` | `2` | Max primary shard count for the smaller join side to qualify for broadcast join (MPP only) |
+| `plugins.velox.shuffle_partitions` | `0` | Number of hash shuffle partitions. 0 = auto (uses number of data nodes) |
 
 ## Dependencies
 
@@ -373,6 +422,37 @@ curl -s -X POST "http://localhost:9200/_plugins/_ppl" \
 curl -s -X POST "http://localhost:9200/_plugins/_sql" \
   -H "Content-Type: application/json" \
   -d '{"query": "SELECT city, COUNT(*) FROM test_olap GROUP BY city"}'
+```
+
+#### 3b. Run join queries (requires two indices)
+
+```bash
+# Create a departments index
+curl -s -X PUT "http://localhost:9200/departments" \
+  -H "Content-Type: application/json" \
+  -d '{"mappings": {"properties": {"dept_id": {"type": "integer"}, "dept_name": {"type": "keyword"}}}}'
+
+# Insert departments
+curl -s -X POST "http://localhost:9200/_bulk?refresh=true" \
+  -H "Content-Type: application/json" \
+  -d '{"index":{"_index":"departments"}}
+{"dept_id": 1, "dept_name": "Engineering"}
+{"index":{"_index":"departments"}}
+{"dept_id": 2, "dept_name": "Marketing"}
+'
+
+# Add dept_id to test_olap (recreate with dept_id field)
+# ... then run join queries:
+
+# Inner join using PPL
+curl -s -X POST "http://localhost:9200/_plugins/_ppl" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "source = employees | inner join left=e right=d ON e.dept_id = d.dept_id departments | fields e.name, d.dept_name"}'
+
+# Join + aggregation
+curl -s -X POST "http://localhost:9200/_plugins/_ppl" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "source = employees | inner join left=e right=d ON e.dept_id = d.dept_id departments | stats count() by d.dept_name"}'
 ```
 
 #### 4. Verify OLAP plugin handled the query

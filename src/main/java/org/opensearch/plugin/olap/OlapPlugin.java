@@ -7,7 +7,6 @@ package org.opensearch.plugin.olap;
 import java.io.IOException;
 import java.util.Arrays;
 import java.util.Collection;
-import java.util.Collections;
 import java.util.List;
 import java.util.function.Supplier;
 import org.opensearch.action.ActionRequest;
@@ -24,7 +23,10 @@ import org.opensearch.plugin.olap.engine.VeloxExecutionEngine;
 import org.opensearch.plugin.olap.execution.VeloxLifecycleService;
 import org.opensearch.plugin.olap.scheduler.QueryScheduler;
 import org.opensearch.plugin.olap.transport.ExecuteFragmentAction;
+import org.opensearch.plugin.olap.transport.ShuffleDataAction;
+import org.opensearch.plugin.olap.transport.ShuffleManager;
 import org.opensearch.plugin.olap.transport.TransportExecuteFragmentAction;
+import org.opensearch.plugin.olap.transport.TransportShuffleDataAction;
 import org.opensearch.plugins.ActionPlugin;
 import org.opensearch.plugins.Plugin;
 import org.opensearch.repositories.RepositoriesService;
@@ -36,28 +38,15 @@ import org.opensearch.watcher.ResourceWatcherService;
 /**
  * OpenSearch OLAP plugin that integrates Apache Velox for vectorized analytical query execution.
  *
- * <p>This plugin co-works with the SQL plugin ({@code opensearch-sql}). The SQL plugin handles
- * SQL/PPL parsing and Calcite RelNode generation. This plugin provides an alternative execution
- * engine that converts RelNodes to Velox plans and executes them via the native C++ Velox engine.
- *
- * <p>Integration flow:
- *
- * <pre>
- * [SQL Plugin]                              [OLAP Plugin]
- * SQL/PPL → Calcite Analyzer → RelNode  →  VeloxPlanConverter → PlanFragmenter
- *                                           → QueryScheduler → Data Nodes
- *                                           → Lucene DocValues → Arrow → Velox
- *                                           → Results back to SQL Plugin
- * </pre>
- *
- * <p>The SQL plugin discovers this plugin's execution engine via the {@link
- * VectorizedEngineExtension} extension point using OpenSearch's {@code ExtensiblePlugin} mechanism.
+ * <p>Supports MPP join strategies (broadcast + hash shuffle) when {@code
+ * plugins.velox.mpp_enabled=true}.
  */
 public class OlapPlugin extends Plugin implements ActionPlugin {
 
   private VeloxLifecycleService veloxLifecycleService;
   private QueryScheduler queryScheduler;
   private VeloxExecutionEngine veloxExecutionEngine;
+  private ShuffleManager shuffleManager;
 
   @Override
   public Collection<Object> createComponents(
@@ -74,24 +63,22 @@ public class OlapPlugin extends Plugin implements ActionPlugin {
       Supplier<RepositoriesService> repositoriesServiceSupplier) {
     this.veloxLifecycleService = new VeloxLifecycleService(environment.settings());
     this.queryScheduler = new QueryScheduler(clusterService, threadPool);
+    this.shuffleManager = new ShuffleManager();
 
-    // TransportService is injected via Guice into TransportExecuteFragmentAction.
-    // For the VeloxExecutionEngine on the coordinator, we need it to dispatch fragments.
-    // It will be wired when the first query arrives via the extension.
-    // For now, create the engine with a deferred transport reference.
     this.veloxExecutionEngine =
         new VeloxExecutionEngine(veloxLifecycleService, queryScheduler, null);
 
-    // Wire the execution engine into the extension point for SQL plugin discovery
     VectorizedEngineExtension.setEngine(veloxExecutionEngine);
 
-    return Arrays.asList(veloxLifecycleService, queryScheduler, veloxExecutionEngine);
+    return Arrays.asList(
+        veloxLifecycleService, queryScheduler, veloxExecutionEngine, shuffleManager);
   }
 
   @Override
   public List<ActionHandler<? extends ActionRequest, ? extends ActionResponse>> getActions() {
-    return Collections.singletonList(
-        new ActionHandler<>(ExecuteFragmentAction.INSTANCE, TransportExecuteFragmentAction.class));
+    return List.of(
+        new ActionHandler<>(ExecuteFragmentAction.INSTANCE, TransportExecuteFragmentAction.class),
+        new ActionHandler<>(ShuffleDataAction.INSTANCE, TransportShuffleDataAction.class));
   }
 
   @Override

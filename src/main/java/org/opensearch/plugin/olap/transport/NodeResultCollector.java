@@ -24,11 +24,7 @@ import org.opensearch.transport.TransportService;
 /**
  * Dispatches fragment execution requests to data nodes and collects results.
  *
- * <p>This is the coordinator-side component that sends ExecuteFragmentRequest messages to target
- * data nodes via TransportService and aggregates responses.
- *
- * <p>Modeled after Presto's RemoteTaskFactory/HttpRemoteTask pattern, adapted to use OpenSearch
- * TransportService instead of HTTP.
+ * <p>Supports dispatch modes for normal scans, broadcast joins, shuffle scans, and shuffle joins.
  */
 public class NodeResultCollector {
 
@@ -57,23 +53,106 @@ public class NodeResultCollector {
       allTasks.addAll(stage.getTasks());
     }
 
-    CountDownLatch latch = new CountDownLatch(allTasks.size());
+    return dispatchTasks(queryId, allTasks, task -> createNormalRequest(queryId, task));
+  }
+
+  /** Dispatch broadcast join tasks: each task receives the broadcast data along with the plan. */
+  public List<ExecuteFragmentResponse> dispatchAndCollectBroadcast(
+      QueryExecution execution,
+      List<org.opensearch.plugin.olap.scheduler.Stage> stages,
+      List<byte[]> broadcastData) {
+    QueryId queryId = execution.getQueryId();
+    List<TaskDescriptor> allTasks = new ArrayList<>();
+    for (var stage : stages) {
+      allTasks.addAll(stage.getTasks());
+    }
+
+    return dispatchTasks(
+        queryId,
+        allTasks,
+        task -> {
+          ExecuteFragmentRequest request = createNormalRequest(queryId, task);
+          request.setBroadcastData(broadcastData);
+          return request;
+        });
+  }
+
+  /**
+   * Dispatch shuffle scan tasks: each task receives the shuffle config telling it how to partition
+   * and where to send data.
+   */
+  public List<ExecuteFragmentResponse> dispatchAndCollectShuffle(
+      QueryExecution execution,
+      List<org.opensearch.plugin.olap.scheduler.Stage> stages,
+      List<String> workerNodeIds,
+      int targetStageId) {
+    QueryId queryId = execution.getQueryId();
+    List<TaskDescriptor> allTasks = new ArrayList<>();
+    for (var stage : stages) {
+      allTasks.addAll(stage.getTasks());
+    }
+
+    return dispatchTasks(
+        queryId,
+        allTasks,
+        task -> {
+          ExecuteFragmentRequest request = createNormalRequest(queryId, task);
+          var props = task.getFragment().getProperties();
+          if (props.isShuffleScan()) {
+            request.setShuffleConfig(
+                workerNodeIds,
+                props.getShuffleKeyChannels(),
+                props.getJoinSide(),
+                targetStageId,
+                workerNodeIds.size());
+          }
+          return request;
+        });
+  }
+
+  /** Dispatch shuffle join tasks: each task reads from ShuffleManager buffer. */
+  public List<ExecuteFragmentResponse> dispatchAndCollectShuffleJoin(
+      QueryExecution execution,
+      List<org.opensearch.plugin.olap.scheduler.Stage> stages,
+      String shuffleQueryId,
+      int shuffleStageId,
+      int expectedLeftSenders,
+      int expectedRightSenders) {
+    QueryId queryId = execution.getQueryId();
+    List<TaskDescriptor> allTasks = new ArrayList<>();
+    for (var stage : stages) {
+      allTasks.addAll(stage.getTasks());
+    }
+
+    return dispatchTasks(
+        queryId,
+        allTasks,
+        task -> {
+          ExecuteFragmentRequest request = createNormalRequest(queryId, task);
+          request.setShuffleJoinConfig(
+              shuffleQueryId, shuffleStageId, expectedLeftSenders, expectedRightSenders);
+          return request;
+        });
+  }
+
+  // ---- Internal ----
+
+  @FunctionalInterface
+  private interface RequestFactory {
+    ExecuteFragmentRequest create(TaskDescriptor task);
+  }
+
+  private List<ExecuteFragmentResponse> dispatchTasks(
+      QueryId queryId, List<TaskDescriptor> tasks, RequestFactory requestFactory) {
+    CountDownLatch latch = new CountDownLatch(tasks.size());
     List<ExecuteFragmentResponse> responses =
-        new ArrayList<>(java.util.Collections.nCopies(allTasks.size(), null));
+        new ArrayList<>(java.util.Collections.nCopies(tasks.size(), null));
     AtomicReference<Exception> firstError = new AtomicReference<>();
 
-    for (int i = 0; i < allTasks.size(); i++) {
+    for (int i = 0; i < tasks.size(); i++) {
       final int index = i;
-      TaskDescriptor task = allTasks.get(i);
-
-      ExecuteFragmentRequest request =
-          new ExecuteFragmentRequest(
-              queryId.getId(),
-              task.getFragment().getFragmentId(),
-              task.getTaskId().getPartitionId(),
-              serializePlanFragment(task),
-              task.getShardIds(),
-              task.getFragment().getProperties().getSourceIndex());
+      TaskDescriptor task = tasks.get(i);
+      ExecuteFragmentRequest request = requestFactory.create(task);
 
       transportService.sendRequest(
           task.getTargetNode(),
@@ -128,6 +207,16 @@ public class NodeResultCollector {
     }
 
     return responses;
+  }
+
+  private ExecuteFragmentRequest createNormalRequest(QueryId queryId, TaskDescriptor task) {
+    return new ExecuteFragmentRequest(
+        queryId.getId(),
+        task.getFragment().getFragmentId(),
+        task.getTaskId().getPartitionId(),
+        serializePlanFragment(task),
+        task.getShardIds(),
+        task.getFragment().getProperties().getSourceIndex());
   }
 
   private String serializePlanFragment(TaskDescriptor task) {

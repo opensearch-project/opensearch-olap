@@ -25,7 +25,9 @@ The OpenSearch OLAP plugin adds a vectorized, columnar execution engine to OpenS
 **At a glance:**
 - Co-works with the SQL plugin — no replacement, no fork
 - 6 minimal changes to the SQL plugin; zero changes to OpenSearch core
-- Supports MPP execution (two-phase distributed aggregation)
+- Calcite Convention-based physical planning (VolcanoPlanner + PhysicalConvention + ConverterRules)
+- Supports MPP execution: two-phase distributed aggregation, coordinator-centric/broadcast/shuffle joins
+- Predicate pushdown to Lucene, per-query session isolation
 - Graceful degradation — if Velox is unavailable, queries fall back to the default engine transparently
 
 ---
@@ -57,15 +59,22 @@ The [RFC (opensearch-project/sql#4812)](https://github.com/opensearch-project/sq
   SQL/PPL Query
       │
       ▼
-  SQL Plugin: Parse → Calcite Analyzer → RelNode (logical plan)
+  SQL Plugin: Parse → Calcite Analyzer → RelNode (Convention.NONE)
       │
       ▼
   DelegatingExecutionEngine
       │
       ├── canVectorize() = true ──► OLAP Plugin
       │                              │
-      │                    1. Convert: RelNode → Velox PlanNode
-      │                    2. Fragment: split PARTIAL / FINAL
+      │                    1. Optimize: PhysicalOptimizer (VolcanoPlanner)
+      │                       - ClusterCopyShuttle → new cluster (strip pushdown)
+      │                       - HepPlanner: FilterMergeRule
+      │                       - ConverterRules: NONE → PhysicalConvention
+      │                       - Inserts PhysicalExchange at distribution boundaries
+      │                    2. Generate: VeloxPlanGenerator
+      │                       - Split at PhysicalExchange → PlanFragments
+      │                       - Two-stage agg: SINGLE → PARTIAL + FINAL
+      │                       - Convert to Velox PlanNodes
       │                    3. Schedule: route fragments to data nodes by shard
       │                    4. Execute:  data nodes run Velox on local shards
       │                    5. Collect:  coordinator merges partial results
@@ -117,8 +126,8 @@ For aggregation queries, the plan is split into two phases:
      ┌──────────────────────────────────────────┐
      │           Coordinator Node                │
      │                                           │
-     │  RelNode → VeloxPlanConverter             │
-     │         → PlanFragmenter                  │
+     │  RelNode → PhysicalOptimizer              │
+     │         → VeloxPlanGenerator              │
      │              │                            │
      │     ┌────────┴────────┐                   │
      │     │   PARTIAL frag  │  FINAL frag       │
@@ -151,22 +160,29 @@ For aggregation queries, the plan is split into two phases:
 The coordinator runs a multi-stage pipeline to transform a logical plan into distributed execution:
 
 ```
-  Calcite RelNode
+  Calcite RelNode (Convention.NONE)
        │
        ▼
-  ① VeloxPlanConverter
-       │  Walks the RelNode tree and produces a Velox PlanNode tree.
-       │  TableScan → ExternalStreamTableHandle (placeholder for data feed)
-       │  Aggregate → AggregationNode (step = SINGLE initially)
+  ① PhysicalOptimizer
+       │  Creates a new VolcanoPlanner + RelOptCluster.
+       │  ClusterCopyShuttle deep-copies the plan into the new cluster,
+       │  stripping CalciteLogicalIndexScan → plain LogicalTableScan
+       │  (prevents SQL plugin pushdown rules from leaking in).
+       │  Runs HepPlanner (FilterMergeRule) then VolcanoPlanner:
+       │    Convention.NONE → PhysicalConvention
+       │    PhysicalAggregateRule inserts PhysicalExchange(SINGLETON)
+       │    PhysicalJoinRule inserts PhysicalExchange(SINGLETON) on both inputs
        ▼
-  Velox PlanNode tree
+  Physical RelNode tree (PhysicalConvention + PhysicalExchange boundaries)
        │
        ▼
-  ② PlanFragmenter
-       │  Finds AggregationNode and splits the tree at that boundary:
-       │    Fragment 0 (leaf, SOURCE):   TableScan → Filter → PARTIAL Agg
-       │    Fragment 1 (root, COORDINATOR): FINAL Agg → remaining operators
-       │  Non-aggregation queries produce a single fragment (no split).
+  ② VeloxPlanGenerator
+       │  Walks the physical plan and splits at PhysicalExchange boundaries.
+       │  Detects Aggregate(SINGLE) + Exchange → two-stage split:
+       │    Fragment 0 (leaf, SOURCE):   PARTIAL Agg → TableScanNode
+       │    Fragment 1 (root, COORDINATOR): FINAL Agg (wired during execution)
+       │  For joins: inserts ProjectNode to rename conflicting column names.
+       │  Converts physical RelNodes to velox4j PlanNodes.
        ▼
   List<PlanFragment>  (ordered leaf-first, root-last)
        │
@@ -388,20 +404,22 @@ The RFC describes a mature system. Our implementation is a focused subset target
 | Aspect | RFC #4812 | Our Implementation |
 |--------|-----------|-------------------|
 | **Scope** | Full rewrite of query pipeline (parsing → execution) | Extends existing SQL plugin (execution only) |
-| **Optimization** | 6-stage optimizer chain (Logical → CBO → Physical → RuntimeFilter → Engine → Exec) | Reuses SQL plugin's existing optimizer |
+| **Optimization** | 6-stage optimizer chain (Logical → CBO → Physical → RuntimeFilter → Engine → Exec) | PhysicalOptimizer: ClusterCopyShuttle + HepPlanner + VolcanoPlanner with PhysicalConvention |
+| **Exchange insertion** | Trait-driven via Convention.enforce() with RelDistributionTraitDef | Explicit in ConverterRules (PhysicalAggregateRule, PhysicalJoinRule insert PhysicalExchange) |
 | **Engine abstraction** | EngineOptimizer + EngineBridge interfaces | `canVectorize()` + `execute(RelNode)` on `ExecutionEngine` |
 | **Execution model** | Push-based pipeline with Operators and Consumers | Pull-based (Velox SerialTask.next()) |
 | **Data reading** | Concurrent reads at segment granularity | Sequential per shard |
 | **Fault tolerance** | Task retries, node health monitoring | No retries; single failure fails query |
-| **Maturity** | Production on thousands of nodes | Proof-of-concept, end-to-end pipeline working |
+| **Maturity** | Production on thousands of nodes | End-to-end working: scan, filter, project, aggregate, join, sort |
 
 ### Our approach as stepping stone
 
-Our design is intentionally narrower in scope. By extending the SQL plugin rather than rewriting it, we:
-- Ship sooner with a working end-to-end pipeline
-- Validate the `canVectorize()` extension point with a real engine
-- Build the scheduling/transport infrastructure that future improvements (shuffle, retries, parallel reads) can layer onto
-- Maintain the option to adopt RFC features incrementally
+Our design extends the SQL plugin rather than rewriting it, while adopting key RFC architectural patterns:
+- **Calcite Convention-based physical planning** — same pattern as the RFC's Physical Optimizer, using VolcanoPlanner with ConverterRules and PhysicalExchange insertion
+- **ClusterCopyShuttle** — decouples from the SQL plugin's planner, stripping pushdown context to prevent rule leaks (solves a real integration challenge the RFC doesn't address)
+- **Distributed execution** — Presto-inspired Stage/Task model with shard routing, same as RFC
+- **Pluggable engine** — `canVectorize()` extension point validated with Velox; other engines can follow the same pattern
+- The scheduling/transport infrastructure supports future improvements (parallel reads, retries, runtime filters) incrementally
 
 ---
 
@@ -411,7 +429,11 @@ Our design is intentionally narrower in scope. By extending the SQL plugin rathe
 
 - Full table scan, filter, projection, aggregation, sort/limit, hash join
 - Two-phase distributed aggregation (PARTIAL/FINAL)
+- Predicate pushdown to Lucene (filter pushed to doc-value-level BKD/term queries)
 - Shard-aware scheduling via ClusterState routing
+- MPP join support: coordinator-centric, broadcast, and hash shuffle strategies
+- Calcite physical planning: PhysicalOptimizer (VolcanoPlanner + ClusterCopyShuttle) → VeloxPlanGenerator
+- Per-query session creation (prevents memory pool collisions)
 - Graceful degradation on unsupported platforms
 - Data types: boolean, integer, long, float, double, keyword, date, timestamp
 
@@ -419,10 +441,9 @@ Our design is intentionally narrower in scope. By extending the SQL plugin rathe
 
 | Priority | Item | Why |
 |----------|------|-----|
-| **High** | Predicate pushdown to Lucene | Currently full-scan; pushing filters to Lucene drastically reduces data read |
 | **High** | Parallel segment reads | Currently sequential within a shard; segments are independent and can be read concurrently |
-| **Medium** | Hash shuffle exchange | Enables distributed joins without gathering all data to coordinator |
+| **High** | Convention.enforce() for distribution | Currently exchanges inserted explicitly in rules; enable Calcite's automatic distribution enforcement |
 | **Medium** | Task retry on failure | Resilience for long-running queries |
-| **Medium** | Cost-based optimization | Better join ordering using index statistics |
-| **Low** | RuntimeFilter | Accelerate joins by filtering probe side before scan |
+| **Medium** | Cost-based join strategy selection | Currently uses shard-count heuristic; use actual index statistics for broadcast vs shuffle |
+| **Medium** | RuntimeFilter | Accelerate joins by filtering probe side before scan |
 | **Low** | Cross-cluster query | Analytics across multiple OpenSearch clusters |
