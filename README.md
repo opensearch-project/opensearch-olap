@@ -22,11 +22,11 @@ DelegatingExecutionEngine
     │
     ├── canVectorize() = true ──► OlapExecutionExtensionImpl ──► VeloxExecutionEngine
     │                                                                │
-    │                                                         VeloxPlanConverter
-    │                                                         (RelNode → PlanNode)
+    │                                                         PhysicalOptimizer
+    │                                                         (VolcanoPlanner + Convention)
     │                                                                │
-    │                                                         PlanFragmenter
-    │                                                         (split for distribution)
+    │                                                         VeloxPlanGenerator
+    │                                                         (split at PhysicalExchange)
     │                                                                │
     │                                                         QueryScheduler
     │                                                         (route by shard)
@@ -66,10 +66,10 @@ This design keeps `QueryService` unchanged — it just calls `executionEngine.ex
                           |        │              |
                           | OlapExecutionExtensionImpl
                           |        │              |
-                          | VeloxPlanConverter    |
-                          |  (RelNode → PlanNode) |
+                          | PhysicalOptimizer     |
+                          |  (VolcanoPlanner)     |
                           |        │              |
-                          |  PlanFragmenter       |
+                          | VeloxPlanGenerator    |
                           |  (split at exchanges) |
                           |        │              |
                           |  QueryScheduler       |
@@ -98,8 +98,8 @@ This design keeps `QueryService` unchanged — it just calls `executionEngine.ex
 
 1. **SQL Parsing** (SQL plugin) - SQL/PPL is parsed and analyzed into a Calcite RelNode tree
 2. **Routing** - `DelegatingExecutionEngine` calls `canVectorize()` on the OLAP extension
-3. **Plan Conversion** - `VeloxPlanConverter` translates Calcite RelNodes to velox4j PlanNodes
-4. **Fragmentation** - `PlanFragmenter` splits the plan at exchange boundaries (e.g., PARTIAL agg on data nodes, FINAL agg on coordinator)
+3. **Physical Optimization** - `PhysicalOptimizer` deep-copies the plan into a new VolcanoPlanner (stripping pushdown), runs HepPlanner + ConverterRules to produce PhysicalConvention nodes with PhysicalExchange at distribution boundaries
+4. **Plan Generation** - `VeloxPlanGenerator` splits the physical plan at PhysicalExchange nodes into PlanFragments, handles two-stage aggregation split (PARTIAL/FINAL), and converts to velox4j PlanNodes
 5. **Scheduling** - `QueryScheduler` uses `ClusterState` routing table to assign fragments to data nodes owning the target shards
 6. **Transport** - Coordinator dispatches `ExecuteFragmentRequest` to data nodes via OpenSearch `TransportService`
 7. **Data Node Execution**:
@@ -162,13 +162,13 @@ src/main/java/org/opensearch/plugin/olap/
 │   └── VectorizedEngineExtension.java #   ExecutionEngine impl (canVectorize + execute)
 ├── plan/
 │   ├── convert/                       # Calcite → Velox expression/type converters
-│   │   ├── VeloxPlanConverter.java    #   RelNode → PlanNode tree (current path)
+│   │   ├── VeloxPlanConverter.java    #   RelNode → PlanNode tree (legacy, kept for reference)
 │   │   ├── VeloxExprConverter.java    #   RexNode → TypedExpr
 │   │   ├── VeloxTypeConverter.java    #   RelDataType → velox4j Type
 │   │   ├── VeloxAggConverter.java     #   AggregateCall → Aggregate
 │   │   └── PlanIdGenerator.java       #   Unique plan node IDs
 │   ├── fragment/                      # Distributed plan fragmentation
-│   │   ├── PlanFragmenter.java        #   Manual split at agg/join boundaries (current path)
+│   │   ├── PlanFragmenter.java        #   Manual split at agg/join boundaries (legacy, kept for reference)
 │   │   ├── PlanFragment.java          #   Fragment with plan subtree + properties
 │   │   └── FragmentProperties.java    #   Distribution metadata (SOURCE, COORDINATOR, BROADCAST, HASH_PARTITIONED)
 │   └── physical/                      # Calcite physical planning framework
@@ -181,7 +181,7 @@ src/main/java/org/opensearch/plugin/olap/
 │       ├── PhysicalJoin.java          #   Physical hash join
 │       ├── PhysicalSort.java          #   Physical sort/limit (dist=SINGLETON)
 │       ├── PhysicalExchange.java      #   Redistribution boundary
-│       ├── PhysicalOptimizer.java     #   VolcanoPlanner setup + optimization
+│       ├── PhysicalOptimizer.java     #   ClusterCopyShuttle + HepPlanner + VolcanoPlanner
 │       ├── VeloxPlanGenerator.java    #   Physical plan → Velox PlanNodes + PlanFragments
 │       └── rules/                     #   Conversion + optimization rules
 │           ├── PhysicalRules.java     #     All rule lists
