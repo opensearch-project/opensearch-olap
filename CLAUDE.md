@@ -40,7 +40,7 @@ OLAP Plugin: VeloxExecutionEngine           OpenSearchExecutionEngine
 ## Key packages
 - `engine/` - SQL plugin integration: `VeloxExecutionEngine` (orchestrates full pipeline), `VectorizedEngineExtension` (implements `ExecutionEngine` with `canVectorize()`)
 - `plan/convert/` - Calcite → Velox expression/type/aggregate converters (reused by both paths)
-- `plan/fragment/` - PlanFragment, FragmentProperties data classes + PlanFragmenter (current path)
+- `plan/fragment/` - PlanFragment, FragmentProperties data classes + PlanFragmenter (legacy, kept for reference)
 - `plan/physical/` - Calcite Convention-based physical planning framework
   - Physical RelNode classes: `PhysicalTableScan`, `PhysicalFilter`, `PhysicalProject`, `PhysicalAggregate`, `PhysicalJoin`, `PhysicalSort`, `PhysicalExchange`
   - `PhysicalConvention` with `enforce()` for auto Exchange insertion
@@ -110,20 +110,19 @@ The SQL plugin uses custom Calcite RelNode subclasses, not always the standard `
 ## Distributed aggregation execution flow
 For aggregation queries on multi-node clusters, the execution is phased:
 
-1. **PlanFragmenter** splits `AggregationNode(SINGLE)` into two fragments:
-   - Leaf fragment: `TableScan → ... → AggregationNode(PARTIAL)` — runs on data nodes
-   - Root fragment: `AggregationNode(FINAL) → Project → Limit` — runs on coordinator
-2. **Phase 1 (data nodes)**: `NodeResultCollector` dispatches only leaf-stage tasks. Each data node runs PARTIAL aggregation via Velox C++. Results serialized with `BaseVectors.serializeToBuf()` (Velox native binary format, NOT Arrow IPC).
-3. **Phase 2 (coordinator)**: `VeloxExecutionEngine.executeCoordinatorFragment()`:
+1. **PhysicalOptimizer** converts `LogicalAggregate → LogicalTableScan` into `PhysicalAggregate → PhysicalExchange(SINGLETON) → PhysicalTableScan`
+2. **VeloxPlanGenerator** detects `Aggregate(SINGLE) → Exchange` and splits into two fragments:
+   - Leaf fragment: `AggregationNode(PARTIAL) → TableScanNode` — runs on data nodes
+   - Root fragment: `AggregationNode(FINAL)` (sources wired during execution) — runs on coordinator
+3. **Phase 1 (data nodes)**: `NodeResultCollector` dispatches leaf-stage tasks. Each data node runs PARTIAL aggregation via Velox C++. Results serialized with `BaseVectors.serializeToBuf()` (Velox native binary format, NOT Arrow IPC).
+4. **Phase 2 (coordinator)**: `VeloxExecutionEngine.executeCoordinatorFragment()`:
    - Deserializes partial results via `BaseVectors.deserializeOneFromBuf()` — preserves intermediate accumulator types
    - Pushes deserialized RowVectors into a local `ExternalStream.BlockingQueue`
-   - Dynamically wires a `TableScanNode(exchange_scan)` as the source of the FINAL `AggregationNode` (since the FINAL node was created with empty sources)
+   - Dynamically wires a `TableScanNode(exchange_scan)` as the source of the FINAL `AggregationNode`
    - Executes the FINAL plan through Velox C++ locally on the coordinator
    - Converts final results to Arrow IPC for the SQL plugin response
 
 Key implementation details:
-- `PlanFragmenter.replaceSource()` reconstructs parent nodes (LimitNode, ProjectNode) when replacing the aggregation split point
-- `PlanFragmenter.getNodeSources()` uses reflection (`setAccessible(true)`) because `PlanNode.getSources()` is `protected`
 - `TransportExecuteFragmentAction` detects PARTIAL plans via `planJson.contains("\"step\":\"PARTIAL\"")` to decide Arrow IPC vs native serde
 - The feeder thread must start AFTER `serialTask.addSplit()` + `noMoreSplits()` to avoid race conditions
 
