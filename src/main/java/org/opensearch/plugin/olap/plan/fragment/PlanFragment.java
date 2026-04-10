@@ -33,7 +33,7 @@ public class PlanFragment {
 
   private final int fragmentId;
   private final PlanNode planRoot;
-  private final FragmentProperties properties;
+  private FragmentProperties properties;
   private final List<Integer> inputFragmentIds;
 
   /**
@@ -63,6 +63,10 @@ public class PlanFragment {
 
   public FragmentProperties getProperties() {
     return properties;
+  }
+
+  public void setProperties(FragmentProperties properties) {
+    this.properties = properties;
   }
 
   public List<Integer> getInputFragmentIds() {

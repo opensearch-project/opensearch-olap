@@ -12,6 +12,7 @@ import org.apache.calcite.rel.core.Aggregate;
 import org.apache.calcite.rel.logical.LogicalAggregate;
 import org.opensearch.plugin.olap.plan.physical.PhysicalAggregate;
 import org.opensearch.plugin.olap.plan.physical.PhysicalConvention;
+import org.opensearch.plugin.olap.plan.physical.PhysicalExchange;
 
 /**
  * MPP aggregate rule: requests HASH distribution from input when group keys exist. This allows
@@ -43,14 +44,12 @@ public class MppAggregateRule extends ConverterRule {
       return null;
     }
 
-    // Request hash distribution by group keys from input
+    // Convert child to PHYSICAL first, then explicitly insert Exchange(HASH).
+    // Same pattern as MppJoinRule — VolcanoPlanner can't decompose cross-convention +
+    // cross-distribution conversion in one step.
     RelNode input =
-        convert(
-            agg.getInput(),
-            agg.getInput()
-                .getTraitSet()
-                .replace(PhysicalConvention.INSTANCE)
-                .replace(RelDistributions.hash(agg.getGroupSet().asList())));
+        convert(agg.getInput(), agg.getInput().getTraitSet().replace(PhysicalConvention.INSTANCE));
+    input = PhysicalExchange.create(input, RelDistributions.hash(agg.getGroupSet().asList()));
 
     return new PhysicalAggregate(
         rel.getCluster(),

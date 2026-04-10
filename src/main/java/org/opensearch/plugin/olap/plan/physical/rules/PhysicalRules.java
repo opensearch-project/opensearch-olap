@@ -24,8 +24,7 @@ public final class PhysicalRules {
 
   /** MPP rules: HASH distribution alternatives. Registered when mpp_enabled=true. */
   public static final List<RelOptRule> MPP_RULES =
-      List.of(
-          MppAggregateRule.DEFAULT_CONFIG.toRule(), MppJoinRule.DEFAULT_CONFIG.toRule());
+      List.of(MppAggregateRule.DEFAULT_CONFIG.toRule(), MppJoinRule.DEFAULT_CONFIG.toRule());
 
   /**
    * Optimization rules. The two-stage aggregation split (SINGLE -> PARTIAL + FINAL) is handled by

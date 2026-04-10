@@ -39,7 +39,6 @@ import org.boostscale.velox4j.plan.PlanNode;
 import org.boostscale.velox4j.plan.TableScanNode;
 import org.boostscale.velox4j.query.Query;
 import org.boostscale.velox4j.query.SerialTask;
-import org.boostscale.velox4j.serde.Serde;
 import org.boostscale.velox4j.session.Session;
 import org.boostscale.velox4j.type.RowType;
 import org.boostscale.velox4j.type.Type;
@@ -106,15 +105,18 @@ public class VeloxExecutionEngine {
     logger.info("Executing query {} via Velox engine", queryId);
 
     try {
-      PlanNode veloxPlan = planConverter.convert(relNode);
+      // Physical optimization: VolcanoPlanner with PhysicalConvention
+      org.opensearch.plugin.olap.plan.physical.PhysicalOptimizer optimizer =
+          new org.opensearch.plugin.olap.plan.physical.PhysicalOptimizer(
+              veloxLifecycle.isMppEnabled());
+      RelNode physicalPlan = optimizer.optimize(relNode);
 
-      // Check if this is a join plan
-      if (planFragmenter.containsJoin(veloxPlan)) {
-        return executeJoinPlan(relNode, veloxPlan, queryId);
-      }
+      // Generate Velox PlanNodes + PlanFragments from the physical plan
+      org.opensearch.plugin.olap.plan.physical.VeloxPlanGenerator generator =
+          new org.opensearch.plugin.olap.plan.physical.VeloxPlanGenerator();
+      List<PlanFragment> fragments = generator.generate(physicalPlan);
 
-      // Non-join: existing single-table execution
-      return executeSingleTablePlan(relNode, veloxPlan, queryId);
+      return executeFragments(relNode, fragments, queryId);
 
     } catch (Exception e) {
       logger.error("Velox execution failed for query {}", queryId, e);
@@ -122,38 +124,191 @@ public class VeloxExecutionEngine {
     }
   }
 
-  // ---- Single-Table Execution (existing logic) ----
+  // ---- Unified Fragment Execution ----
 
-  private ExecutionEngine.QueryResponse executeSingleTablePlan(
-      RelNode relNode, PlanNode veloxPlan, QueryId queryId) {
-    String sourceIndex = extractSourceIndex(relNode);
-    List<PlanFragment> fragments = planFragmenter.fragment(veloxPlan, sourceIndex);
+  /**
+   * Execute a list of PlanFragments produced by VeloxPlanGenerator. Handles all topologies:
+   * single-table (scan+agg), coordinator-centric join (two leaf stages + coordinator), and MPP
+   * shuffle joins (hash-partitioned scan → shuffle → worker join).
+   */
+  private ExecutionEngine.QueryResponse executeFragments(
+      RelNode relNode, List<PlanFragment> fragments, QueryId queryId) {
+
+    // Detect if any leaf fragments require hash shuffle
+    boolean hasShuffleScan = fragments.stream().anyMatch(f -> f.getProperties().isShuffleScan());
+
+    if (hasShuffleScan) {
+      return executeShuffleFragments(relNode, fragments, queryId);
+    }
+
     QueryExecution execution = queryScheduler.schedule(fragments, ExecutionPolicy.PHASED);
     NodeResultCollector collector = new NodeResultCollector(transportService, queryScheduler);
 
     List<Stage> leafStages = execution.getLeafStages();
-    List<PlanFragment> coordinatorFragments = new ArrayList<>();
-    for (PlanFragment f : fragments) {
-      if (f.isRoot() && !f.isLeaf()) {
-        coordinatorFragments.add(f);
-      }
-    }
+    PlanFragment coordinatorFragment = findCoordinatorFragment(fragments);
 
+    // Phase 1: Dispatch all leaf stages to data nodes
     List<ExecuteFragmentResponse> leafResponses =
         collector.dispatchAndCollect(execution, leafStages);
 
+    // Phase 2: Execute coordinator fragment if present
+    if (coordinatorFragment == null || coordinatorFragment.getPlanRoot() == null) {
+      return buildQueryResponse(relNode.getRowType(), leafResponses);
+    }
+
     List<ExecuteFragmentResponse> finalResponses;
-    if (coordinatorFragments.isEmpty()) {
-      finalResponses = leafResponses;
-    } else {
+    if (leafStages.size() <= 1) {
+      // Single-input coordinator (aggregation: PARTIAL → FINAL)
       logger.info(
           "Executing coordinator fragment for query {} with {} partial results",
           queryId,
           leafResponses.size());
-      finalResponses = executeCoordinatorFragment(coordinatorFragments.get(0), leafResponses);
+      finalResponses = executeCoordinatorFragment(coordinatorFragment, leafResponses);
+    } else {
+      // Multi-input coordinator (join: left scan + right scan → HashJoinNode)
+      logger.info(
+          "Executing coordinator join for query {} with {} leaf stages",
+          queryId,
+          leafStages.size());
+      Map<Integer, List<ExecuteFragmentResponse>> responsesByFragment =
+          groupResponsesByFragment(leafResponses, leafStages);
+      // For a two-input join, pass the first two fragment response groups
+      List<List<ExecuteFragmentResponse>> inputGroups =
+          new ArrayList<>(responsesByFragment.values());
+      finalResponses =
+          executeCoordinatorJoin(
+              coordinatorFragment,
+              inputGroups.size() > 0 ? inputGroups.get(0) : Collections.emptyList(),
+              inputGroups.size() > 1 ? inputGroups.get(1) : Collections.emptyList());
     }
 
     return buildQueryResponse(relNode.getRowType(), finalResponses);
+  }
+
+  // ---- MPP Shuffle Fragment Execution ----
+
+  /**
+   * Execute fragments that use hash shuffle distribution. Shuffle scan fragments hash-partition
+   * their data and send partitions to worker nodes via ShuffleDataAction. Worker nodes execute the
+   * join plan on their received partitions.
+   */
+  private ExecutionEngine.QueryResponse executeShuffleFragments(
+      RelNode relNode, List<PlanFragment> fragments, QueryId queryId) {
+    int partitionCount = veloxLifecycle.getShufflePartitions();
+    if (partitionCount <= 0) {
+      partitionCount = queryScheduler.getDataNodeIds().size();
+    }
+    logger.info(
+        "Executing shuffle fragments for query {} with {} partitions", queryId, partitionCount);
+
+    // The coordinator fragment contains the join plan. For shuffle execution, we need to
+    // create a HASH_PARTITIONED stage from it so it runs on N workers (not just coordinator).
+    PlanFragment coordinatorFragment = findCoordinatorFragment(fragments);
+    if (coordinatorFragment == null) {
+      throw new IllegalStateException("No coordinator fragment found for shuffle join");
+    }
+
+    // Replace the coordinator fragment with a HASH_PARTITIONED one for worker execution
+    List<PlanFragment> adjustedFragments = new ArrayList<>();
+    for (PlanFragment f : fragments) {
+      if (f.getProperties().getDistribution() == FragmentProperties.Distribution.COORDINATOR) {
+        // Convert coordinator to hash-partitioned worker stage
+        adjustedFragments.add(
+            new PlanFragment(
+                f.getFragmentId(),
+                f.getPlanRoot(),
+                FragmentProperties.hashPartitioned(partitionCount),
+                f.getInputFragmentIds()));
+      } else {
+        adjustedFragments.add(f);
+      }
+    }
+
+    QueryExecution execution = queryScheduler.schedule(adjustedFragments, ExecutionPolicy.PHASED);
+    NodeResultCollector collector = new NodeResultCollector(transportService, queryScheduler);
+
+    // Identify shuffle scan stages and the join worker stage
+    List<Stage> shuffleScanStages = new ArrayList<>();
+    Stage joinStage = null;
+    for (Stage stage : execution.getStages()) {
+      FragmentProperties props = stage.getFragment().getProperties();
+      if (props.isShuffleScan()) {
+        shuffleScanStages.add(stage);
+      } else if (props.getDistribution() == FragmentProperties.Distribution.HASH_PARTITIONED) {
+        joinStage = stage;
+      }
+    }
+
+    if (joinStage == null) {
+      throw new IllegalStateException("No hash-partitioned join stage found");
+    }
+
+    // Get worker node IDs for shuffle targets
+    List<String> workerNodeIds = new ArrayList<>();
+    for (TaskDescriptor task : joinStage.getTasks()) {
+      workerNodeIds.add(task.getTargetNode().getId());
+    }
+
+    // Assign join sides to shuffle scan stages (first=left, second=right)
+    for (int i = 0; i < shuffleScanStages.size(); i++) {
+      Stage stage = shuffleScanStages.get(i);
+      String side = (i == 0) ? "left" : "right";
+      // Update the fragment properties with join side info
+      FragmentProperties oldProps = stage.getFragment().getProperties();
+      if (oldProps.getJoinSide() == null) {
+        stage
+            .getFragment()
+            .setProperties(
+                FragmentProperties.shuffleScan(
+                    oldProps.getSourceIndex(),
+                    side,
+                    oldProps.getShuffleKeyChannels(),
+                    workerNodeIds.size()));
+      }
+    }
+
+    // Count senders per side
+    int leftSenderCount = 0;
+    int rightSenderCount = 0;
+    for (int i = 0; i < shuffleScanStages.size(); i++) {
+      int taskCount = shuffleScanStages.get(i).getTasks().size();
+      if (i == 0) leftSenderCount = taskCount;
+      else rightSenderCount += taskCount;
+    }
+
+    // Phase 1: Dispatch shuffle scan stages
+    int targetStageId = joinStage.getStageId().getStageNumber();
+    List<ExecuteFragmentResponse> scanResponses =
+        collector.dispatchAndCollectShuffle(
+            execution, shuffleScanStages, workerNodeIds, targetStageId);
+    logger.info(
+        "Shuffle scan phase complete: {} responses for query {}", scanResponses.size(), queryId);
+
+    // Phase 2: Dispatch shuffle join tasks to workers
+    List<ExecuteFragmentResponse> joinResponses =
+        collector.dispatchAndCollectShuffleJoin(
+            execution,
+            List.of(joinStage),
+            queryId.getId(),
+            targetStageId,
+            leftSenderCount,
+            rightSenderCount);
+
+    return buildQueryResponse(relNode.getRowType(), joinResponses);
+  }
+
+  /** Group leaf stage responses by their fragment ID. */
+  private Map<Integer, List<ExecuteFragmentResponse>> groupResponsesByFragment(
+      List<ExecuteFragmentResponse> responses, List<Stage> leafStages) {
+    Map<Integer, List<ExecuteFragmentResponse>> grouped = new HashMap<>();
+    int idx = 0;
+    for (Stage stage : leafStages) {
+      int fragId = stage.getFragment().getFragmentId();
+      for (TaskDescriptor task : stage.getTasks()) {
+        grouped.computeIfAbsent(fragId, k -> new ArrayList<>()).add(responses.get(idx++));
+      }
+    }
+    return grouped;
   }
 
   // ---- Join Plan Execution ----
@@ -256,55 +411,38 @@ public class VeloxExecutionEngine {
     Session session = veloxLifecycle.getSession();
     String connectorId = "connector-external-stream";
 
-    // Get output types from the first available response batch
-    Type leftType = getResponseOutputType(session, leftResponses);
-    Type rightType = getResponseOutputType(session, rightResponses);
+    // The coordinator plan already has exchange scan placeholders from VeloxPlanGenerator.
+    // Find their IDs so we can wire splits to the correct scan nodes.
+    org.opensearch.plugin.olap.execution.VeloxExecutor tempExecutor =
+        new org.opensearch.plugin.olap.execution.VeloxExecutor(session);
+    List<String> scanIds = tempExecutor.findAllTableScanNodeIds(coordinatorFragment.getPlanRoot());
 
-    if (leftType == null || rightType == null) {
-      logger.warn("No data from one or both join sides");
-      return List.of(ExecuteFragmentResponse.success(0, new byte[0]));
+    if (scanIds.size() < 2) {
+      logger.warn("Coordinator join plan has < 2 scan nodes, falling back to single-input");
+      return executeCoordinatorFragment(coordinatorFragment, leftResponses);
     }
 
-    // Create two exchange scan nodes
-    TableScanNode leftExchange =
-        new TableScanNode(
-            "left_exchange",
-            leftType,
-            new ExternalStreamTableHandle(connectorId),
-            Collections.emptyList());
-    TableScanNode rightExchange =
-        new TableScanNode(
-            "right_exchange",
-            rightType,
-            new ExternalStreamTableHandle(connectorId),
-            Collections.emptyList());
+    String leftScanId = scanIds.get(0);
+    String rightScanId = scanIds.get(1);
 
-    // Wire both exchange scans into the coordinator plan
-    PlanNode coordinatorPlan =
-        wireJoinSources(coordinatorFragment.getPlanRoot(), leftExchange, rightExchange);
-
-    // Fix final aggregate types if there's an aggregation above the join
-    coordinatorPlan = fixAggregateTypes(coordinatorPlan, leftType, rightType);
-
-    // Create BlockingQueues
+    // Create BlockingQueues for both sides
     BlockingQueue leftQueue = session.externalStreamOps().newBlockingQueue();
     BlockingQueue rightQueue = session.externalStreamOps().newBlockingQueue();
 
-    // Build and execute the query
+    // Build and execute the coordinator plan as-is (exchange scans already in place)
     ConnectorConfig connectorConfig = ConnectorConfig.create(Map.of(connectorId, Config.empty()));
-    Query query = new Query(coordinatorPlan, Config.empty(), connectorConfig);
+    Query query = new Query(coordinatorFragment.getPlanRoot(), Config.empty(), connectorConfig);
 
-    logger.info("Executing coordinator join plan: {}", Serde.toJson(query));
+    logger.info("Executing coordinator join plan with scan IDs: {}, {}", leftScanId, rightScanId);
 
     SerialTask serialTask = session.queryOps().execute(query);
 
-    // Add splits for both exchange scans
+    // Wire splits to the actual exchange scan node IDs
+    serialTask.addSplit(leftScanId, new ExternalStreamConnectorSplit(connectorId, leftQueue.id()));
     serialTask.addSplit(
-        "left_exchange", new ExternalStreamConnectorSplit(connectorId, leftQueue.id()));
-    serialTask.addSplit(
-        "right_exchange", new ExternalStreamConnectorSplit(connectorId, rightQueue.id()));
-    serialTask.noMoreSplits("left_exchange");
-    serialTask.noMoreSplits("right_exchange");
+        rightScanId, new ExternalStreamConnectorSplit(connectorId, rightQueue.id()));
+    serialTask.noMoreSplits(leftScanId);
+    serialTask.noMoreSplits(rightScanId);
 
     // Start feeder threads for both sides
     Thread leftFeeder =

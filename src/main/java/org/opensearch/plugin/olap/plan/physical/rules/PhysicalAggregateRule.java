@@ -12,7 +12,6 @@ import org.apache.calcite.rel.core.Aggregate;
 import org.apache.calcite.rel.logical.LogicalAggregate;
 import org.opensearch.plugin.olap.plan.physical.PhysicalAggregate;
 import org.opensearch.plugin.olap.plan.physical.PhysicalConvention;
-import org.opensearch.plugin.olap.plan.physical.PhysicalExchange;
 
 /**
  * Default aggregate rule: requests SINGLETON distribution from input. All data is gathered to the
@@ -36,14 +35,15 @@ public class PhysicalAggregateRule extends ConverterRule {
   @Override
   public RelNode convert(RelNode rel) {
     Aggregate agg = (Aggregate) rel;
+    // Convert child to PhysicalConvention only (no distribution requirement).
+    // The aggregate itself declares SINGLETON distribution in its traitSet.
+    // Convention.enforce() will auto-insert PhysicalExchange when the child's
+    // distribution (e.g., RANDOM from scan) doesn't satisfy SINGLETON.
     RelNode input =
-        convert(
-            agg.getInput(), agg.getInput().getTraitSet().replace(PhysicalConvention.INSTANCE));
-    // Explicitly insert Exchange(SINGLETON) to gather data before aggregation
-    input = PhysicalExchange.create(input, RelDistributions.SINGLETON);
+        convert(agg.getInput(), agg.getInput().getTraitSet().replace(PhysicalConvention.INSTANCE));
     return new PhysicalAggregate(
         rel.getCluster(),
-        rel.getTraitSet().replace(PhysicalConvention.INSTANCE),
+        rel.getTraitSet().replace(PhysicalConvention.INSTANCE).replace(RelDistributions.SINGLETON),
         input,
         agg.getGroupSet(),
         agg.getGroupSets(),

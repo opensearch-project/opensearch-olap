@@ -21,7 +21,10 @@ public class PhysicalTableScanRule extends ConverterRule {
   public static final Config DEFAULT_CONFIG =
       Config.INSTANCE
           .withConversion(
-              TableScan.class, Convention.NONE, PhysicalConvention.INSTANCE, "PhysicalTableScanRule")
+              TableScan.class,
+              Convention.NONE,
+              PhysicalConvention.INSTANCE,
+              "PhysicalTableScanRule")
           .withRuleFactory(PhysicalTableScanRule::new);
 
   protected PhysicalTableScanRule(Config config) {

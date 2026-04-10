@@ -87,6 +87,9 @@ public class PhysicalOptimizer {
       allRules.addAll(PhysicalRules.MPP_RULES);
     }
     allRules.addAll(PhysicalRules.OPTIMIZATION_RULES);
+    // AbstractConverter.ExpandConversionRule enables Convention.enforce() to fire
+    // for distribution trait mismatches (e.g., RANDOM → SINGLETON via PhysicalExchange).
+    allRules.add(org.apache.calcite.plan.volcano.AbstractConverter.ExpandConversionRule.INSTANCE);
 
     // Step 5: Register rules and run optimization directly on our planner
     for (RelOptRule rule : allRules) {
@@ -181,11 +184,18 @@ public class PhysicalOptimizer {
 
     @Override
     public RelNode visit(RelNode other) {
+      // Handle Sort subclasses (LogicalSystemLimit extends Sort but doesn't
+      // dispatch to visit(LogicalSort)). LogicalSort.create() uses the input's
+      // cluster, ensuring the new node belongs to our cluster.
+      if (other instanceof org.apache.calcite.rel.core.Sort) {
+        org.apache.calcite.rel.core.Sort sort = (org.apache.calcite.rel.core.Sort) other;
+        RelNode newInput = sort.getInput().accept(this);
+        return LogicalSort.create(newInput, sort.getCollation(), sort.offset, sort.fetch);
+      }
       // Generic fallback: visit children, then create new node using targetCluster
       List<RelNode> newInputs =
           other.getInputs().stream().map(input -> input.accept(this)).collect(Collectors.toList());
       if (!newInputs.isEmpty()) {
-        // Use the new input's cluster to create the copy
         return other.copy(mapTraits(other.getTraitSet()), newInputs);
       }
       return other;

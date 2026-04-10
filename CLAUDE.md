@@ -24,7 +24,7 @@ OLAP Plugin: VeloxExecutionEngine           OpenSearchExecutionEngine
        - Convention.NONE → PhysicalConvention
        - PhysicalAggregateRule inserts PhysicalExchange(SINGLETON) before agg
        - PhysicalJoinRule inserts PhysicalExchange(SINGLETON) for both join inputs
-       - MPP rules: HASH distribution alternatives (when mpp_enabled=true)
+       - MPP rules: MppJoinRule/MppAggregateRule insert PhysicalExchange(HASH) (when mpp_enabled=true)
              │
              ▼
   VeloxPlanGenerator
@@ -73,6 +73,9 @@ SPI service file: `META-INF/services/org.opensearch.sql.executor.ExecutionEngine
 - Apache Arrow 18.1.0 — `arrow-vector`, `arrow-memory-core`, `arrow-memory-unsafe`, `arrow-c-data`, `arrow-format`
 - `com.google.flatbuffers:flatbuffers-java:24.3.25` — required by `arrow-c-data` at runtime (not pulled transitively)
 - velox4j 0.1.0-SNAPSHOT — repackaged at build time to strip javax.annotation and org.slf4j (avoids jar hell with SQL plugin's jsr305)
+
+## Coding
+Use simple class name + import in coding as much as possible, except there is obvious existence of class naming conflicts.
 
 ## Build
 ```bash
@@ -127,12 +130,32 @@ Key implementation details:
 - The feeder thread must start AFTER `serialTask.addSplit()` + `noMoreSplits()` to avoid race conditions
 
 ## MPP join support
-Three join strategies controlled by `plugins.velox.mpp_enabled` (default false):
+Three join strategies controlled by `plugins.velox.mpp_enabled` (default false, **dynamic** — can be toggled at runtime via cluster settings API):
 - **Coordinator-centric** (mpp_enabled=false): Both sides gathered to coordinator, join runs locally
 - **Broadcast** (mpp_enabled=true, small build side): Small table broadcast to all probe nodes
 - **Hash shuffle** (mpp_enabled=true, both large): Both sides hash-partitioned by join key, shuffled P2P via `ShuffleDataAction`
 
-Cost estimator uses shard count heuristic (`plugins.velox.broadcast_max_shards`, default 2). `plugins.velox.shuffle_partitions` controls partition count (0 = auto, uses number of data nodes).
+Cost estimator uses shard count heuristic (`plugins.velox.broadcast_max_shards`, default 2). `plugins.velox.shuffle_partitions` controls partition count (0 = auto, uses number of data nodes). All three settings are **dynamic** (`Setting.Property.Dynamic`).
+
+### MPP rule design (MppJoinRule, MppAggregateRule)
+MPP rules use the same explicit PhysicalExchange insertion pattern as the base rules:
+1. Convert children to PhysicalConvention (convention conversion only)
+2. Explicitly insert `PhysicalExchange.create(child, RelDistributions.hash(keys))`
+3. The VolcanoPlanner explores both SINGLETON (base rules) and HASH (MPP rules) alternatives, picks the lower-cost plan
+
+This avoids `CannotPlanException` — the VolcanoPlanner can't decompose cross-convention + cross-distribution conversion (NONE+ANY → PHYSICAL+HASH) in one step, so the exchange must be inserted explicitly rather than requested via traits.
+
+### MPP execution in VeloxExecutionEngine
+`executeFragments()` detects shuffle scan fragments (leaf fragments with `shuffleKeyChannels`) and routes to `executeShuffleFragments()`, which:
+1. Replaces the COORDINATOR fragment with a HASH_PARTITIONED one for worker execution
+2. Assigns join sides (left/right) to shuffle scan stages
+3. Dispatches shuffle scan stages via `NodeResultCollector.dispatchAndCollectShuffle()`
+4. Dispatches shuffle join tasks via `NodeResultCollector.dispatchAndCollectShuffleJoin()`
+
+### VeloxPlanGenerator exchange handling
+`handleExchange()` checks the exchange's own distribution (`exchange.getDistribution()`), not the input's:
+- SINGLETON exchange → `FragmentProperties.source()` (gather to coordinator)
+- HASH_DISTRIBUTED exchange → `FragmentProperties.shuffleScan()` (hash-partition by key channels)
 
 ### Join column name conflict
 Velox validates that left and right output types have no duplicate names. The SQL plugin's `CalciteRelNodeVisitor.visitJoin()` adds a rename Project above the join (e.g. `dept_id0` → `d.dept_id`). The converter inserts a `ProjectNode` around the right side to rename conflicting columns. The scan keeps original names (for `LuceneArrowReader`), and ExternalStream maps by position, so the rename is transparent.
@@ -144,9 +167,9 @@ Uses Calcite's Convention + VolcanoPlanner, wired into `VeloxExecutionEngine.exe
 - Physical nodes extend Calcite base classes (Filter, Project, etc.) and implement `PhysicalRel` marker interface
 - `PhysicalTableScan` overrides `deriveRowType()` to preserve the SQL plugin's scan row type
 - ConverterRules convert Convention.NONE → PhysicalConvention with explicit PhysicalExchange insertion
-- MPP rules (MppAggregateRule, MppJoinRule) registered only when mpp_enabled=true
+- MPP rules (MppAggregateRule, MppJoinRule) registered only when mpp_enabled=true; use same explicit PhysicalExchange(HASH) insertion pattern as base rules
 - `PhysicalOptimizer` creates a **new VolcanoPlanner + RelOptCluster** with `RelDistributionTraitDef`. Deep-copies the incoming plan via `ClusterCopyShuttle` to decouple from the SQL plugin's planner. Runs `FilterMergeRule` via HepPlanner before VolcanoPlanner.
-- `VeloxPlanGenerator` walks the physical plan, splits at PhysicalExchange nodes, handles two-stage aggregation split (PARTIAL/FINAL with Velox-specific intermediate types)
+- `VeloxPlanGenerator` walks the physical plan, splits at PhysicalExchange nodes, handles two-stage aggregation split (PARTIAL/FINAL with Velox-specific intermediate types). `handleExchange()` checks the exchange's own distribution to produce correct fragment properties (SINGLETON→SOURCE, HASH→shuffleScan)
 - Reuses Calcite's built-in `RelDistribution` (SINGLETON, HASH_DISTRIBUTED, RANDOM_DISTRIBUTED, ANY)
 - **Guava is compileOnly** in build.gradle — needed because Calcite base classes use `ImmutableList` in constructors
 

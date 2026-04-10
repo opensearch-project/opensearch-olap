@@ -70,6 +70,21 @@ public class OlapPlugin extends Plugin implements ActionPlugin {
 
     VectorizedEngineExtension.setEngine(veloxExecutionEngine);
 
+    // Register dynamic setting update consumers
+    clusterService
+        .getClusterSettings()
+        .addSettingsUpdateConsumer(
+            VeloxLifecycleService.MPP_ENABLED, veloxLifecycleService::setMppEnabled);
+    clusterService
+        .getClusterSettings()
+        .addSettingsUpdateConsumer(
+            VeloxLifecycleService.BROADCAST_MAX_SHARDS,
+            veloxLifecycleService::setBroadcastMaxShards);
+    clusterService
+        .getClusterSettings()
+        .addSettingsUpdateConsumer(
+            VeloxLifecycleService.SHUFFLE_PARTITIONS, veloxLifecycleService::setShufflePartitions);
+
     return Arrays.asList(
         veloxLifecycleService, queryScheduler, veloxExecutionEngine, shuffleManager);
   }

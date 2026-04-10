@@ -183,7 +183,48 @@ public class VeloxPlanGeneratorTests extends OpenSearchTestCase {
     VeloxPlanGenerator gen = new VeloxPlanGenerator();
     List<PlanFragment> fragments = gen.generate(physical);
 
-    assertTrue("MPP join should produce fragments", fragments.size() >= 1);
+    // MPP join should produce at least 3 fragments: 2 leaf scans + 1 coordinator join
+    assertTrue(
+        "MPP join should produce at least 3 fragments, got " + fragments.size(),
+        fragments.size() >= 3);
+  }
+
+  // ---- MPP aggregate produces fragments without CannotPlanException ----
+
+  public void testMppAggregateWithGroupByProducesFragments() {
+    RelBuilder rb = b();
+    // With group keys, MppAggregateRule should fire (HASH distribution alternative)
+    RelNode logical =
+        rb.scan("employees").aggregate(rb.groupKey("dept_id", "name"), rb.count()).build();
+    RelNode physical = optimize(logical, true);
+
+    VeloxPlanGenerator gen = new VeloxPlanGenerator();
+    List<PlanFragment> fragments = gen.generate(physical);
+
+    // Should produce at least 1 fragment (planner may pick either SINGLETON or HASH)
+    assertTrue(
+        "MPP aggregate should produce fragments, got " + fragments.size(), fragments.size() >= 1);
+  }
+
+  // ---- MPP join with left join ----
+
+  public void testMppLeftJoinProducesFragments() {
+    RelBuilder rb = b();
+    RelNode logical =
+        rb.scan("employees")
+            .scan("departments")
+            .join(JoinRelType.LEFT, rb.equals(rb.field(2, 0, "dept_id"), rb.field(2, 1, "dept_id")))
+            .build();
+    RelNode physical = optimize(logical, true);
+
+    VeloxPlanGenerator gen = new VeloxPlanGenerator();
+    List<PlanFragment> fragments = gen.generate(physical);
+
+    // Planner explores both SINGLETON and HASH alternatives, picks lower cost.
+    // At minimum should produce fragments without CannotPlanException.
+    assertTrue(
+        "MPP left join should produce at least 1 fragment, got " + fragments.size(),
+        fragments.size() >= 1);
   }
 
   // ---- Every fragment has a non-null plan root ----
