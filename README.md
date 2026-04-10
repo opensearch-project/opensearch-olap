@@ -162,13 +162,11 @@ src/main/java/org/opensearch/plugin/olap/
 │   └── VectorizedEngineExtension.java #   ExecutionEngine impl (canVectorize + execute)
 ├── plan/
 │   ├── convert/                       # Calcite → Velox expression/type converters
-│   │   ├── VeloxPlanConverter.java    #   RelNode → PlanNode tree (legacy, kept for reference)
 │   │   ├── VeloxExprConverter.java    #   RexNode → TypedExpr
 │   │   ├── VeloxTypeConverter.java    #   RelDataType → velox4j Type
 │   │   ├── VeloxAggConverter.java     #   AggregateCall → Aggregate
 │   │   └── PlanIdGenerator.java       #   Unique plan node IDs
 │   ├── fragment/                      # Distributed plan fragmentation
-│   │   ├── PlanFragmenter.java        #   Manual split at agg/join boundaries (legacy, kept for reference)
 │   │   ├── PlanFragment.java          #   Fragment with plan subtree + properties
 │   │   └── FragmentProperties.java    #   Distribution metadata (SOURCE, COORDINATOR, BROADCAST, HASH_PARTITIONED)
 │   └── physical/                      # Calcite physical planning framework

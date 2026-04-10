@@ -435,8 +435,10 @@ Our design extends the SQL plugin rather than rewriting it, while adopting key R
 - Two-phase distributed aggregation (PARTIAL/FINAL)
 - Predicate pushdown to Lucene (filter pushed to doc-value-level BKD/term queries)
 - Shard-aware scheduling via ClusterState routing
-- MPP join support: coordinator-centric, broadcast, and hash shuffle strategies
+- MPP join support: coordinator-centric, broadcast, and hash shuffle strategies (all wired through PhysicalOptimizer → VeloxPlanGenerator → executeFragments)
 - Calcite physical planning: PhysicalOptimizer (VolcanoPlanner + ClusterCopyShuttle) → VeloxPlanGenerator
+- Dynamic MPP settings: `mpp_enabled`, `broadcast_max_shards`, `shuffle_partitions` togglable at runtime via cluster settings API
+- Cost-based MPP strategy selection: CostEstimator selects BROADCAST vs HASH_SHUFFLE based on shard count heuristic
 - Per-query session creation (prevents memory pool collisions)
 - Graceful degradation on unsupported platforms
 - Data types: boolean, integer, long, float, double, keyword, date, timestamp
