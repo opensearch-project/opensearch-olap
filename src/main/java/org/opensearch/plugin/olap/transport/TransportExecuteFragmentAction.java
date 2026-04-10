@@ -378,8 +378,17 @@ public class TransportExecuteFragmentAction
         RowVector batch = iter.next();
         if (batch == null) break;
 
-        byte[][] partitions =
-            session.rowVectorOps().hashPartitionAndSerialize(batch, keyChannels, numPartitions);
+        // Partition by join key hash and serialize each partition.
+        // partitionByKeyHashes returns List<RowVector>, we serialize each to native bytes.
+        List<RowVector> partitionVectors =
+            session.rowVectorOps().partitionByKeyHashes(batch, keyChannels, numPartitions);
+        byte[][] partitions = new byte[partitionVectors.size()][];
+        for (int p = 0; p < partitionVectors.size(); p++) {
+          if (partitionVectors.get(p) != null) {
+            partitions[p] =
+                org.boostscale.velox4j.data.BaseVectors.serializeOneToBuf(partitionVectors.get(p));
+          }
+        }
 
         for (int i = 0; i < partitions.length; i++) {
           if (partitions[i] != null) {

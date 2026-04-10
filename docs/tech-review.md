@@ -172,6 +172,10 @@ The coordinator runs a multi-stage pipeline to transform a logical plan into dis
        │    Convention.NONE → PhysicalConvention
        │    PhysicalAggregateRule inserts PhysicalExchange(SINGLETON)
        │    PhysicalJoinRule inserts PhysicalExchange(SINGLETON) on both inputs
+       │    MPP rules (when mpp_enabled=true):
+       │      MppJoinRule inserts PhysicalExchange(HASH) on both inputs
+       │      MppAggregateRule inserts PhysicalExchange(HASH) on input
+       │    Planner explores SINGLETON + HASH alternatives, picks lower cost
        ▼
   Physical RelNode tree (PhysicalConvention + PhysicalExchange boundaries)
        │
@@ -405,7 +409,7 @@ The RFC describes a mature system. Our implementation is a focused subset target
 |--------|-----------|-------------------|
 | **Scope** | Full rewrite of query pipeline (parsing → execution) | Extends existing SQL plugin (execution only) |
 | **Optimization** | 6-stage optimizer chain (Logical → CBO → Physical → RuntimeFilter → Engine → Exec) | PhysicalOptimizer: ClusterCopyShuttle + HepPlanner + VolcanoPlanner with PhysicalConvention |
-| **Exchange insertion** | Trait-driven via Convention.enforce() with RelDistributionTraitDef | Explicit in ConverterRules (PhysicalAggregateRule, PhysicalJoinRule insert PhysicalExchange) |
+| **Exchange insertion** | Trait-driven via Convention.enforce() with RelDistributionTraitDef | Explicit in ConverterRules: base rules insert PhysicalExchange(SINGLETON), MPP rules insert PhysicalExchange(HASH). VolcanoPlanner explores both. |
 | **Engine abstraction** | EngineOptimizer + EngineBridge interfaces | `canVectorize()` + `execute(RelNode)` on `ExecutionEngine` |
 | **Execution model** | Push-based pipeline with Operators and Consumers | Pull-based (Velox SerialTask.next()) |
 | **Data reading** | Concurrent reads at segment granularity | Sequential per shard |
@@ -442,7 +446,7 @@ Our design extends the SQL plugin rather than rewriting it, while adopting key R
 | Priority | Item | Why |
 |----------|------|-----|
 | **High** | Parallel segment reads | Currently sequential within a shard; segments are independent and can be read concurrently |
-| **High** | Convention.enforce() for distribution | Currently exchanges inserted explicitly in rules; enable Calcite's automatic distribution enforcement |
+| **Medium** | Convention.enforce() for distribution | Currently exchanges inserted explicitly in rules; enable Calcite's automatic distribution enforcement for cleaner rule definitions |
 | **Medium** | Task retry on failure | Resilience for long-running queries |
 | **Medium** | Cost-based join strategy selection | Currently uses shard-count heuristic; use actual index statistics for broadcast vs shuffle |
 | **Medium** | RuntimeFilter | Accelerate joins by filtering probe side before scan |

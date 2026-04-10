@@ -23,10 +23,7 @@ public class PhysicalJoinRule extends ConverterRule {
   public static final Config DEFAULT_CONFIG =
       Config.INSTANCE
           .withConversion(
-              LogicalJoin.class,
-              Convention.NONE,
-              PhysicalConvention.INSTANCE,
-              "PhysicalJoinRule")
+              LogicalJoin.class, Convention.NONE, PhysicalConvention.INSTANCE, "PhysicalJoinRule")
           .withRuleFactory(PhysicalJoinRule::new);
 
   protected PhysicalJoinRule(Config config) {
@@ -36,9 +33,14 @@ public class PhysicalJoinRule extends ConverterRule {
   @Override
   public RelNode convert(RelNode rel) {
     Join join = (Join) rel;
+    // Convert children to PhysicalConvention, then explicitly insert Exchange(SINGLETON).
+    // We can't rely on Convention.enforce() here because the VolcanoPlanner can't decompose
+    // cross-convention + cross-distribution conversion (NONE+ANY → PHYSICAL+SINGLETON) into
+    // two steps. The aggregate rule uses same-convention enforce (PHYSICAL+RANDOM →
+    // PHYSICAL+SINGLETON)
+    // which works, but joins need the cross-convention step first.
     RelNode left =
-        convert(
-            join.getLeft(), join.getLeft().getTraitSet().replace(PhysicalConvention.INSTANCE));
+        convert(join.getLeft(), join.getLeft().getTraitSet().replace(PhysicalConvention.INSTANCE));
     RelNode right =
         convert(
             join.getRight(), join.getRight().getTraitSet().replace(PhysicalConvention.INSTANCE));
@@ -46,7 +48,7 @@ public class PhysicalJoinRule extends ConverterRule {
     right = PhysicalExchange.create(right, RelDistributions.SINGLETON);
     return new PhysicalJoin(
         rel.getCluster(),
-        rel.getTraitSet().replace(PhysicalConvention.INSTANCE),
+        rel.getTraitSet().replace(PhysicalConvention.INSTANCE).replace(RelDistributions.SINGLETON),
         left,
         right,
         join.getCondition(),

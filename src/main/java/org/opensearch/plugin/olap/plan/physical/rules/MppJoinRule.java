@@ -12,6 +12,7 @@ import org.apache.calcite.rel.core.Join;
 import org.apache.calcite.rel.core.JoinInfo;
 import org.apache.calcite.rel.logical.LogicalJoin;
 import org.opensearch.plugin.olap.plan.physical.PhysicalConvention;
+import org.opensearch.plugin.olap.plan.physical.PhysicalExchange;
 import org.opensearch.plugin.olap.plan.physical.PhysicalJoin;
 
 /**
@@ -41,20 +42,16 @@ public class MppJoinRule extends ConverterRule {
       return null;
     }
 
+    // Convert children to PhysicalConvention first, then explicitly insert Exchange(HASH).
+    // Same pattern as PhysicalJoinRule — VolcanoPlanner can't decompose cross-convention +
+    // cross-distribution conversion in one step.
     RelNode left =
-        convert(
-            join.getLeft(),
-            join.getLeft()
-                .getTraitSet()
-                .replace(PhysicalConvention.INSTANCE)
-                .replace(RelDistributions.hash(joinInfo.leftKeys)));
+        convert(join.getLeft(), join.getLeft().getTraitSet().replace(PhysicalConvention.INSTANCE));
     RelNode right =
         convert(
-            join.getRight(),
-            join.getRight()
-                .getTraitSet()
-                .replace(PhysicalConvention.INSTANCE)
-                .replace(RelDistributions.hash(joinInfo.rightKeys)));
+            join.getRight(), join.getRight().getTraitSet().replace(PhysicalConvention.INSTANCE));
+    left = PhysicalExchange.create(left, RelDistributions.hash(joinInfo.leftKeys));
+    right = PhysicalExchange.create(right, RelDistributions.hash(joinInfo.rightKeys));
 
     return new PhysicalJoin(
         rel.getCluster(),

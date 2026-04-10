@@ -48,21 +48,32 @@ public class VeloxLifecycleService implements Closeable {
 
   /** Enable MPP (massively parallel processing) join strategies (broadcast + hash shuffle). */
   public static final Setting<Boolean> MPP_ENABLED =
-      Setting.boolSetting("plugins.velox.mpp_enabled", false, Setting.Property.NodeScope);
+      Setting.boolSetting(
+          "plugins.velox.mpp_enabled", false, Setting.Property.NodeScope, Setting.Property.Dynamic);
 
   /**
    * Max primary shard count for the smaller join side to qualify for broadcast. If the smaller side
    * has more shards than this, hash shuffle is used instead.
    */
   public static final Setting<Integer> BROADCAST_MAX_SHARDS =
-      Setting.intSetting("plugins.velox.broadcast_max_shards", 2, 1, Setting.Property.NodeScope);
+      Setting.intSetting(
+          "plugins.velox.broadcast_max_shards",
+          2,
+          1,
+          Setting.Property.NodeScope,
+          Setting.Property.Dynamic);
 
   /**
    * Number of shuffle partitions for hash shuffle join. Defaults to 0 which means auto (use the
    * number of data nodes).
    */
   public static final Setting<Integer> SHUFFLE_PARTITIONS =
-      Setting.intSetting("plugins.velox.shuffle_partitions", 0, 0, Setting.Property.NodeScope);
+      Setting.intSetting(
+          "plugins.velox.shuffle_partitions",
+          0,
+          0,
+          Setting.Property.NodeScope,
+          Setting.Property.Dynamic);
 
   private volatile boolean enabled;
   private volatile boolean mppEnabled;
@@ -156,6 +167,18 @@ public class VeloxLifecycleService implements Closeable {
 
   public int getShufflePartitions() {
     return shufflePartitions;
+  }
+
+  public void setMppEnabled(boolean mppEnabled) {
+    this.mppEnabled = mppEnabled;
+  }
+
+  public void setBroadcastMaxShards(int broadcastMaxShards) {
+    this.broadcastMaxShards = broadcastMaxShards;
+  }
+
+  public void setShufflePartitions(int shufflePartitions) {
+    this.shufflePartitions = shufflePartitions;
   }
 
   public static List<Setting<?>> getSettings() {

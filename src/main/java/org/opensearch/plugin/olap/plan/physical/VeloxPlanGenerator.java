@@ -50,8 +50,8 @@ import org.opensearch.plugin.olap.plan.fragment.PlanFragment;
  * Converts a physical Calcite plan (PhysicalConvention with PhysicalExchange nodes) into a list of
  * {@link PlanFragment}s containing velox4j PlanNodes.
  *
- * <p>The generator walks the physical plan tree. At each {@link PhysicalExchange} node, it creates a
- * fragment boundary. Within each fragment, it converts physical RelNodes to Velox PlanNodes using
+ * <p>The generator walks the physical plan tree. At each {@link PhysicalExchange} node, it creates
+ * a fragment boundary. Within each fragment, it converts physical RelNodes to Velox PlanNodes using
  * the existing converter utilities ({@link VeloxExprConverter}, {@link VeloxAggConverter}, {@link
  * VeloxTypeConverter}).
  *
@@ -111,12 +111,27 @@ public class VeloxPlanGenerator {
       }
     }
 
+    for (PlanFragment f : fragments) {
+      logger.info(
+          "Fragment {}: dist={}, inputs={}",
+          f.getFragmentId(),
+          f.getProperties().getDistribution(),
+          f.getInputFragmentIds());
+    }
     return new ArrayList<>(fragments);
   }
 
   // ---- Physical -> Velox conversion ----
 
   private PlanNode toVeloxPlan(RelNode node) {
+    // VolcanoPlanner wraps nodes in RelSubset — unwrap to get the actual physical node
+    if (node instanceof org.apache.calcite.plan.volcano.RelSubset) {
+      RelNode best = ((org.apache.calcite.plan.volcano.RelSubset) node).getBest();
+      if (best != null) {
+        return toVeloxPlan(best);
+      }
+      throw new IllegalStateException("RelSubset has no best plan: " + node);
+    }
     if (node instanceof PhysicalExchange) {
       return handleExchange((PhysicalExchange) node);
     }
@@ -150,21 +165,18 @@ public class VeloxPlanGenerator {
     // Recursively convert the child (the leaf/intermediate fragment)
     PlanNode childPlan = toVeloxPlan(exchange.getInput());
 
-    // Determine fragment properties from the exchange's input distribution
+    // Determine fragment properties from the exchange's own distribution (what it enforces),
+    // not the input's distribution. SINGLETON → gather to coordinator, HASH → shuffle scan.
     String sourceIndex = extractSourceIndex(exchange.getInput());
-    RelDistribution inputDist =
-        exchange
-            .getInput()
-            .getTraitSet()
-            .getTrait(org.apache.calcite.rel.RelDistributionTraitDef.INSTANCE);
+    RelDistribution exchangeDist = exchange.getDistribution();
 
     FragmentProperties props;
-    if (inputDist != null && inputDist.getType() == RelDistribution.Type.HASH_DISTRIBUTED) {
-      // Hash-partitioned fragment (MPP worker)
-      List<Integer> keyChannels = inputDist.getKeys();
+    if (exchangeDist != null && exchangeDist.getType() == RelDistribution.Type.HASH_DISTRIBUTED) {
+      // Hash-partitioned fragment (MPP shuffle scan)
+      List<Integer> keyChannels = exchangeDist.getKeys();
       props = FragmentProperties.shuffleScan(sourceIndex, null, keyChannels, 0);
     } else {
-      // Source fragment (data node scan)
+      // Source fragment (data node scan, gathered to coordinator)
       props = FragmentProperties.source(sourceIndex);
     }
 
@@ -228,6 +240,18 @@ public class VeloxPlanGenerator {
   }
 
   private PlanNode convertAggregate(PhysicalAggregate agg) {
+    // Check if this is a SINGLE aggregate above an exchange — needs two-stage split.
+    // After VolcanoPlanner, inputs may be wrapped in RelSubset. Unwrap to find the
+    // actual PhysicalExchange.
+    RelNode rawInput = agg.getInput();
+    if (rawInput instanceof org.apache.calcite.plan.volcano.RelSubset) {
+      RelNode best = ((org.apache.calcite.plan.volcano.RelSubset) rawInput).getBest();
+      if (best != null) rawInput = best;
+    }
+    if (agg.getStep() == PhysicalAggregate.Step.SINGLE && rawInput instanceof PhysicalExchange) {
+      return convertTwoStageAggregate(agg, (PhysicalExchange) rawInput);
+    }
+
     String nodeId = idGen.next();
     PlanNode source = toVeloxPlan(agg.getInput());
     if (source == null) {
@@ -277,6 +301,144 @@ public class VeloxPlanGenerator {
         Collections.singletonList(source),
         null,
         Collections.emptyList());
+  }
+
+  /**
+   * Split a SINGLE aggregate above an exchange into PARTIAL (leaf) + FINAL (coordinator). The
+   * PARTIAL runs on data nodes, the FINAL merges results on the coordinator.
+   */
+  private PlanNode convertTwoStageAggregate(PhysicalAggregate agg, PhysicalExchange exchange) {
+    // 1. Convert the subtree below the exchange (scan + filter + project)
+    PlanNode scanPlan = toVeloxPlan(exchange.getInput());
+
+    // 2. Build the PARTIAL aggregate above the scan
+    RelDataType inputRowType = exchange.getInput().getRowType();
+    VeloxAggConverter aggConverter = new VeloxAggConverter(inputRowType);
+
+    List<FieldAccessTypedExpr> groupingKeys = new ArrayList<>();
+    for (int fieldIndex : agg.getGroupSet()) {
+      RelDataTypeField field = inputRowType.getFieldList().get(fieldIndex);
+      Type veloxType = VeloxTypeConverter.toVeloxType(field.getType());
+      groupingKeys.add(FieldAccessTypedExpr.create(veloxType, field.getName()));
+    }
+
+    List<String> aggregateNames = new ArrayList<>();
+    List<Aggregate> aggregates = new ArrayList<>();
+    for (int i = 0; i < agg.getAggCallList().size(); i++) {
+      AggregateCall aggCall = agg.getAggCallList().get(i);
+      aggregateNames.add(aggConverter.resolveAggOutputName(aggCall, i));
+      aggregates.add(aggConverter.convert(aggCall));
+    }
+
+    // Rewrite for PARTIAL step (intermediate accumulator types)
+    List<Aggregate> partialAggs = new ArrayList<>(aggregates.size());
+    for (Aggregate orig : aggregates) {
+      Type intermediateType =
+          resolveIntermediateType(
+              orig.getCall().getFunctionName(),
+              orig.getCall().getReturnType(),
+              orig.getRawInputTypes());
+      org.boostscale.velox4j.expression.CallTypedExpr partialCall =
+          new org.boostscale.velox4j.expression.CallTypedExpr(
+              intermediateType, orig.getCall().getInputs(), orig.getCall().getFunctionName());
+      partialAggs.add(
+          new Aggregate(
+              partialCall,
+              orig.getRawInputTypes(),
+              orig.getMask(),
+              orig.getSortingKeys(),
+              orig.getSortingOrders(),
+              orig.isDistinct()));
+    }
+
+    String partialId = idGen.next() + "_partial";
+    AggregationNode partialAgg =
+        new AggregationNode(
+            partialId,
+            AggregateStep.PARTIAL,
+            groupingKeys,
+            Collections.emptyList(),
+            aggregateNames,
+            partialAggs,
+            false,
+            false,
+            Collections.singletonList(scanPlan),
+            null,
+            Collections.emptyList());
+
+    // 3. Create the leaf fragment with PARTIAL agg
+    String sourceIndex = extractSourceIndex(exchange.getInput());
+    int leafFragId = fragmentId.getAndIncrement();
+    fragments.add(
+        new PlanFragment(
+            leafFragId,
+            partialAgg,
+            FragmentProperties.source(sourceIndex),
+            Collections.emptyList()));
+
+    // 4. Build the FINAL aggregate (coordinator side)
+    List<Aggregate> finalAggs = new ArrayList<>(aggregates.size());
+    for (int i = 0; i < aggregates.size(); i++) {
+      Aggregate orig = aggregates.get(i);
+      String intermediateName = aggregateNames.get(i);
+      TypedExpr intermediateRef =
+          FieldAccessTypedExpr.create(orig.getCall().getReturnType(), intermediateName);
+      org.boostscale.velox4j.expression.CallTypedExpr finalCall =
+          new org.boostscale.velox4j.expression.CallTypedExpr(
+              orig.getCall().getReturnType(),
+              List.of(intermediateRef),
+              orig.getCall().getFunctionName());
+      finalAggs.add(
+          new Aggregate(
+              finalCall,
+              orig.getRawInputTypes(),
+              orig.getMask(),
+              orig.getSortingKeys(),
+              orig.getSortingOrders(),
+              orig.isDistinct()));
+    }
+
+    String finalId = idGen.next() + "_final";
+    return new AggregationNode(
+        finalId,
+        AggregateStep.FINAL,
+        groupingKeys,
+        Collections.emptyList(),
+        aggregateNames,
+        finalAggs,
+        false,
+        false,
+        Collections.emptyList(),
+        null,
+        Collections.emptyList());
+  }
+
+  private Type resolveIntermediateType(
+      String functionName, Type finalType, List<Type> rawInputTypes) {
+    switch (functionName) {
+      case "avg":
+        return new RowType(
+            List.of("sum", "count"),
+            List.of(
+                new org.boostscale.velox4j.type.DoubleType(),
+                new org.boostscale.velox4j.type.BigIntType()));
+      case "count":
+        return new org.boostscale.velox4j.type.BigIntType();
+      case "sum":
+        if (!rawInputTypes.isEmpty()) {
+          Type inputType = rawInputTypes.get(0);
+          if (inputType instanceof org.boostscale.velox4j.type.RealType
+              || inputType instanceof org.boostscale.velox4j.type.DoubleType) {
+            return new org.boostscale.velox4j.type.DoubleType();
+          }
+        }
+        return new org.boostscale.velox4j.type.BigIntType();
+      case "min":
+      case "max":
+        return finalType;
+      default:
+        return finalType;
+    }
   }
 
   private PlanNode convertJoin(PhysicalJoin join) {

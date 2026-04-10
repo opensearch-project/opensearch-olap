@@ -5,12 +5,10 @@
 package org.opensearch.plugin.olap.plan.physical.rules;
 
 import org.apache.calcite.plan.Convention;
-import org.apache.calcite.rel.RelDistributions;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.convert.ConverterRule;
 import org.apache.calcite.rel.core.Sort;
 import org.opensearch.plugin.olap.plan.physical.PhysicalConvention;
-import org.opensearch.plugin.olap.plan.physical.PhysicalExchange;
 import org.opensearch.plugin.olap.plan.physical.PhysicalSort;
 
 /**
@@ -35,7 +33,9 @@ public class PhysicalSortRule extends ConverterRule {
     RelNode input =
         convert(
             sort.getInput(), sort.getInput().getTraitSet().replace(PhysicalConvention.INSTANCE));
-    input = PhysicalExchange.create(input, RelDistributions.SINGLETON);
+    // Do NOT insert exchange here. Sort/Limit is always the outermost operator,
+    // applied on the coordinator after aggregation/join which already inserted
+    // their own exchanges. Adding another exchange would create double fragmentation.
     return new PhysicalSort(
         rel.getCluster(),
         rel.getTraitSet().replace(PhysicalConvention.INSTANCE),

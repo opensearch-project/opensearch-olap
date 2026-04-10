@@ -130,7 +130,7 @@ This design keeps `QueryService` unchanged — it just calls `executionEngine.ex
 
 ### MPP Join Strategies
 
-When `plugins.velox.mpp_enabled=true`, the plugin selects between three join strategies based on cost:
+When `plugins.velox.mpp_enabled=true` (dynamic — can be toggled at runtime), the plugin selects between three join strategies based on cost:
 
 | Strategy | When Used | How It Works |
 |----------|-----------|-------------|
@@ -144,7 +144,7 @@ The execution pipeline uses a Calcite Convention-based physical planning framewo
 
 1. **`PhysicalOptimizer`** creates a fresh `VolcanoPlanner` and deep-copies the SQL plugin's plan into it (stripping `CalciteLogicalIndexScan`'s pushdown context). Runs `FilterMergeRule` via HepPlanner, then VolcanoPlanner with `PhysicalConvention` converter rules.
 
-2. **ConverterRules** transform each logical operator to its physical equivalent (`PhysicalTableScan`, `PhysicalFilter`, `PhysicalProject`, `PhysicalAggregate`, `PhysicalJoin`, `PhysicalSort`), inserting `PhysicalExchange(SINGLETON)` nodes at distribution boundaries.
+2. **ConverterRules** transform each logical operator to its physical equivalent (`PhysicalTableScan`, `PhysicalFilter`, `PhysicalProject`, `PhysicalAggregate`, `PhysicalJoin`, `PhysicalSort`), inserting `PhysicalExchange(SINGLETON)` nodes at distribution boundaries. When `mpp_enabled=true`, MPP rules (`MppJoinRule`, `MppAggregateRule`) are also registered, inserting `PhysicalExchange(HASH)` for hash-distributed alternatives. The VolcanoPlanner explores both and picks the lower-cost plan.
 
 3. **`VeloxPlanGenerator`** walks the physical plan, splits at `PhysicalExchange` boundaries into `PlanFragment`s, and converts to Velox PlanNodes. Two-stage aggregation (PARTIAL + FINAL) is split here with Velox-specific intermediate accumulator types.
 
@@ -259,9 +259,9 @@ COUNT, SUM, AVG, MIN, MAX (with DISTINCT support)
 | `plugins.velox.enabled` | `true` | Enable/disable the OLAP plugin |
 | `plugins.velox.memory_limit_bytes` | `4294967296` (4 GB) | Velox engine memory limit |
 | `plugins.velox.num_threads` | `4` | Velox execution threads |
-| `plugins.velox.mpp_enabled` | `false` | Enable MPP join strategies (broadcast + hash shuffle). When false, joins use coordinator-centric execution. |
-| `plugins.velox.broadcast_max_shards` | `2` | Max primary shard count for the smaller join side to qualify for broadcast join (MPP only) |
-| `plugins.velox.shuffle_partitions` | `0` | Number of hash shuffle partitions. 0 = auto (uses number of data nodes) |
+| `plugins.velox.mpp_enabled` | `false` | Enable MPP join strategies (broadcast + hash shuffle). When false, joins use coordinator-centric execution. **Dynamic** — can be toggled at runtime via cluster settings API. |
+| `plugins.velox.broadcast_max_shards` | `2` | Max primary shard count for the smaller join side to qualify for broadcast join (MPP only). **Dynamic.** |
+| `plugins.velox.shuffle_partitions` | `0` | Number of hash shuffle partitions. 0 = auto (uses number of data nodes). **Dynamic.** |
 
 ## Dependencies
 
@@ -321,6 +321,12 @@ Integration tests run against a real single-node OpenSearch cluster with the job
 ```
 
 Test sources live in `src/integTest/java/`. The base class `OlapRestTestCase` provides helpers for creating test indices, executing PPL queries, and asserting results via the OpenSearch REST API.
+
+Test suites:
+- **AggregationIT** (7 tests) — distributed aggregation (count, sum, avg, min/max by group)
+- **JoinIT** (8 tests) — coordinator-centric joins (inner, left, with filter/agg/limit)
+- **PredicatePushdownIT** (19 tests) — Lucene predicate pushdown (equality, range, compound)
+- **MppJoinIT** (9 tests) — joins and aggregations with `mpp_enabled=true` (toggled via dynamic cluster setting)
 
 **Note:** Integration tests require the Velox native libraries (`libvelox.so`) to be compatible with the host OS. The Maven-published `velox4j` jar bundles libraries built on CentOS 7. If the host is incompatible, Velox will fail to initialize and the OLAP plugin will disable itself — queries will fall back to the default SQL engine and the tests will fail. See [Multi-Node Testing (Docker)](#multi-node-testing-docker) for an alternative.
 
