@@ -58,7 +58,12 @@ public class PhysicalExchange extends SingleRel implements PhysicalRel {
   @Override
   public RelOptCost computeSelfCost(RelOptPlanner planner, RelMetadataQuery mq) {
     double rowCount = mq.getRowCount(getInput());
-    // Exchange cost is proportional to data movement (network I/O)
+    // HASH exchange distributes work across nodes (lower per-node cost).
+    // SINGLETON gathers everything to one node. When both are available
+    // (mpp_enabled=true), the planner should prefer HASH for joins.
+    if (distribution.getType() == RelDistribution.Type.HASH_DISTRIBUTED) {
+      return planner.getCostFactory().makeCost(rowCount * 0.8, 0, rowCount * 0.8);
+    }
     return planner.getCostFactory().makeCost(rowCount, 0, rowCount);
   }
 }

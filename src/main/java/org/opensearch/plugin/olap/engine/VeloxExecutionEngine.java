@@ -128,24 +128,38 @@ public class VeloxExecutionEngine {
 
   /**
    * Execute a list of PlanFragments produced by VeloxPlanGenerator. Handles all topologies:
-   * single-table (scan+agg), coordinator-centric join (two leaf stages + coordinator), and MPP
-   * shuffle joins (hash-partitioned scan → shuffle → worker join).
+   * single-table (scan+agg), coordinator-centric join (two leaf stages + coordinator), MPP
+   * broadcast join (build collected, join on probe nodes), and MPP shuffle join (hash-partitioned
+   * scan → shuffle → worker join).
    */
   private ExecutionEngine.QueryResponse executeFragments(
       RelNode relNode, List<PlanFragment> fragments, QueryId queryId) {
 
-    // Detect if any leaf fragments require hash shuffle
-    boolean hasShuffleScan = fragments.stream().anyMatch(f -> f.getProperties().isShuffleScan());
+    PlanFragment coordinatorFragment = findCoordinatorFragment(fragments);
 
-    if (hasShuffleScan) {
-      return executeShuffleFragments(relNode, fragments, queryId);
+    // Collect leaf fragments (SOURCE or shuffle scan)
+    List<PlanFragment> leafFragments =
+        fragments.stream().filter(f -> f.isLeaf()).collect(java.util.stream.Collectors.toList());
+
+    // MPP join strategy selection: when mpp_enabled=true and this is a multi-table join,
+    // CostEstimator decides between BROADCAST and HASH_SHUFFLE.
+    if (veloxLifecycle.isMppEnabled() && leafFragments.size() >= 2 && coordinatorFragment != null) {
+      JoinStrategy strategy = selectJoinStrategy(leafFragments);
+      logger.info("MPP join strategy for query {}: {}", queryId, strategy);
+      switch (strategy) {
+        case BROADCAST:
+          return executeBroadcastFragments(relNode, leafFragments, coordinatorFragment, queryId);
+        case HASH_SHUFFLE:
+          return executeShuffleFragments(relNode, fragments, queryId);
+        default:
+          break; // fall through to coordinator-centric
+      }
     }
 
+    // Default coordinator-centric path (mpp_enabled=false or non-join queries)
     QueryExecution execution = queryScheduler.schedule(fragments, ExecutionPolicy.PHASED);
     NodeResultCollector collector = new NodeResultCollector(transportService, queryScheduler);
-
     List<Stage> leafStages = execution.getLeafStages();
-    PlanFragment coordinatorFragment = findCoordinatorFragment(fragments);
 
     // Phase 1: Dispatch all leaf stages to data nodes
     List<ExecuteFragmentResponse> leafResponses =
@@ -172,7 +186,6 @@ public class VeloxExecutionEngine {
           leafStages.size());
       Map<Integer, List<ExecuteFragmentResponse>> responsesByFragment =
           groupResponsesByFragment(leafResponses, leafStages);
-      // For a two-input join, pass the first two fragment response groups
       List<List<ExecuteFragmentResponse>> inputGroups =
           new ArrayList<>(responsesByFragment.values());
       finalResponses =
@@ -183,6 +196,110 @@ public class VeloxExecutionEngine {
     }
 
     return buildQueryResponse(relNode.getRowType(), finalResponses);
+  }
+
+  /** Select join strategy using CostEstimator based on leaf fragment source indices. */
+  private JoinStrategy selectJoinStrategy(List<PlanFragment> leafFragments) {
+    String leftIndex = leafFragments.get(0).getProperties().getSourceIndex();
+    String rightIndex = leafFragments.get(1).getProperties().getSourceIndex();
+    CostEstimator estimator =
+        new CostEstimator(
+            queryScheduler.getClusterService(), veloxLifecycle.getBroadcastMaxShards());
+    return estimator.selectJoinStrategy(leftIndex, rightIndex);
+  }
+
+  // ---- MPP Broadcast Fragment Execution ----
+
+  /**
+   * Execute a broadcast join: collect the smaller (build) side, then dispatch the join plan to
+   * probe-side nodes with the build data broadcast. The coordinator join plan (with two exchange
+   * scans) is reused — TransportExecuteFragmentAction wires the first scan to local shards (probe)
+   * and the second scan to the broadcast data (build).
+   */
+  private ExecutionEngine.QueryResponse executeBroadcastFragments(
+      RelNode relNode,
+      List<PlanFragment> leafFragments,
+      PlanFragment coordinatorFragment,
+      QueryId queryId) {
+
+    // Determine build side (smaller index by shard count)
+    String leftIndex = leafFragments.get(0).getProperties().getSourceIndex();
+    String rightIndex = leafFragments.get(1).getProperties().getSourceIndex();
+    CostEstimator estimator =
+        new CostEstimator(
+            queryScheduler.getClusterService(), veloxLifecycle.getBroadcastMaxShards());
+    String buildSide = estimator.selectBuildSide(leftIndex, rightIndex);
+
+    PlanFragment buildFragment;
+    String probeIndex;
+    int buildScanIndex; // which exchange scan in the coordinator plan is the build side
+    if ("left".equals(buildSide)) {
+      buildFragment = leafFragments.get(0);
+      probeIndex = rightIndex;
+      buildScanIndex = 0; // left exchange scan = build
+    } else {
+      buildFragment = leafFragments.get(1);
+      probeIndex = leftIndex;
+      buildScanIndex = 1; // right exchange scan = build
+    }
+
+    logger.info(
+        "Executing broadcast join for query {}: build={}, probe={}",
+        queryId,
+        buildFragment.getProperties().getSourceIndex(),
+        probeIndex);
+
+    // Create adjusted fragments for broadcast execution:
+    // 1. Build scan (leaf, SOURCE) — collects build data to coordinator
+    // 2. Join (BROADCAST, probeIndex) — runs on probe-side nodes with broadcast data
+    List<PlanFragment> adjustedFragments =
+        List.of(
+            new PlanFragment(
+                0,
+                buildFragment.getPlanRoot(),
+                FragmentProperties.source(buildFragment.getProperties().getSourceIndex()),
+                Collections.emptyList()),
+            new PlanFragment(
+                1,
+                coordinatorFragment.getPlanRoot(),
+                FragmentProperties.broadcast(probeIndex),
+                List.of(0)));
+
+    QueryExecution execution = queryScheduler.schedule(adjustedFragments, ExecutionPolicy.PHASED);
+    NodeResultCollector collector = new NodeResultCollector(transportService, queryScheduler);
+
+    // Phase 1: Dispatch build stage, collect results
+    List<Stage> buildStages = execution.getLeafStages();
+    List<ExecuteFragmentResponse> buildResponses =
+        collector.dispatchAndCollect(execution, buildStages);
+
+    // Convert build-side results to native serde for broadcast
+    List<byte[]> broadcastData = new ArrayList<>();
+    for (ExecuteFragmentResponse resp : buildResponses) {
+      if (resp.getStatus() != ExecuteFragmentResponse.Status.SUCCESS) continue;
+      if (resp.hasNativeResults()) {
+        broadcastData.addAll(resp.getNativeResultBatches());
+      } else if (resp.getResultData() != null && resp.getResultData().length > 0) {
+        broadcastData.addAll(arrowIpcToNativeBatches(resp.getResultData()));
+      }
+    }
+    logger.info(
+        "Broadcast: collected {} build-side batches for query {}", broadcastData.size(), queryId);
+
+    // Phase 2: Dispatch broadcast join to probe-side nodes
+    List<Stage> broadcastStages = new ArrayList<>();
+    for (Stage stage : execution.getStages()) {
+      if (stage.getFragment().getProperties().getDistribution()
+          == FragmentProperties.Distribution.BROADCAST) {
+        broadcastStages.add(stage);
+      }
+    }
+
+    List<ExecuteFragmentResponse> joinResponses =
+        collector.dispatchAndCollectBroadcast(
+            execution, broadcastStages, broadcastData, buildScanIndex);
+
+    return buildQueryResponse(relNode.getRowType(), joinResponses);
   }
 
   // ---- MPP Shuffle Fragment Execution ----
@@ -284,12 +401,13 @@ public class VeloxExecutionEngine {
     logger.info(
         "Shuffle scan phase complete: {} responses for query {}", scanResponses.size(), queryId);
 
-    // Phase 2: Dispatch shuffle join tasks to workers
+    // Phase 2: Dispatch shuffle join tasks to workers.
+    // Use execution's queryId (same as scan tasks) so ShuffleManager lookup matches.
     List<ExecuteFragmentResponse> joinResponses =
         collector.dispatchAndCollectShuffleJoin(
             execution,
             List.of(joinStage),
-            queryId.getId(),
+            execution.getQueryId().getId(),
             targetStageId,
             leftSenderCount,
             rightSenderCount);
@@ -899,7 +1017,13 @@ public class VeloxExecutionEngine {
     } catch (Exception e) {
       logger.warn("Cannot convert Arrow IPC to native: {}", e.getMessage());
     } finally {
-      allocator.close();
+      try {
+        allocator.close();
+      } catch (IllegalStateException ex) {
+        // Arrow C Data Interface may hold buffer references after Velox conversion;
+        // the underlying memory is managed by Velox, so this is safe to ignore.
+        logger.debug("Arrow allocator close warning: {}", ex.getMessage());
+      }
     }
     return nativeBatches;
   }

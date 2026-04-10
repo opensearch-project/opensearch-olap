@@ -4,6 +4,7 @@
 
 package org.opensearch.plugin.olap.transport;
 
+import java.util.ArrayList;
 import java.util.List;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -207,15 +208,18 @@ public class TransportExecuteFragmentAction
     VeloxExecutor executor = new VeloxExecutor(session);
     String connectorId = "connector-external-stream";
 
-    // Find the two TableScanNode IDs in the join plan (left=probe, right=build)
+    // Find the two TableScanNode IDs in the join plan.
+    // broadcastBuildScanIndex tells us which scan is the build side (default 1 = right).
     Query query = Serde.fromJson(request.getPlanFragmentJson(), Query.class);
     List<String> scanIds = executor.findAllTableScanNodeIds(query.getPlan());
     if (scanIds.size() < 2) {
       return ExecuteFragmentResponse.failure(
           "Broadcast join plan must have 2 TableScanNodes, found " + scanIds.size());
     }
-    String probeScanId = scanIds.get(0);
-    String buildScanId = scanIds.get(1);
+    int buildIdx = request.getBroadcastBuildScanIndex();
+    int probeIdx = (buildIdx == 0) ? 1 : 0;
+    String probeScanId = scanIds.get(probeIdx);
+    String buildScanId = scanIds.get(buildIdx);
 
     // Create probe-side bridge (reads from local shards)
     ExternalStreamBridge probeBridge = new ExternalStreamBridge(session);
@@ -227,7 +231,11 @@ public class TransportExecuteFragmentAction
     try {
       probeBridge.open();
 
-      List<String> scanFields = extractScanFields(request.getPlanFragmentJson());
+      // Extract field names from the probe-side scan (not the build-side scan)
+      List<String> scanFields = extractScanFieldsFromNode(query.getPlan(), probeScanId);
+      if (scanFields.isEmpty()) {
+        scanFields = extractScanFields(request.getPlanFragmentJson());
+      }
       probeBridge.setRequestedFields(scanFields);
 
       // Start probe-side feeder thread (reads local shards)
@@ -579,6 +587,40 @@ public class TransportExecuteFragmentAction
   }
 
   // ---- Plan Introspection Helpers ----
+
+  /** Extract field names from a specific TableScanNode by ID. */
+  private List<String> extractScanFieldsFromNode(PlanNode root, String targetScanId) {
+    List<TableScanNode> scans = new ArrayList<>();
+    collectTableScanNodes(root, scans);
+    for (TableScanNode scan : scans) {
+      if (scan.getId().equals(targetScanId)) {
+        Type outputType = scan.getOutputType();
+        if (outputType instanceof RowType) {
+          return ((RowType) outputType).getNames();
+        }
+      }
+    }
+    return List.of();
+  }
+
+  private void collectTableScanNodes(PlanNode node, List<TableScanNode> result) {
+    if (node instanceof TableScanNode) {
+      result.add((TableScanNode) node);
+    }
+    try {
+      java.lang.reflect.Method m = PlanNode.class.getDeclaredMethod("getSources");
+      m.setAccessible(true);
+      @SuppressWarnings("unchecked")
+      List<PlanNode> sources = (List<PlanNode>) m.invoke(node);
+      if (sources != null) {
+        for (PlanNode source : sources) {
+          collectTableScanNodes(source, result);
+        }
+      }
+    } catch (Exception e) {
+      // ignore traversal errors
+    }
+  }
 
   private List<String> extractScanFields(String planJson) {
     Query query = Serde.fromJson(planJson, Query.class);
