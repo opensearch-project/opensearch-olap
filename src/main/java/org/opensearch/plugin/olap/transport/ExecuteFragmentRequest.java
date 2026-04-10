@@ -42,6 +42,9 @@ public class ExecuteFragmentRequest extends ActionRequest {
   /** Velox native serialized build-side batches for broadcast join. Null if not broadcast. */
   private List<byte[]> broadcastData;
 
+  /** Index of the build-side TableScanNode in the join plan (0=left, 1=right). Default 1. */
+  private int broadcastBuildScanIndex = 1;
+
   // --- Shuffle scan fields ---
   /** Target node IDs for each shuffle partition. Null if not a shuffle scan. */
   private List<String> shuffleTargetNodeIds;
@@ -93,6 +96,7 @@ public class ExecuteFragmentRequest extends ActionRequest {
       for (int i = 0; i < broadcastCount; i++) {
         this.broadcastData.add(in.readByteArray());
       }
+      this.broadcastBuildScanIndex = in.readVInt();
     }
 
     // Shuffle scan config
@@ -156,6 +160,7 @@ public class ExecuteFragmentRequest extends ActionRequest {
       for (byte[] batch : broadcastData) {
         out.writeByteArray(batch);
       }
+      out.writeVInt(broadcastBuildScanIndex);
     } else {
       out.writeVInt(0);
     }
@@ -280,8 +285,17 @@ public class ExecuteFragmentRequest extends ActionRequest {
 
   // --- Setters for builder-style construction ---
 
+  public int getBroadcastBuildScanIndex() {
+    return broadcastBuildScanIndex;
+  }
+
   public void setBroadcastData(List<byte[]> broadcastData) {
     this.broadcastData = broadcastData;
+  }
+
+  public void setBroadcastData(List<byte[]> broadcastData, int buildScanIndex) {
+    this.broadcastData = broadcastData;
+    this.broadcastBuildScanIndex = buildScanIndex;
   }
 
   public void setShuffleConfig(

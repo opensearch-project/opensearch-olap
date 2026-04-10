@@ -61,6 +61,19 @@ public class NodeResultCollector {
       QueryExecution execution,
       List<org.opensearch.plugin.olap.scheduler.Stage> stages,
       List<byte[]> broadcastData) {
+    return dispatchAndCollectBroadcast(execution, stages, broadcastData, 1);
+  }
+
+  /**
+   * Dispatch broadcast join tasks with explicit build scan index.
+   *
+   * @param buildScanIndex which TableScanNode in the plan is the build side (0=left, 1=right)
+   */
+  public List<ExecuteFragmentResponse> dispatchAndCollectBroadcast(
+      QueryExecution execution,
+      List<org.opensearch.plugin.olap.scheduler.Stage> stages,
+      List<byte[]> broadcastData,
+      int buildScanIndex) {
     QueryId queryId = execution.getQueryId();
     List<TaskDescriptor> allTasks = new ArrayList<>();
     for (var stage : stages) {
@@ -72,7 +85,7 @@ public class NodeResultCollector {
         allTasks,
         task -> {
           ExecuteFragmentRequest request = createNormalRequest(queryId, task);
-          request.setBroadcastData(broadcastData);
+          request.setBroadcastData(broadcastData, buildScanIndex);
           return request;
         });
   }
