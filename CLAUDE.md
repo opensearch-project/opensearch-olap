@@ -39,8 +39,8 @@ OLAP Plugin: VeloxExecutionEngine           OpenSearchExecutionEngine
 
 ## Key packages
 - `engine/` - SQL plugin integration: `VeloxExecutionEngine` (orchestrates full pipeline), `VectorizedEngineExtension` (implements `ExecutionEngine` with `canVectorize()`)
-- `plan/convert/` - Calcite → Velox expression/type/aggregate converters (reused by both paths)
-- `plan/fragment/` - PlanFragment, FragmentProperties data classes + PlanFragmenter (legacy, kept for reference)
+- `plan/convert/` - Calcite → Velox expression/type/aggregate converters (reused by VeloxPlanGenerator)
+- `plan/fragment/` - PlanFragment, FragmentProperties data classes
 - `plan/physical/` - Calcite Convention-based physical planning framework
   - Physical RelNode classes: `PhysicalTableScan`, `PhysicalFilter`, `PhysicalProject`, `PhysicalAggregate`, `PhysicalJoin`, `PhysicalSort`, `PhysicalExchange`
   - `PhysicalConvention` with `enforce()` for auto Exchange insertion
@@ -145,12 +145,12 @@ MPP rules use the same explicit PhysicalExchange insertion pattern as the base r
 
 This avoids `CannotPlanException` — the VolcanoPlanner can't decompose cross-convention + cross-distribution conversion (NONE+ANY → PHYSICAL+HASH) in one step, so the exchange must be inserted explicitly rather than requested via traits.
 
+`PhysicalExchange.computeSelfCost()` gives HASH_DISTRIBUTED 0.8x the cost of SINGLETON, so when `mpp_enabled=true` the planner prefers HASH exchanges for joins. The `CostEstimator` then decides BROADCAST vs HASH_SHUFFLE at execution time.
+
 ### MPP execution in VeloxExecutionEngine
-`executeFragments()` detects shuffle scan fragments (leaf fragments with `shuffleKeyChannels`) and routes to `executeShuffleFragments()`, which:
-1. Replaces the COORDINATOR fragment with a HASH_PARTITIONED one for worker execution
-2. Assigns join sides (left/right) to shuffle scan stages
-3. Dispatches shuffle scan stages via `NodeResultCollector.dispatchAndCollectShuffle()`
-4. Dispatches shuffle join tasks via `NodeResultCollector.dispatchAndCollectShuffleJoin()`
+`executeFragments()` uses `CostEstimator` when `mpp_enabled=true` and multiple leaf stages (join) to select between BROADCAST and HASH_SHUFFLE:
+- **BROADCAST** (`executeBroadcastFragments`): Collects build side, converts to native serde, dispatches coordinator join plan to probe-side nodes with broadcast data. Uses `broadcastBuildScanIndex` to tell data nodes which exchange scan is build vs probe.
+- **HASH_SHUFFLE** (`executeShuffleFragments`): Replaces COORDINATOR fragment with HASH_PARTITIONED for worker execution, assigns join sides to shuffle scan stages, dispatches via `dispatchAndCollectShuffle()` + `dispatchAndCollectShuffleJoin()`.
 
 ### VeloxPlanGenerator exchange handling
 `handleExchange()` checks the exchange's own distribution (`exchange.getDistribution()`), not the input's:
@@ -188,7 +188,7 @@ The PARTIAL/FINAL split requires Velox-specific intermediate accumulator types (
 - **OpenSearch doc values types**: OpenSearch stores all numeric types as `SORTED_NUMERIC` (not `NUMERIC`) and keyword/text as `SORTED_SET` (not `SORTED`). `LuceneArrowReader.mapToDocValueType()` handles this.
 - **Arrow Text → String**: Arrow Utf8 vectors return `org.apache.arrow.vector.util.Text` objects. Must convert to `String` before passing to `ExprValueUtils.tupleValue()` in `VeloxExecutionEngine.readArrowIpcToExprValues()`.
 - **Velox temp dirs in /tmp**: Each Velox initialization creates ~490MB temp dir under `/tmp`. Multiple restarts or multi-node clusters on the same host can fill `/tmp` (tmpfs). Clean with `rm -rf /tmp/opensearch-*`.
-- **velox4j `PlanNode.getSources()` is protected**: Cannot traverse plan trees without reflection. A fix to make it `public` is pending in velox4j (branch `fix/unique-memory-pool-names`). Once merged, remove all reflection hacks in PlanFragmenter, VeloxExecutor, VeloxExecutionEngine, TransportExecuteFragmentAction.
+- **velox4j `PlanNode.getSources()` is protected**: Cannot traverse plan trees without reflection. A fix to make it `public` is pending in velox4j (branch `fix/unique-memory-pool-names`). Once merged, remove all reflection hacks in VeloxExecutor, VeloxExecutionEngine, TransportExecuteFragmentAction.
 
 ## Graceful degradation
 `VeloxLifecycleService` catches native library load failures and disables itself (logs a warning). This allows the plugin to install on unsupported platforms (e.g. macOS/aarch64) without crashing OpenSearch. `canVectorize()` returns `false` when Velox is unavailable.

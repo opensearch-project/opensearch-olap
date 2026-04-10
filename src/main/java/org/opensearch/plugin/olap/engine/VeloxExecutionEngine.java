@@ -18,8 +18,6 @@ import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowStreamReader;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.calcite.rel.RelNode;
-import org.apache.calcite.rel.core.TableScan;
-import org.apache.calcite.rel.logical.LogicalJoin;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rel.type.RelDataTypeField;
 import org.apache.calcite.sql.type.SqlTypeName;
@@ -44,10 +42,8 @@ import org.boostscale.velox4j.type.RowType;
 import org.boostscale.velox4j.type.Type;
 import org.opensearch.plugin.olap.common.QueryId;
 import org.opensearch.plugin.olap.execution.VeloxLifecycleService;
-import org.opensearch.plugin.olap.plan.convert.VeloxPlanConverter;
 import org.opensearch.plugin.olap.plan.fragment.FragmentProperties;
 import org.opensearch.plugin.olap.plan.fragment.PlanFragment;
-import org.opensearch.plugin.olap.plan.fragment.PlanFragmenter;
 import org.opensearch.plugin.olap.scheduler.CostEstimator;
 import org.opensearch.plugin.olap.scheduler.ExecutionPolicy;
 import org.opensearch.plugin.olap.scheduler.JoinStrategy;
@@ -83,8 +79,6 @@ public class VeloxExecutionEngine {
 
   private static final Logger logger = LogManager.getLogger(VeloxExecutionEngine.class);
 
-  private final VeloxPlanConverter planConverter;
-  private final PlanFragmenter planFragmenter;
   private final QueryScheduler queryScheduler;
   private final VeloxLifecycleService veloxLifecycle;
   private volatile TransportService transportService;
@@ -94,8 +88,6 @@ public class VeloxExecutionEngine {
       QueryScheduler queryScheduler,
       TransportService transportService) {
     this.veloxLifecycle = veloxLifecycle;
-    this.planConverter = new VeloxPlanConverter();
-    this.planFragmenter = new PlanFragmenter();
     this.queryScheduler = queryScheduler;
     this.transportService = transportService;
   }
@@ -429,95 +421,6 @@ public class VeloxExecutionEngine {
     return grouped;
   }
 
-  // ---- Join Plan Execution ----
-
-  private ExecutionEngine.QueryResponse executeJoinPlan(
-      RelNode relNode, PlanNode veloxPlan, QueryId queryId) {
-    // Extract source indices for both sides
-    String leftIndex = extractSourceIndex(findLeftInput(relNode));
-    String rightIndex = extractSourceIndex(findRightInput(relNode));
-    logger.info(
-        "Join query {}: left={}, right={}, mpp_enabled={}",
-        queryId,
-        leftIndex,
-        rightIndex,
-        veloxLifecycle.isMppEnabled());
-
-    if (!veloxLifecycle.isMppEnabled()) {
-      return executeJoinCoordinatorCentric(relNode, veloxPlan, leftIndex, rightIndex, queryId);
-    }
-
-    // MPP enabled: use cost-based strategy selection
-    CostEstimator estimator =
-        new CostEstimator(
-            queryScheduler.getClusterService(), veloxLifecycle.getBroadcastMaxShards());
-    JoinStrategy strategy = estimator.selectJoinStrategy(leftIndex, rightIndex);
-    logger.info("Query {} selected join strategy: {}", queryId, strategy);
-
-    switch (strategy) {
-      case BROADCAST:
-        return executeJoinBroadcast(relNode, veloxPlan, leftIndex, rightIndex, queryId, estimator);
-      case HASH_SHUFFLE:
-        return executeJoinHashShuffle(relNode, veloxPlan, leftIndex, rightIndex, queryId);
-      default:
-        return executeJoinCoordinatorCentric(relNode, veloxPlan, leftIndex, rightIndex, queryId);
-    }
-  }
-
-  // ---- Option 1: Coordinator-Centric Join ----
-
-  private ExecutionEngine.QueryResponse executeJoinCoordinatorCentric(
-      RelNode relNode, PlanNode veloxPlan, String leftIndex, String rightIndex, QueryId queryId) {
-    logger.info("Executing coordinator-centric join for query {}", queryId);
-
-    List<PlanFragment> fragments =
-        planFragmenter.fragmentJoin(
-            veloxPlan, leftIndex, rightIndex, JoinStrategy.COORDINATOR_CENTRIC, 0);
-    QueryExecution execution = queryScheduler.schedule(fragments, ExecutionPolicy.PHASED);
-    NodeResultCollector collector = new NodeResultCollector(transportService, queryScheduler);
-
-    // Dispatch both leaf stages (left scan + right scan) and collect results
-    List<Stage> leafStages = execution.getLeafStages();
-    List<ExecuteFragmentResponse> leafResponses =
-        collector.dispatchAndCollect(execution, leafStages);
-
-    // Group responses by fragment ID
-    Map<Integer, List<ExecuteFragmentResponse>> responsesByFragment = new HashMap<>();
-    int responseIdx = 0;
-    for (Stage stage : leafStages) {
-      int fragId = stage.getFragment().getFragmentId();
-      for (TaskDescriptor task : stage.getTasks()) {
-        responsesByFragment
-            .computeIfAbsent(fragId, k -> new ArrayList<>())
-            .add(leafResponses.get(responseIdx++));
-      }
-    }
-
-    // Find the coordinator fragment (the one with join + everything above)
-    PlanFragment coordinatorFragment = null;
-    for (PlanFragment f : fragments) {
-      if (f.getProperties().getDistribution() == FragmentProperties.Distribution.COORDINATOR) {
-        coordinatorFragment = f;
-        break;
-      }
-    }
-
-    if (coordinatorFragment == null) {
-      throw new IllegalStateException("No coordinator fragment found for join");
-    }
-
-    // Execute coordinator join: wire both sides into the HashJoinNode
-    List<ExecuteFragmentResponse> finalResponses =
-        executeCoordinatorJoin(
-            coordinatorFragment,
-            responsesByFragment.getOrDefault(
-                fragments.get(0).getFragmentId(), Collections.emptyList()),
-            responsesByFragment.getOrDefault(
-                fragments.get(1).getFragmentId(), Collections.emptyList()));
-
-    return buildQueryResponse(relNode.getRowType(), finalResponses);
-  }
-
   /**
    * Execute a join on the coordinator node by deserializing both sides into BlockingQueues and
    * running the HashJoinNode through Velox.
@@ -586,189 +489,6 @@ public class VeloxExecutionEngine {
         logger.debug("Arrow allocator close warning: {}", ex.getMessage());
       }
     }
-  }
-
-  // ---- Option 4: Broadcast Join ----
-
-  private ExecutionEngine.QueryResponse executeJoinBroadcast(
-      RelNode relNode,
-      PlanNode veloxPlan,
-      String leftIndex,
-      String rightIndex,
-      QueryId queryId,
-      CostEstimator estimator) {
-    logger.info("Executing broadcast join for query {}", queryId);
-
-    // Determine which side to broadcast (the smaller one)
-    String buildSide = estimator.selectBuildSide(leftIndex, rightIndex);
-
-    // If the right side (build) is larger, we need to swap the indices for fragmentation.
-    // Our fragmeter convention: left=probe, right=build.
-    String probeIndex, buildIndex;
-    if ("left".equals(buildSide)) {
-      // Swap: left is build, right is probe
-      probeIndex = rightIndex;
-      buildIndex = leftIndex;
-    } else {
-      probeIndex = leftIndex;
-      buildIndex = rightIndex;
-    }
-
-    List<PlanFragment> fragments =
-        planFragmenter.fragmentJoin(veloxPlan, probeIndex, buildIndex, JoinStrategy.BROADCAST, 0);
-    QueryExecution execution = queryScheduler.schedule(fragments, ExecutionPolicy.PHASED);
-    NodeResultCollector collector = new NodeResultCollector(transportService, queryScheduler);
-
-    // Phase 1: Collect build side
-    Stage buildStage = null;
-    for (Stage stage : execution.getLeafStages()) {
-      if ("right".equals(stage.getFragment().getProperties().getJoinSide())) {
-        buildStage = stage;
-        break;
-      }
-    }
-    if (buildStage == null) {
-      // Fallback: first leaf stage is build
-      buildStage = execution.getLeafStages().get(0);
-    }
-
-    List<ExecuteFragmentResponse> buildResponses =
-        collector.dispatchAndCollect(execution, List.of(buildStage));
-
-    // Collect build-side data as native serde batches
-    List<byte[]> broadcastData = new ArrayList<>();
-    for (ExecuteFragmentResponse resp : buildResponses) {
-      if (resp.getStatus() != ExecuteFragmentResponse.Status.SUCCESS) continue;
-      if (resp.hasNativeResults()) {
-        broadcastData.addAll(resp.getNativeResultBatches());
-      } else if (resp.getResultData() != null && resp.getResultData().length > 0) {
-        // Convert Arrow IPC to native serde for broadcast
-        broadcastData.addAll(arrowIpcToNativeBatches(resp.getResultData()));
-      }
-    }
-
-    logger.info("Broadcast: collected {} build-side batches", broadcastData.size());
-
-    // Phase 2: Dispatch probe-side join tasks with broadcast data
-    Stage probeJoinStage = null;
-    for (Stage stage : execution.getStages()) {
-      if (stage.getFragment().getProperties().getDistribution()
-          == FragmentProperties.Distribution.BROADCAST) {
-        probeJoinStage = stage;
-        break;
-      }
-    }
-
-    if (probeJoinStage == null) {
-      throw new IllegalStateException("No broadcast probe stage found");
-    }
-
-    // Attach broadcast data to each probe task
-    for (TaskDescriptor task : probeJoinStage.getTasks()) {
-      task.getFragment().setBroadcastData(broadcastData);
-    }
-
-    List<ExecuteFragmentResponse> probeResponses =
-        collector.dispatchAndCollectBroadcast(execution, List.of(probeJoinStage), broadcastData);
-
-    // Phase 3: If there's a coordinator fragment (final agg), execute it
-    PlanFragment coordinatorFragment = findCoordinatorFragment(fragments);
-    List<ExecuteFragmentResponse> finalResponses;
-
-    if (coordinatorFragment != null) {
-      finalResponses = executeCoordinatorFragment(coordinatorFragment, probeResponses);
-    } else {
-      finalResponses = probeResponses;
-    }
-
-    return buildQueryResponse(relNode.getRowType(), finalResponses);
-  }
-
-  // ---- Option 4: Hash Shuffle Join ----
-
-  private ExecutionEngine.QueryResponse executeJoinHashShuffle(
-      RelNode relNode, PlanNode veloxPlan, String leftIndex, String rightIndex, QueryId queryId) {
-    int partitionCount = veloxLifecycle.getShufflePartitions();
-    if (partitionCount <= 0) {
-      partitionCount = queryScheduler.getDataNodeIds().size();
-    }
-    logger.info(
-        "Executing hash shuffle join for query {} with {} partitions", queryId, partitionCount);
-
-    List<PlanFragment> fragments =
-        planFragmenter.fragmentJoin(
-            veloxPlan, leftIndex, rightIndex, JoinStrategy.HASH_SHUFFLE, partitionCount);
-    QueryExecution execution = queryScheduler.schedule(fragments, ExecutionPolicy.PHASED);
-    NodeResultCollector collector = new NodeResultCollector(transportService, queryScheduler);
-
-    // Identify stages
-    List<Stage> leftScanStages = new ArrayList<>();
-    List<Stage> rightScanStages = new ArrayList<>();
-    Stage joinStage = null;
-    PlanFragment coordinatorFragment = null;
-
-    for (Stage stage : execution.getStages()) {
-      FragmentProperties props = stage.getFragment().getProperties();
-      if (props.isShuffleScan()) {
-        if ("left".equals(props.getJoinSide())) {
-          leftScanStages.add(stage);
-        } else {
-          rightScanStages.add(stage);
-        }
-      } else if (props.getDistribution() == FragmentProperties.Distribution.HASH_PARTITIONED) {
-        joinStage = stage;
-      } else if (props.getDistribution() == FragmentProperties.Distribution.COORDINATOR) {
-        coordinatorFragment = stage.getFragment();
-      }
-    }
-
-    if (joinStage == null) {
-      throw new IllegalStateException("No hash-partitioned join stage found");
-    }
-
-    // Get worker node IDs for shuffle targets
-    List<String> workerNodeIds = new ArrayList<>();
-    for (TaskDescriptor task : joinStage.getTasks()) {
-      workerNodeIds.add(task.getTargetNode().getId());
-    }
-
-    // Phase 1: Dispatch left and right scan+shuffle tasks in parallel
-    int leftSenderCount = 0;
-    int rightSenderCount = 0;
-    for (Stage s : leftScanStages) leftSenderCount += s.getTasks().size();
-    for (Stage s : rightScanStages) rightSenderCount += s.getTasks().size();
-
-    List<Stage> allScanStages = new ArrayList<>();
-    allScanStages.addAll(leftScanStages);
-    allScanStages.addAll(rightScanStages);
-
-    List<ExecuteFragmentResponse> scanResponses =
-        collector.dispatchAndCollectShuffle(
-            execution, allScanStages, workerNodeIds, joinStage.getStageId().getStageNumber());
-
-    logger.info("Shuffle scan phase complete: {} responses", scanResponses.size());
-
-    // Phase 2: Dispatch join tasks to workers
-    final int finalLeftSenders = leftSenderCount;
-    final int finalRightSenders = rightSenderCount;
-    List<ExecuteFragmentResponse> joinResponses =
-        collector.dispatchAndCollectShuffleJoin(
-            execution,
-            List.of(joinStage),
-            queryId.getId(),
-            joinStage.getStageId().getStageNumber(),
-            finalLeftSenders,
-            finalRightSenders);
-
-    // Phase 3: If there's a coordinator fragment, execute it
-    List<ExecuteFragmentResponse> finalResponses;
-    if (coordinatorFragment != null && coordinatorFragment.getPlanRoot() != null) {
-      finalResponses = executeCoordinatorFragment(coordinatorFragment, joinResponses);
-    } else {
-      finalResponses = joinResponses;
-    }
-
-    return buildQueryResponse(relNode.getRowType(), finalResponses);
   }
 
   // ---- Coordinator Fragment Execution (for FINAL aggregation) ----
@@ -858,47 +578,6 @@ public class VeloxExecutionEngine {
 
   // ---- Plan Tree Manipulation Helpers ----
 
-  /** Wire two source TableScanNodes into a join plan with null sources. */
-  private PlanNode wireJoinSources(
-      PlanNode node, TableScanNode leftSource, TableScanNode rightSource) {
-    if (node instanceof HashJoinNode) {
-      HashJoinNode join = (HashJoinNode) node;
-      return new HashJoinNode(
-          join.getId(),
-          join.getJoinType(),
-          join.getLeftKeys(),
-          join.getRightKeys(),
-          join.getFilter(),
-          leftSource,
-          rightSource,
-          join.getOutputType(),
-          false,
-          false);
-    }
-
-    List<PlanNode> sources = getNodeSources(node);
-    if (sources != null && !sources.isEmpty()) {
-      List<PlanNode> newSources = new ArrayList<>();
-      boolean changed = false;
-      for (PlanNode child : sources) {
-        PlanNode wired = wireJoinSources(child, leftSource, rightSource);
-        newSources.add(wired);
-        if (wired != child) changed = true;
-      }
-      if (changed) {
-        return reconstructNode(node, newSources);
-      }
-    }
-    return node;
-  }
-
-  /** Fix aggregate types in the plan if needed (placeholder — delegates to existing logic). */
-  private PlanNode fixAggregateTypes(PlanNode plan, Type leftType, Type rightType) {
-    // For coordinator-centric join, the data arrives as Arrow IPC which preserves types.
-    // No special intermediate type fixing needed unless there's a FINAL agg.
-    return plan;
-  }
-
   /** Wire a single source into a plan with empty sources (for FINAL agg). */
   private PlanNode wireSourceIntoPlan(
       PlanNode node, TableScanNode source, RowType intermediateRowType) {
@@ -973,34 +652,6 @@ public class VeloxExecutionEngine {
   }
 
   // ---- Utility Methods ----
-
-  private Type getResponseOutputType(Session session, List<ExecuteFragmentResponse> responses) {
-    for (ExecuteFragmentResponse resp : responses) {
-      if (resp.hasNativeResults() && !resp.getNativeResultBatches().isEmpty()) {
-        BaseVector vec =
-            session.baseVectorOps().deserializeOneFromBuf(resp.getNativeResultBatches().get(0));
-        return vec.getType();
-      }
-      if (resp.getResultData() != null && resp.getResultData().length > 0) {
-        return getArrowIpcOutputType(resp.getResultData());
-      }
-    }
-    return null;
-  }
-
-  private Type getArrowIpcOutputType(byte[] arrowIpc) {
-    BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE);
-    try (ArrowStreamReader reader =
-        new ArrowStreamReader(new ByteArrayInputStream(arrowIpc), allocator)) {
-      reader.loadNextBatch();
-      return arrowSchemaToVeloxRowType(reader.getVectorSchemaRoot().getSchema());
-    } catch (Exception e) {
-      logger.warn("Cannot read Arrow IPC type: {}", e.getMessage());
-      return null;
-    } finally {
-      allocator.close();
-    }
-  }
 
   private List<byte[]> arrowIpcToNativeBatches(byte[] arrowIpc) {
     Session session = veloxLifecycle.getSession();
@@ -1200,45 +851,6 @@ public class VeloxExecutionEngine {
           false);
     }
     return node;
-  }
-
-  // ---- RelNode Traversal ----
-
-  private RelNode findLeftInput(RelNode relNode) {
-    if (relNode instanceof LogicalJoin) {
-      return ((LogicalJoin) relNode).getLeft();
-    }
-    for (RelNode input : relNode.getInputs()) {
-      RelNode found = findLeftInput(input);
-      if (found != null) return found;
-    }
-    return null;
-  }
-
-  private RelNode findRightInput(RelNode relNode) {
-    if (relNode instanceof LogicalJoin) {
-      return ((LogicalJoin) relNode).getRight();
-    }
-    for (RelNode input : relNode.getInputs()) {
-      RelNode found = findRightInput(input);
-      if (found != null) return found;
-    }
-    return null;
-  }
-
-  private String extractSourceIndex(RelNode relNode) {
-    if (relNode == null) return null;
-    if (relNode instanceof TableScan) {
-      List<String> names = ((TableScan) relNode).getTable().getQualifiedName();
-      return names.get(names.size() - 1);
-    }
-    for (RelNode input : relNode.getInputs()) {
-      String index = extractSourceIndex(input);
-      if (index != null) {
-        return index;
-      }
-    }
-    return null;
   }
 
   // ---- Arrow/Type Helpers ----
