@@ -439,17 +439,48 @@ Our design extends the SQL plugin rather than rewriting it, while adopting key R
 - Calcite physical planning: PhysicalOptimizer (VolcanoPlanner + ClusterCopyShuttle) → VeloxPlanGenerator
 - Dynamic MPP settings: `mpp_enabled`, `broadcast_max_shards`, `shuffle_partitions` togglable at runtime via cluster settings API
 - Cost-based MPP strategy selection: CostEstimator selects BROADCAST vs HASH_SHUFFLE based on shard count heuristic
+- Segment-level parallel reads: each Lucene segment read by a separate thread, configurable via `plugins.velox.segment_parallelism` (default 4, dynamic)
 - Per-query session creation (prevents memory pool collisions)
 - Graceful degradation on unsupported platforms
 - Data types: boolean, integer, long, float, double, keyword, date, timestamp
 
 ### What's Next
 
-| Priority | Item | Why |
-|----------|------|-----|
-| **High** | Parallel segment reads | Currently sequential within a shard; segments are independent and can be read concurrently |
-| **Medium** | Convention.enforce() for distribution | Currently exchanges inserted explicitly in rules; enable Calcite's automatic distribution enforcement for cleaner rule definitions |
-| **Medium** | Task retry on failure | Resilience for long-running queries |
-| **Medium** | Cost-based join strategy selection | Currently uses shard-count heuristic; use actual index statistics for broadcast vs shuffle |
-| **Medium** | RuntimeFilter | Accelerate joins by filtering probe side before scan |
-| **Low** | Cross-cluster query | Analytics across multiple OpenSearch clusters |
+Gaps identified by comparison with [RFC #4812](https://github.com/opensearch-project/sql/issues/4812), prioritized by production impact.
+
+#### Phase 1 — Performance & Stability Foundation
+
+| Priority | Item | Gap vs RFC | Current State |
+|----------|------|-----------|---------------|
+| **Critical** | Runtime Filter (TERMS) | RFC shows 2min → 100ms for 2B×2K row joins; build-side filter propagated to probe scan for early filtering | Not implemented |
+| ~~**High**~~ | ~~Segment-level parallel reads~~ | ~~RFC splits TableScan across Lucene segments with concurrent workers~~ | **Done** — `readShardIntoStreamParallel()` submits one task per segment; configurable via `segment_parallelism` |
+| **High** | Fault tolerance + task retry | RFC has task-level retry, bad node tracking, shard replica failover | Single failure kills query |
+| **High** | Backpressure / flow control | RFC has sink buffer limits with reverse pressure propagation | Basic BlockingQueue back-pressure only |
+
+#### Phase 2 — Query Optimization
+
+| Priority | Item | Gap vs RFC | Current State |
+|----------|------|-----------|---------------|
+| **High** | CBO statistics + join reorder | RFC uses runtime statistics + DP algorithm for bushy join reordering | Fixed join order, shard-count heuristic for strategy selection |
+| **High** | Cost-based join strategy (real stats) | RFC uses table cardinality + selectivity estimation | Shard count proxy only (`CostEstimator.getShardCount()`) |
+| **Medium** | Runtime Filter (BLOOM) | RFC supports probabilistic BLOOM variant for high-cardinality keys | Not implemented (depends on TERMS RF) |
+| **Medium** | TopN optimization | RFC pushes ORDER BY + LIMIT as ranking subquery to data nodes | Sort/Limit runs on coordinator after full data collection |
+
+#### Phase 3 — Advanced Distributed Execution
+
+| Priority | Item | Gap vs RFC | Current State |
+|----------|------|-----------|---------------|
+| **Medium** | Co-Routing / ES_ROUTING_SHUFFLE | RFC enables shard-local joins when both sides share routing key — no shuffle needed | Not implemented; all joins require data movement |
+| **Medium** | Adaptive query execution | RFC replans at runtime based on intermediate result sizes | All decisions at plan time |
+| **Medium** | Two-stage Runtime Filter construction | RFC builds PARTIAL RF locally, merges into FINAL RF globally for distributed builds | Not implemented (depends on TERMS RF) |
+| **Low** | Convention.enforce() for distribution | RFC uses trait-driven exchange insertion via Calcite's automatic enforcement | Explicit PhysicalExchange insertion in rules (works but verbose) |
+
+#### Phase 4 — Operator & Feature Completeness
+
+| Priority | Item | Gap vs RFC | Current State |
+|----------|------|-----------|---------------|
+| **Medium** | Window functions | ROW_NUMBER, RANK, LAG, LEAD, etc. | Not implemented |
+| **Medium** | UNION / INTERSECT / EXCEPT | Set operations | Not implemented |
+| **Low** | Recursive CTE (WITH RECURSIVE) | Fixpoint iteration | Not implemented |
+| **Low** | Cross-cluster query | Analytics across multiple OpenSearch clusters | Not implemented |
+| **Low** | EXPLAIN visualization | RFC has multi-stage plan visualization + DOT format | Basic logging only |
