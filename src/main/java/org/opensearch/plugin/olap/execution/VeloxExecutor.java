@@ -283,22 +283,11 @@ public class VeloxExecutor {
     if (node instanceof TableScanNode) {
       return node.getId();
     }
-    try {
-      java.lang.reflect.Method m = PlanNode.class.getDeclaredMethod("getSources");
-      m.setAccessible(true);
-      @SuppressWarnings("unchecked")
-      java.util.List<PlanNode> sources = (java.util.List<PlanNode>) m.invoke(node);
-      if (sources != null) {
-        for (PlanNode source : sources) {
-          String id = findTableScanNodeId(source);
-          if (id != null) {
-            return id;
-          }
-        }
+    for (PlanNode source : node.getSources()) {
+      String id = findTableScanNodeId(source);
+      if (id != null) {
+        return id;
       }
-    } catch (Exception e) {
-      logger.warn(
-          "Cannot traverse plan node {}: {}", node.getClass().getSimpleName(), e.getMessage());
     }
     return null;
   }
@@ -318,18 +307,8 @@ public class VeloxExecutor {
       ids.add(node.getId());
       return;
     }
-    try {
-      java.lang.reflect.Method m = PlanNode.class.getDeclaredMethod("getSources");
-      m.setAccessible(true);
-      @SuppressWarnings("unchecked")
-      java.util.List<PlanNode> sources = (java.util.List<PlanNode>) m.invoke(node);
-      if (sources != null) {
-        for (PlanNode source : sources) {
-          collectTableScanNodeIds(source, ids);
-        }
-      }
-    } catch (Exception e) {
-      logger.warn("Cannot traverse plan node: {}", e.getMessage());
+    for (PlanNode source : node.getSources()) {
+      collectTableScanNodeIds(source, ids);
     }
   }
 }

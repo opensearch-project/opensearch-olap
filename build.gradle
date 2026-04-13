@@ -385,7 +385,7 @@ check.dependsOn jacocoTestCoverageVerification
 
 // Third-party audit: only Arrow and velox4j are bundled; Calcite/Guava/Jackson are compileOnly
 thirdPartyAudit.ignoreMissingClasses(
-    // Jackson (Arrow optional dependency for JSON format)
+    // Jackson (Arrow optional dependency for JSON format — compileOnly, provided at runtime by OpenSearch)
     'com.fasterxml.jackson.databind.JsonNode',
     'com.fasterxml.jackson.databind.MapperFeature',
     'com.fasterxml.jackson.databind.MappingJsonFactory',
@@ -397,53 +397,8 @@ thirdPartyAudit.ignoreMissingClasses(
     'com.fasterxml.jackson.databind.json.JsonMapper$Builder',
     'com.fasterxml.jackson.databind.node.ObjectNode',
     'com.fasterxml.jackson.databind.ser.std.StdSerializer',
-    // Netty (Arrow memory-netty internals)
-    'io.netty.buffer.PooledByteBufAllocatorL',
-    'io.netty.buffer.UnsafeDirectLittleEndian',
-    'io.netty.util.internal.PlatformDependent',
     // Commons Codec (Arrow optional dependency)
-    'org.apache.commons.codec.binary.Hex',
-    // FlatBuffers (Arrow optional dependency for IPC)
-    'com.google.flatbuffers.FlatBufferBuilder',
-    // Arrow FlatBuf classes (optional, only when FlatBuffers is present)
-    'org.apache.arrow.flatbuf.Binary',
-    'org.apache.arrow.flatbuf.BinaryView',
-    'org.apache.arrow.flatbuf.Block',
-    'org.apache.arrow.flatbuf.BodyCompression',
-    'org.apache.arrow.flatbuf.Bool',
-    'org.apache.arrow.flatbuf.Buffer',
-    'org.apache.arrow.flatbuf.Date',
-    'org.apache.arrow.flatbuf.Decimal',
-    'org.apache.arrow.flatbuf.DictionaryBatch',
-    'org.apache.arrow.flatbuf.DictionaryEncoding',
-    'org.apache.arrow.flatbuf.Duration',
-    'org.apache.arrow.flatbuf.Field',
-    'org.apache.arrow.flatbuf.FieldNode',
-    'org.apache.arrow.flatbuf.FixedSizeBinary',
-    'org.apache.arrow.flatbuf.FixedSizeList',
-    'org.apache.arrow.flatbuf.FloatingPoint',
-    'org.apache.arrow.flatbuf.Footer',
-    'org.apache.arrow.flatbuf.Int',
-    'org.apache.arrow.flatbuf.Interval',
-    'org.apache.arrow.flatbuf.KeyValue',
-    'org.apache.arrow.flatbuf.LargeBinary',
-    'org.apache.arrow.flatbuf.LargeList',
-    'org.apache.arrow.flatbuf.LargeListView',
-    'org.apache.arrow.flatbuf.LargeUtf8',
-    'org.apache.arrow.flatbuf.List',
-    'org.apache.arrow.flatbuf.ListView',
-    'org.apache.arrow.flatbuf.Map',
-    'org.apache.arrow.flatbuf.Message',
-    'org.apache.arrow.flatbuf.Null',
-    'org.apache.arrow.flatbuf.RecordBatch',
-    'org.apache.arrow.flatbuf.RunEndEncoded',
-    'org.apache.arrow.flatbuf.Schema',
-    'org.apache.arrow.flatbuf.Struct_',
-    'org.apache.arrow.flatbuf.Time',
-    'org.apache.arrow.flatbuf.Timestamp',
-    'org.apache.arrow.flatbuf.Union',
-    'org.apache.arrow.flatbuf.Utf8',
-    'org.apache.arrow.flatbuf.Utf8View'
+    'org.apache.commons.codec.binary.Hex'
 )
 
 thirdPartyAudit.ignoreViolations(

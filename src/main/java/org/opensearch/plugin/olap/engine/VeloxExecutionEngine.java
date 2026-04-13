@@ -602,7 +602,7 @@ public class VeloxExecutionEngine {
       }
     }
 
-    List<PlanNode> sources = getNodeSources(node);
+    List<PlanNode> sources = node.getSources();
     if (sources != null && !sources.isEmpty()) {
       List<PlanNode> newSources = new ArrayList<>();
       boolean changed = false;
@@ -788,25 +788,6 @@ public class VeloxExecutionEngine {
       }
     }
     return null;
-  }
-
-  @SuppressWarnings("unchecked")
-  private List<PlanNode> getNodeSources(PlanNode node) {
-    if (node instanceof org.boostscale.velox4j.plan.AggregationNode) {
-      return ((org.boostscale.velox4j.plan.AggregationNode) node).getSources();
-    }
-    return getNodeSourcesViaReflection(node);
-  }
-
-  @SuppressWarnings("unchecked")
-  private List<PlanNode> getNodeSourcesViaReflection(PlanNode node) {
-    try {
-      java.lang.reflect.Method m = PlanNode.class.getDeclaredMethod("getSources");
-      m.setAccessible(true);
-      return (List<PlanNode>) m.invoke(node);
-    } catch (Exception e) {
-      return Collections.emptyList();
-    }
   }
 
   private PlanNode reconstructNode(PlanNode node, List<PlanNode> newSources) {

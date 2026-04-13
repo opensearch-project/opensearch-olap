@@ -22,6 +22,7 @@ import org.apache.lucene.search.Query;
 import org.apache.lucene.search.ScoreMode;
 import org.apache.lucene.search.Scorer;
 import org.apache.lucene.search.Weight;
+import org.opensearch.common.util.concurrent.FutureUtils;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.index.IndexService;
 import org.opensearch.index.engine.Engine;
@@ -183,7 +184,7 @@ public class LuceneArrowReader {
       } catch (Exception e) {
         // Cancel remaining tasks on failure
         for (Future<?> f : futures) {
-          f.cancel(true);
+          FutureUtils.cancel(f);
         }
         throw new IOException("Parallel segment read failed for shard " + shardId, e);
       }
