@@ -45,6 +45,16 @@ public class ExecuteFragmentRequest extends ActionRequest {
   /** Index of the build-side TableScanNode in the join plan (0=left, 1=right). Default 1. */
   private int broadcastBuildScanIndex = 1;
 
+  // --- Runtime filter fields ---
+  /** Probe-side join key field name for runtime filter pushdown. Null if RF not applicable. */
+  private String rfFieldName;
+
+  /** OpenSearch field type of the RF field ("keyword", "integer", "long"). */
+  private String rfFieldType;
+
+  /** Distinct join key values from the build side, serialized as strings. */
+  private List<String> rfValues;
+
   // --- Shuffle scan fields ---
   /** Target node IDs for each shuffle partition. Null if not a shuffle scan. */
   private List<String> shuffleTargetNodeIds;
@@ -97,6 +107,17 @@ public class ExecuteFragmentRequest extends ActionRequest {
         this.broadcastData.add(in.readByteArray());
       }
       this.broadcastBuildScanIndex = in.readVInt();
+    }
+
+    // Runtime filter
+    this.rfFieldName = in.readOptionalString();
+    if (this.rfFieldName != null) {
+      this.rfFieldType = in.readString();
+      int rfCount = in.readVInt();
+      this.rfValues = new ArrayList<>(rfCount);
+      for (int i = 0; i < rfCount; i++) {
+        this.rfValues.add(in.readString());
+      }
     }
 
     // Shuffle scan config
@@ -163,6 +184,16 @@ public class ExecuteFragmentRequest extends ActionRequest {
       out.writeVInt(broadcastBuildScanIndex);
     } else {
       out.writeVInt(0);
+    }
+
+    // Runtime filter
+    out.writeOptionalString(rfFieldName);
+    if (rfFieldName != null) {
+      out.writeString(rfFieldType);
+      out.writeVInt(rfValues.size());
+      for (String v : rfValues) {
+        out.writeString(v);
+      }
     }
 
     // Shuffle scan config
@@ -237,6 +268,28 @@ public class ExecuteFragmentRequest extends ActionRequest {
 
   public boolean hasBroadcastData() {
     return broadcastData != null && !broadcastData.isEmpty();
+  }
+
+  public String getRfFieldName() {
+    return rfFieldName;
+  }
+
+  public String getRfFieldType() {
+    return rfFieldType;
+  }
+
+  public List<String> getRfValues() {
+    return rfValues;
+  }
+
+  public boolean hasRuntimeFilter() {
+    return rfFieldName != null && rfValues != null && !rfValues.isEmpty();
+  }
+
+  public void setRuntimeFilter(String fieldName, String fieldType, List<String> values) {
+    this.rfFieldName = fieldName;
+    this.rfFieldType = fieldType;
+    this.rfValues = values;
   }
 
   public List<String> getShuffleTargetNodeIds() {

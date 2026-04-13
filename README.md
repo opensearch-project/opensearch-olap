@@ -262,6 +262,8 @@ COUNT, SUM, AVG, MIN, MAX (with DISTINCT support)
 | `plugins.velox.shuffle_partitions` | `0` | Number of hash shuffle partitions. 0 = auto (uses number of data nodes). **Dynamic.** |
 | `plugins.velox.segment_parallelism` | `4` | Number of parallel threads for reading Lucene segments within a shard. Set to 1 to disable. **Dynamic.** |
 | `plugins.velox.task_max_retries` | `2` | Max retry attempts per failed task. Retries use replica shards on different nodes when available. Set to 0 to disable. **Dynamic.** |
+| `plugins.velox.runtime_filter_enabled` | `true` | Enable runtime filter pushdown for broadcast joins. Extracts build-side join key values and pushes as Lucene TermsQuery to probe scan. **Dynamic.** |
+| `plugins.velox.runtime_filter_max_cardinality` | `10000` | Max distinct values for runtime filter. If build-side cardinality exceeds this, RF is skipped. **Dynamic.** |
 
 ## Dependencies
 

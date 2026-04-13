@@ -100,12 +100,34 @@ public class VeloxLifecycleService implements Closeable {
           Setting.Property.NodeScope,
           Setting.Property.Dynamic);
 
+  /** Enable runtime filter pushdown for broadcast joins. */
+  public static final Setting<Boolean> RUNTIME_FILTER_ENABLED =
+      Setting.boolSetting(
+          "plugins.velox.runtime_filter_enabled",
+          true,
+          Setting.Property.NodeScope,
+          Setting.Property.Dynamic);
+
+  /**
+   * Max distinct value count for runtime filter. If build-side join key cardinality exceeds this,
+   * RF is skipped (query still works, just without the optimization).
+   */
+  public static final Setting<Integer> RUNTIME_FILTER_MAX_CARDINALITY =
+      Setting.intSetting(
+          "plugins.velox.runtime_filter_max_cardinality",
+          10000,
+          0,
+          Setting.Property.NodeScope,
+          Setting.Property.Dynamic);
+
   private volatile boolean enabled;
   private volatile boolean mppEnabled;
   private volatile int broadcastMaxShards;
   private volatile int shufflePartitions;
   private volatile int segmentParallelism;
   private volatile int taskMaxRetries;
+  private volatile boolean runtimeFilterEnabled;
+  private volatile int runtimeFilterMaxCardinality;
   private volatile MemoryManager memoryManager;
   private volatile Session session;
   private volatile boolean initialized = false;
@@ -117,6 +139,8 @@ public class VeloxLifecycleService implements Closeable {
     this.shufflePartitions = SHUFFLE_PARTITIONS.get(settings);
     this.segmentParallelism = SEGMENT_PARALLELISM.get(settings);
     this.taskMaxRetries = TASK_MAX_RETRIES.get(settings);
+    this.runtimeFilterEnabled = RUNTIME_FILTER_ENABLED.get(settings);
+    this.runtimeFilterMaxCardinality = RUNTIME_FILTER_MAX_CARDINALITY.get(settings);
 
     if (enabled) {
       try {
@@ -226,6 +250,22 @@ public class VeloxLifecycleService implements Closeable {
     this.taskMaxRetries = taskMaxRetries;
   }
 
+  public boolean isRuntimeFilterEnabled() {
+    return runtimeFilterEnabled;
+  }
+
+  public void setRuntimeFilterEnabled(boolean runtimeFilterEnabled) {
+    this.runtimeFilterEnabled = runtimeFilterEnabled;
+  }
+
+  public int getRuntimeFilterMaxCardinality() {
+    return runtimeFilterMaxCardinality;
+  }
+
+  public void setRuntimeFilterMaxCardinality(int runtimeFilterMaxCardinality) {
+    this.runtimeFilterMaxCardinality = runtimeFilterMaxCardinality;
+  }
+
   public static List<Setting<?>> getSettings() {
     return List.of(
         OLAP_ENABLED,
@@ -235,7 +275,9 @@ public class VeloxLifecycleService implements Closeable {
         BROADCAST_MAX_SHARDS,
         SHUFFLE_PARTITIONS,
         SEGMENT_PARALLELISM,
-        TASK_MAX_RETRIES);
+        TASK_MAX_RETRIES,
+        RUNTIME_FILTER_ENABLED,
+        RUNTIME_FILTER_MAX_CARDINALITY);
   }
 
   @Override
