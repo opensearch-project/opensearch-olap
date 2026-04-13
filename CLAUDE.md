@@ -47,7 +47,7 @@ OLAP Plugin: VeloxExecutionEngine           OpenSearchExecutionEngine
   - `PhysicalOptimizer` runs VolcanoPlanner with distribution traits
   - `VeloxPlanGenerator` converts physical plan → Velox PlanNodes + PlanFragments
   - `rules/` - ConverterRules (NONE→PHYSICAL), MPP rules, TwoStageAggRule
-- `scheduler/` - Presto-inspired Stage/Task scheduler using OpenSearch ClusterState for shard routing. Also contains `CostEstimator` and `JoinStrategy` for MPP join selection.
+- `scheduler/` - Presto-inspired Stage/Task scheduler using OpenSearch ClusterState for shard routing. Also contains `CostEstimator`, `JoinStrategy`, `ErrorClassifier` (error categorization for retry), `BadResourceTracker` (failed node/shard exclusion), and `ShardRouter` (with replica failover).
 - `transport/` - Inter-node communication: `ExecuteFragmentAction` for fragment dispatch, `ShuffleDataAction` for P2P shuffle data exchange, `ShuffleManager` for shuffle buffer management
 - `execution/` - Lucene DocValues → Arrow → velox4j ExternalStream.BlockingQueue → Velox C++ execution
 - `result/` - Interface stubs for result collection (not yet implemented)

@@ -150,7 +150,9 @@ public class VeloxExecutionEngine {
 
     // Default coordinator-centric path (mpp_enabled=false or non-join queries)
     QueryExecution execution = queryScheduler.schedule(fragments, ExecutionPolicy.PHASED);
-    NodeResultCollector collector = new NodeResultCollector(transportService, queryScheduler);
+    NodeResultCollector collector =
+        new NodeResultCollector(
+            transportService, queryScheduler, veloxLifecycle.getTaskMaxRetries());
     List<Stage> leafStages = execution.getLeafStages();
 
     // Phase 1: Dispatch all leaf stages to data nodes
@@ -258,7 +260,9 @@ public class VeloxExecutionEngine {
                 List.of(0)));
 
     QueryExecution execution = queryScheduler.schedule(adjustedFragments, ExecutionPolicy.PHASED);
-    NodeResultCollector collector = new NodeResultCollector(transportService, queryScheduler);
+    NodeResultCollector collector =
+        new NodeResultCollector(
+            transportService, queryScheduler, veloxLifecycle.getTaskMaxRetries());
 
     // Phase 1: Dispatch build stage, collect results
     List<Stage> buildStages = execution.getLeafStages();
@@ -334,7 +338,9 @@ public class VeloxExecutionEngine {
     }
 
     QueryExecution execution = queryScheduler.schedule(adjustedFragments, ExecutionPolicy.PHASED);
-    NodeResultCollector collector = new NodeResultCollector(transportService, queryScheduler);
+    NodeResultCollector collector =
+        new NodeResultCollector(
+            transportService, queryScheduler, veloxLifecycle.getTaskMaxRetries());
 
     // Identify shuffle scan stages and the join worker stage
     List<Stage> shuffleScanStages = new ArrayList<>();

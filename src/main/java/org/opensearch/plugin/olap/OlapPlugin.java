@@ -89,6 +89,10 @@ public class OlapPlugin extends Plugin implements ActionPlugin {
         .addSettingsUpdateConsumer(
             VeloxLifecycleService.SEGMENT_PARALLELISM,
             veloxLifecycleService::setSegmentParallelism);
+    clusterService
+        .getClusterSettings()
+        .addSettingsUpdateConsumer(
+            VeloxLifecycleService.TASK_MAX_RETRIES, veloxLifecycleService::setTaskMaxRetries);
 
     return Arrays.asList(
         veloxLifecycleService, queryScheduler, veloxExecutionEngine, shuffleManager);

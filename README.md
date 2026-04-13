@@ -260,6 +260,8 @@ COUNT, SUM, AVG, MIN, MAX (with DISTINCT support)
 | `plugins.velox.mpp_enabled` | `false` | Enable MPP join strategies (broadcast + hash shuffle). When false, joins use coordinator-centric execution. **Dynamic** — can be toggled at runtime via cluster settings API. |
 | `plugins.velox.broadcast_max_shards` | `2` | Max primary shard count for the smaller join side to qualify for broadcast join (MPP only). **Dynamic.** |
 | `plugins.velox.shuffle_partitions` | `0` | Number of hash shuffle partitions. 0 = auto (uses number of data nodes). **Dynamic.** |
+| `plugins.velox.segment_parallelism` | `4` | Number of parallel threads for reading Lucene segments within a shard. Set to 1 to disable. **Dynamic.** |
+| `plugins.velox.task_max_retries` | `2` | Max retry attempts per failed task. Retries use replica shards on different nodes when available. Set to 0 to disable. **Dynamic.** |
 
 ## Dependencies
 

@@ -440,6 +440,7 @@ Our design extends the SQL plugin rather than rewriting it, while adopting key R
 - Dynamic MPP settings: `mpp_enabled`, `broadcast_max_shards`, `shuffle_partitions` togglable at runtime via cluster settings API
 - Cost-based MPP strategy selection: CostEstimator selects BROADCAST vs HASH_SHUFFLE based on shard count heuristic
 - Segment-level parallel reads: each Lucene segment read by a separate thread, configurable via `plugins.velox.segment_parallelism` (default 4, dynamic)
+- Fault tolerance with task retry: per-task retry with error classification (node/shard/transient), bad resource tracking, and replica failover via `plugins.velox.task_max_retries` (default 2, dynamic)
 - Per-query session creation (prevents memory pool collisions)
 - Graceful degradation on unsupported platforms
 - Data types: boolean, integer, long, float, double, keyword, date, timestamp
@@ -454,7 +455,7 @@ Gaps identified by comparison with [RFC #4812](https://github.com/opensearch-pro
 |----------|------|-----------|---------------|
 | **Critical** | Runtime Filter (TERMS) | RFC shows 2min → 100ms for 2B×2K row joins; build-side filter propagated to probe scan for early filtering | Not implemented |
 | ~~**High**~~ | ~~Segment-level parallel reads~~ | ~~RFC splits TableScan across Lucene segments with concurrent workers~~ | **Done** — `readShardIntoStreamParallel()` submits one task per segment; configurable via `segment_parallelism` |
-| **High** | Fault tolerance + task retry | RFC has task-level retry, bad node tracking, shard replica failover | Single failure kills query |
+| ~~**High**~~ | ~~Fault tolerance + task retry~~ | ~~RFC has task-level retry, bad node tracking, shard replica failover~~ | **Done** — `ErrorClassifier` categorizes errors, `BadResourceTracker` excludes failed nodes/shards, `NodeResultCollector` retries with replica failover; configurable via `task_max_retries` |
 | **High** | Backpressure / flow control | RFC has sink buffer limits with reverse pressure propagation | Basic BlockingQueue back-pressure only |
 
 #### Phase 2 — Query Optimization

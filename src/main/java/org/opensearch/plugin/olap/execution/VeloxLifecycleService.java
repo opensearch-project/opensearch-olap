@@ -88,11 +88,24 @@ public class VeloxLifecycleService implements Closeable {
           Setting.Property.NodeScope,
           Setting.Property.Dynamic);
 
+  /**
+   * Maximum number of retry attempts per failed task. Retries use replica shards on different nodes
+   * when available, or the same node for transient errors. Set to 0 to disable retries.
+   */
+  public static final Setting<Integer> TASK_MAX_RETRIES =
+      Setting.intSetting(
+          "plugins.velox.task_max_retries",
+          2,
+          0,
+          Setting.Property.NodeScope,
+          Setting.Property.Dynamic);
+
   private volatile boolean enabled;
   private volatile boolean mppEnabled;
   private volatile int broadcastMaxShards;
   private volatile int shufflePartitions;
   private volatile int segmentParallelism;
+  private volatile int taskMaxRetries;
   private volatile MemoryManager memoryManager;
   private volatile Session session;
   private volatile boolean initialized = false;
@@ -103,6 +116,7 @@ public class VeloxLifecycleService implements Closeable {
     this.broadcastMaxShards = BROADCAST_MAX_SHARDS.get(settings);
     this.shufflePartitions = SHUFFLE_PARTITIONS.get(settings);
     this.segmentParallelism = SEGMENT_PARALLELISM.get(settings);
+    this.taskMaxRetries = TASK_MAX_RETRIES.get(settings);
 
     if (enabled) {
       try {
@@ -204,6 +218,14 @@ public class VeloxLifecycleService implements Closeable {
     this.segmentParallelism = segmentParallelism;
   }
 
+  public int getTaskMaxRetries() {
+    return taskMaxRetries;
+  }
+
+  public void setTaskMaxRetries(int taskMaxRetries) {
+    this.taskMaxRetries = taskMaxRetries;
+  }
+
   public static List<Setting<?>> getSettings() {
     return List.of(
         OLAP_ENABLED,
@@ -212,7 +234,8 @@ public class VeloxLifecycleService implements Closeable {
         MPP_ENABLED,
         BROADCAST_MAX_SHARDS,
         SHUFFLE_PARTITIONS,
-        SEGMENT_PARALLELISM);
+        SEGMENT_PARALLELISM,
+        TASK_MAX_RETRIES);
   }
 
   @Override

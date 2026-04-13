@@ -9,7 +9,8 @@ public enum TaskState {
   RUNNING,
   FINISHED,
   FAILED,
-  CANCELLED;
+  CANCELLED,
+  RETRYING;
 
   public boolean isTerminal() {
     return this == FINISHED || this == FAILED || this == CANCELLED;
