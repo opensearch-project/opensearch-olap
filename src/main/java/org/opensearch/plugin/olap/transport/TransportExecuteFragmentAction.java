@@ -6,11 +6,14 @@ package org.opensearch.plugin.olap.transport;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.boostscale.velox4j.connector.ExternalStreams;
 import org.boostscale.velox4j.data.BaseVector;
 import org.boostscale.velox4j.data.RowVector;
+import org.boostscale.velox4j.plan.partition.HashPartitionFunctionSpec;
 import org.boostscale.velox4j.expression.TypedExpr;
 import org.boostscale.velox4j.iterator.CloseableIterator;
 import org.boostscale.velox4j.plan.FilterNode;
@@ -64,6 +67,7 @@ public class TransportExecuteFragmentAction
   private final TransportService transportService;
   private final ClusterService clusterService;
   private final ShuffleManager shuffleManager;
+  private final ExecutorService segmentExecutor;
 
   @Inject
   public TransportExecuteFragmentAction(
@@ -83,6 +87,17 @@ public class TransportExecuteFragmentAction
     this.clusterService = clusterService;
     this.shuffleManager = shuffleManager;
     veloxExecutionEngine.setTransportService(transportService);
+
+    // Shared thread pool for parallel segment reads within a shard
+    int parallelism = veloxLifecycle.getSegmentParallelism();
+    this.segmentExecutor =
+        Executors.newFixedThreadPool(
+            parallelism,
+            r -> {
+              Thread t = new Thread(r, "olap-segment-reader");
+              t.setDaemon(true);
+              return t;
+            });
   }
 
   @Override
@@ -144,13 +159,23 @@ public class TransportExecuteFragmentAction
       }
 
       final org.apache.lucene.search.Query finalPushdownQuery = pushdownQuery;
+      final boolean useParallelReads = veloxLifecycle.getSegmentParallelism() > 1;
       Thread feederThread =
           new Thread(
               () -> {
                 try {
                   for (ShardId shardId : shardIds) {
-                    reader.readShardIntoStream(
-                        shardId, request.getSourceIndex(), bridge, finalPushdownQuery);
+                    if (useParallelReads) {
+                      reader.readShardIntoStreamParallel(
+                          shardId,
+                          request.getSourceIndex(),
+                          bridge,
+                          finalPushdownQuery,
+                          segmentExecutor);
+                    } else {
+                      reader.readShardIntoStream(
+                          shardId, request.getSourceIndex(), bridge, finalPushdownQuery);
+                    }
                   }
                   bridge.noMoreInput();
                 } catch (Throwable e) {
@@ -386,10 +411,12 @@ public class TransportExecuteFragmentAction
         RowVector batch = iter.next();
         if (batch == null) break;
 
-        // Partition by join key hash and serialize each partition.
-        // partitionByKeyHashes returns List<RowVector>, we serialize each to native bytes.
+        // Partition by hash using HashPartitionFunctionSpec and serialize each partition.
+        HashPartitionFunctionSpec hashSpec =
+            new HashPartitionFunctionSpec(
+                (RowType) batch.getType(), keyChannels);
         List<RowVector> partitionVectors =
-            session.rowVectorOps().partitionByKeyHashes(batch, keyChannels, numPartitions);
+            session.rowVectorOps().partitionBySpec(batch, hashSpec, numPartitions);
         byte[][] partitions = new byte[partitionVectors.size()][];
         for (int p = 0; p < partitionVectors.size(); p++) {
           if (partitionVectors.get(p) != null) {

@@ -75,10 +75,24 @@ public class VeloxLifecycleService implements Closeable {
           Setting.Property.NodeScope,
           Setting.Property.Dynamic);
 
+  /**
+   * Number of parallel threads for reading Lucene segments within a shard. Each segment is read by
+   * a separate thread, producing Arrow batches concurrently into the shared ExternalStreamBridge.
+   * Default 4. Set to 1 to disable parallelism.
+   */
+  public static final Setting<Integer> SEGMENT_PARALLELISM =
+      Setting.intSetting(
+          "plugins.velox.segment_parallelism",
+          4,
+          1,
+          Setting.Property.NodeScope,
+          Setting.Property.Dynamic);
+
   private volatile boolean enabled;
   private volatile boolean mppEnabled;
   private volatile int broadcastMaxShards;
   private volatile int shufflePartitions;
+  private volatile int segmentParallelism;
   private volatile MemoryManager memoryManager;
   private volatile Session session;
   private volatile boolean initialized = false;
@@ -88,6 +102,7 @@ public class VeloxLifecycleService implements Closeable {
     this.mppEnabled = MPP_ENABLED.get(settings);
     this.broadcastMaxShards = BROADCAST_MAX_SHARDS.get(settings);
     this.shufflePartitions = SHUFFLE_PARTITIONS.get(settings);
+    this.segmentParallelism = SEGMENT_PARALLELISM.get(settings);
 
     if (enabled) {
       try {
@@ -181,6 +196,14 @@ public class VeloxLifecycleService implements Closeable {
     this.shufflePartitions = shufflePartitions;
   }
 
+  public int getSegmentParallelism() {
+    return segmentParallelism;
+  }
+
+  public void setSegmentParallelism(int segmentParallelism) {
+    this.segmentParallelism = segmentParallelism;
+  }
+
   public static List<Setting<?>> getSettings() {
     return List.of(
         OLAP_ENABLED,
@@ -188,7 +211,8 @@ public class VeloxLifecycleService implements Closeable {
         VELOX_NUM_THREADS,
         MPP_ENABLED,
         BROADCAST_MAX_SHARDS,
-        SHUFFLE_PARTITIONS);
+        SHUFFLE_PARTITIONS,
+        SEGMENT_PARALLELISM);
   }
 
   @Override

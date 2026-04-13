@@ -7,6 +7,9 @@ package org.opensearch.plugin.olap.execution;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.types.FloatingPointPrecision;
@@ -105,7 +108,102 @@ public class LuceneArrowReader {
     }
   }
 
-  /** Full scan: iterate every document in every segment. */
+  /**
+   * Read doc values from a shard using parallel segment reads.
+   *
+   * <p>Each Lucene segment is read by a separate task submitted to the executor. All tasks feed
+   * batches into the shared bridge (thread-safe BlockingQueue). Falls back to sequential when there
+   * is only one segment.
+   *
+   * @param segmentExecutor thread pool for parallel segment reads
+   */
+  public void readShardIntoStreamParallel(
+      ShardId shardId,
+      String indexName,
+      ExternalStreamBridge bridge,
+      Query pushdownQuery,
+      ExecutorService segmentExecutor)
+      throws IOException {
+    IndexService indexService = indicesService.indexServiceSafe(shardId.getIndex());
+    IndexShard shard = indexService.getShard(shardId.id());
+
+    try (Engine.Searcher searcher = shard.acquireSearcher("olap-velox")) {
+      List<ColumnSpec> columnSpecs = resolveColumnSpecs(indexService, bridge.getRequestedFields());
+      List<LeafReaderContext> leaves = searcher.getIndexReader().leaves();
+
+      if (leaves.size() <= 1) {
+        // Single segment — no benefit from parallelism, use sequential path
+        ArrowBatchBuilder batchBuilder = new ArrowBatchBuilder(allocator, columnSpecs, BATCH_SIZE);
+        if (pushdownQuery != null) {
+          readWithPushdown(searcher, batchBuilder, bridge, shardId, pushdownQuery);
+        } else {
+          readFullScan(searcher, batchBuilder, bridge, shardId);
+        }
+        return;
+      }
+
+      // Prepare pushdown weight once (Weight is thread-safe)
+      Weight weight = null;
+      if (pushdownQuery != null) {
+        Query rewritten = searcher.rewrite(pushdownQuery);
+        weight = searcher.createWeight(rewritten, ScoreMode.COMPLETE_NO_SCORES, 1.0f);
+      }
+
+      long rowCountBefore = bridge.getRowCount();
+
+      // Submit one task per segment
+      List<Future<?>> futures = new ArrayList<>(leaves.size());
+      final Weight finalWeight = weight;
+      for (LeafReaderContext leafCtx : leaves) {
+        futures.add(
+            segmentExecutor.submit(
+                () -> {
+                  try {
+                    // Each task creates its own ArrowBatchBuilder (thread-local DocValues)
+                    ArrowBatchBuilder taskBuilder =
+                        new ArrowBatchBuilder(allocator, columnSpecs, BATCH_SIZE);
+                    if (finalWeight != null) {
+                      readSegmentWithPushdown(taskBuilder, bridge, shardId, leafCtx, finalWeight);
+                    } else {
+                      readSegmentFullScan(taskBuilder, bridge, shardId, leafCtx);
+                    }
+                  } catch (IOException e) {
+                    throw new RuntimeException(
+                        "Segment read failed: shard=" + shardId + " segment=" + leafCtx.ord, e);
+                  }
+                  return null;
+                }));
+      }
+
+      // Await all segment tasks
+      try {
+        for (Future<?> f : futures) {
+          f.get(120, TimeUnit.SECONDS);
+        }
+      } catch (Exception e) {
+        // Cancel remaining tasks on failure
+        for (Future<?> f : futures) {
+          f.cancel(true);
+        }
+        throw new IOException("Parallel segment read failed for shard " + shardId, e);
+      }
+
+      if (pushdownQuery != null) {
+        long docsMatched = bridge.getRowCount() - rowCountBefore;
+        logger.debug(
+            "Pushdown scan completed for shard {}: {} docs matched ({} segments, parallel)",
+            shardId,
+            docsMatched,
+            leaves.size());
+      } else {
+        logger.debug("Finished parallel reading shard {}: {} segments", shardId, leaves.size());
+      }
+    }
+  }
+
+  // ---- Sequential scan methods ----
+
+  /** Full scan: iterate every document in every segment sequentially. */
   private void readFullScan(
       Engine.Searcher searcher,
       ArrowBatchBuilder batchBuilder,
@@ -113,21 +211,11 @@ public class LuceneArrowReader {
       ShardId shardId)
       throws IOException {
     for (LeafReaderContext leafCtx : searcher.getIndexReader().leaves()) {
-      int maxDoc = leafCtx.reader().maxDoc();
-
-      for (int startDoc = 0; startDoc < maxDoc; startDoc += BATCH_SIZE) {
-        int endDoc = Math.min(startDoc + BATCH_SIZE, maxDoc);
-
-        VectorSchemaRoot batch = batchBuilder.buildBatch(leafCtx.reader(), startDoc, endDoc);
-        bridge.feedBatch(batch);
-
-        logger.trace(
-            "Fed batch [{}-{}) from shard {} segment {}", startDoc, endDoc, shardId, leafCtx.ord);
-      }
+      readSegmentFullScan(batchBuilder, bridge, shardId, leafCtx);
     }
   }
 
-  /** Filtered scan: use a Lucene query to read only matching documents per segment. */
+  /** Filtered scan: use a Lucene query to read only matching documents sequentially. */
   private void readWithPushdown(
       Engine.Searcher searcher,
       ArrowBatchBuilder batchBuilder,
@@ -135,47 +223,69 @@ public class LuceneArrowReader {
       ShardId shardId,
       Query pushdownQuery)
       throws IOException {
-    // Engine.Searcher extends IndexSearcher — use it directly
     Query rewritten = searcher.rewrite(pushdownQuery);
     Weight weight = searcher.createWeight(rewritten, ScoreMode.COMPLETE_NO_SCORES, 1.0f);
 
-    long totalMatched = 0;
-
+    long rowCountBefore = bridge.getRowCount();
     for (LeafReaderContext leafCtx : searcher.getIndexReader().leaves()) {
-      Scorer scorer = weight.scorer(leafCtx);
-      if (scorer == null) {
-        // No matches in this segment — skip entirely
-        logger.trace("Pushdown: no matches in shard {} segment {}", shardId, leafCtx.ord);
-        continue;
-      }
+      readSegmentWithPushdown(batchBuilder, bridge, shardId, leafCtx, weight);
+    }
+    long docsMatched = bridge.getRowCount() - rowCountBefore;
+    logger.debug("Pushdown scan completed for shard {}: {} docs matched", shardId, docsMatched);
+  }
 
-      DocIdSetIterator docIdIter = scorer.iterator();
-      int[] batch = new int[BATCH_SIZE];
-      int count = 0;
+  // ---- Per-segment read methods (used by both sequential and parallel paths) ----
 
-      for (int docId = docIdIter.nextDoc();
-          docId != DocIdSetIterator.NO_MORE_DOCS;
-          docId = docIdIter.nextDoc()) {
-        batch[count++] = docId;
-        if (count == BATCH_SIZE) {
-          VectorSchemaRoot arrowBatch = batchBuilder.buildBatch(leafCtx.reader(), batch, count);
-          bridge.feedBatch(arrowBatch);
-          totalMatched += count;
-          count = 0;
-        }
-      }
+  /** Read a single segment (full scan) and feed batches to the bridge. */
+  private void readSegmentFullScan(
+      ArrowBatchBuilder batchBuilder,
+      ExternalStreamBridge bridge,
+      ShardId shardId,
+      LeafReaderContext leafCtx)
+      throws IOException {
+    int maxDoc = leafCtx.reader().maxDoc();
+    for (int startDoc = 0; startDoc < maxDoc; startDoc += BATCH_SIZE) {
+      int endDoc = Math.min(startDoc + BATCH_SIZE, maxDoc);
+      VectorSchemaRoot batch = batchBuilder.buildBatch(leafCtx.reader(), startDoc, endDoc);
+      bridge.feedBatch(batch);
+      logger.trace(
+          "Fed batch [{}-{}) from shard {} segment {}", startDoc, endDoc, shardId, leafCtx.ord);
+    }
+  }
 
-      // Flush remaining docs in this segment
-      if (count > 0) {
-        VectorSchemaRoot arrowBatch = batchBuilder.buildBatch(leafCtx.reader(), batch, count);
-        bridge.feedBatch(arrowBatch);
-        totalMatched += count;
-      }
-
-      logger.trace("Pushdown: shard {} segment {} matched docs", shardId, leafCtx.ord);
+  /** Read a single segment (pushdown) and feed matching batches to the bridge. */
+  private void readSegmentWithPushdown(
+      ArrowBatchBuilder batchBuilder,
+      ExternalStreamBridge bridge,
+      ShardId shardId,
+      LeafReaderContext leafCtx,
+      Weight weight)
+      throws IOException {
+    Scorer scorer = weight.scorer(leafCtx);
+    if (scorer == null) {
+      logger.trace("Pushdown: no matches in shard {} segment {}", shardId, leafCtx.ord);
+      return;
     }
 
-    logger.debug("Pushdown scan completed for shard {}: {} docs matched", shardId, totalMatched);
+    DocIdSetIterator docIdIter = scorer.iterator();
+    int[] batch = new int[BATCH_SIZE];
+    int count = 0;
+
+    for (int docId = docIdIter.nextDoc();
+        docId != DocIdSetIterator.NO_MORE_DOCS;
+        docId = docIdIter.nextDoc()) {
+      batch[count++] = docId;
+      if (count == BATCH_SIZE) {
+        VectorSchemaRoot arrowBatch = batchBuilder.buildBatch(leafCtx.reader(), batch, count);
+        bridge.feedBatch(arrowBatch);
+        count = 0;
+      }
+    }
+
+    if (count > 0) {
+      VectorSchemaRoot arrowBatch = batchBuilder.buildBatch(leafCtx.reader(), batch, count);
+      bridge.feedBatch(arrowBatch);
+    }
   }
 
   /**

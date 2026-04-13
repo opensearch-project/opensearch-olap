@@ -194,6 +194,9 @@ dependencies {
     testImplementation "org.apache.calcite.avatica:avatica-core:1.27.0"
     // Guava is required at test runtime by Calcite (SqlTypeName uses ImmutableMap, etc.)
     testImplementation "com.google.guava:guava:33.4.8-jre"
+    // jackson is required by Arrow's VectorSchemaRoot (Schema serialization in unit tests).
+    testRuntimeOnly "com.fasterxml.jackson.core:jackson-databind:2.21.2"
+    testRuntimeOnly "com.fasterxml.jackson.core:jackson-annotations:2.21"
 }
 
 // =============================================================================
