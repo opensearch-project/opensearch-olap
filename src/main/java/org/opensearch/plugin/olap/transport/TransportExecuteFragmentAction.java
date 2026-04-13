@@ -13,12 +13,12 @@ import org.apache.logging.log4j.Logger;
 import org.boostscale.velox4j.connector.ExternalStreams;
 import org.boostscale.velox4j.data.BaseVector;
 import org.boostscale.velox4j.data.RowVector;
-import org.boostscale.velox4j.plan.partition.HashPartitionFunctionSpec;
 import org.boostscale.velox4j.expression.TypedExpr;
 import org.boostscale.velox4j.iterator.CloseableIterator;
 import org.boostscale.velox4j.plan.FilterNode;
 import org.boostscale.velox4j.plan.PlanNode;
 import org.boostscale.velox4j.plan.TableScanNode;
+import org.boostscale.velox4j.plan.partition.HashPartitionFunctionSpec;
 import org.boostscale.velox4j.query.Query;
 import org.boostscale.velox4j.serde.Serde;
 import org.boostscale.velox4j.session.Session;
@@ -413,8 +413,7 @@ public class TransportExecuteFragmentAction
 
         // Partition by hash using HashPartitionFunctionSpec and serialize each partition.
         HashPartitionFunctionSpec hashSpec =
-            new HashPartitionFunctionSpec(
-                (RowType) batch.getType(), keyChannels);
+            new HashPartitionFunctionSpec((RowType) batch.getType(), keyChannels);
         List<RowVector> partitionVectors =
             session.rowVectorOps().partitionBySpec(batch, hashSpec, numPartitions);
         byte[][] partitions = new byte[partitionVectors.size()][];
@@ -634,18 +633,8 @@ public class TransportExecuteFragmentAction
     if (node instanceof TableScanNode) {
       result.add((TableScanNode) node);
     }
-    try {
-      java.lang.reflect.Method m = PlanNode.class.getDeclaredMethod("getSources");
-      m.setAccessible(true);
-      @SuppressWarnings("unchecked")
-      List<PlanNode> sources = (List<PlanNode>) m.invoke(node);
-      if (sources != null) {
-        for (PlanNode source : sources) {
-          collectTableScanNodes(source, result);
-        }
-      }
-    } catch (Exception e) {
-      // ignore traversal errors
+    for (PlanNode source : node.getSources()) {
+      collectTableScanNodes(source, result);
     }
   }
 
@@ -680,21 +669,11 @@ public class TransportExecuteFragmentAction
   }
 
   private FilterNode findFilterNode(PlanNode node) {
-    try {
-      java.lang.reflect.Method m = PlanNode.class.getDeclaredMethod("getSources");
-      m.setAccessible(true);
-      @SuppressWarnings("unchecked")
-      List<PlanNode> sources = (List<PlanNode>) m.invoke(node);
-      if (sources != null) {
-        for (PlanNode source : sources) {
-          FilterNode deeper = findFilterNode(source);
-          if (deeper != null) {
-            return deeper;
-          }
-        }
+    for (PlanNode source : node.getSources()) {
+      FilterNode deeper = findFilterNode(source);
+      if (deeper != null) {
+        return deeper;
       }
-    } catch (Exception e) {
-      logger.warn("Cannot traverse plan node for filter extraction: {}", e.getMessage());
     }
     if (node instanceof FilterNode) {
       return (FilterNode) node;
@@ -706,21 +685,11 @@ public class TransportExecuteFragmentAction
     if (node instanceof TableScanNode) {
       return node;
     }
-    try {
-      java.lang.reflect.Method m = PlanNode.class.getDeclaredMethod("getSources");
-      m.setAccessible(true);
-      @SuppressWarnings("unchecked")
-      List<PlanNode> sources = (List<PlanNode>) m.invoke(node);
-      if (sources != null) {
-        for (PlanNode source : sources) {
-          PlanNode found = findTableScanNode(source);
-          if (found != null) {
-            return found;
-          }
-        }
+    for (PlanNode source : node.getSources()) {
+      PlanNode found = findTableScanNode(source);
+      if (found != null) {
+        return found;
       }
-    } catch (Exception e) {
-      logger.warn("Cannot traverse plan node: {}", e.getMessage());
     }
     return null;
   }
