@@ -5,7 +5,9 @@
 package org.opensearch.plugin.olap.transport;
 
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import org.apache.logging.log4j.LogManager;
@@ -36,6 +38,7 @@ import org.opensearch.plugin.olap.engine.VeloxExecutionEngine;
 import org.opensearch.plugin.olap.execution.ExternalStreamBridge;
 import org.opensearch.plugin.olap.execution.LuceneArrowReader;
 import org.opensearch.plugin.olap.execution.LuceneFilterConverter;
+import org.opensearch.plugin.olap.execution.RuntimeFilterBuilder;
 import org.opensearch.plugin.olap.execution.VeloxExecutor;
 import org.opensearch.plugin.olap.execution.VeloxLifecycleService;
 import org.opensearch.tasks.Task;
@@ -263,14 +266,41 @@ public class TransportExecuteFragmentAction
       }
       probeBridge.setRequestedFields(scanFields);
 
-      // Start probe-side feeder thread (reads local shards)
+      // Build runtime filter query if present in request
+      org.apache.lucene.search.Query rfQuery = buildRuntimeFilterQuery(request);
+      if (rfQuery != null) {
+        logger.info(
+            "Runtime filter applied for query {}: field={}, {} values",
+            queryId,
+            request.getRfFieldName(),
+            request.getRfValues().size());
+      }
+
+      // For broadcast join, don't extract pushdown from the full join plan — the plan
+      // contains both probe and build branches, and extractPushdownQuery could return a
+      // build-side filter that doesn't apply to probe-side shards. Predicate pushdown for
+      // the probe side is handled by Velox's FilterNode in the join plan. Only the RF
+      // (explicitly targeting the probe join key) is safe to push to Lucene here.
+      org.apache.lucene.search.Query combinedQuery = rfQuery;
+
+      // Start probe-side feeder thread (reads local shards with RF pushdown)
+      final org.apache.lucene.search.Query finalCombinedQuery = combinedQuery;
       Thread probeFeeder =
           new Thread(
               () -> {
                 try {
                   for (ShardId shardId : request.getShardIds()) {
-                    reader.readShardIntoStream(
-                        shardId, request.getSourceIndex(), probeBridge, null);
+                    if (veloxLifecycle.getSegmentParallelism() > 1) {
+                      reader.readShardIntoStreamParallel(
+                          shardId,
+                          request.getSourceIndex(),
+                          probeBridge,
+                          finalCombinedQuery,
+                          segmentExecutor);
+                    } else {
+                      reader.readShardIntoStream(
+                          shardId, request.getSourceIndex(), probeBridge, finalCombinedQuery);
+                    }
                   }
                   probeBridge.noMoreInput();
                 } catch (Throwable e) {
@@ -615,6 +645,32 @@ public class TransportExecuteFragmentAction
   // ---- Plan Introspection Helpers ----
 
   /** Extract field names from a specific TableScanNode by ID. */
+  /** Build a Lucene runtime filter query from the request's RF metadata. */
+  private org.apache.lucene.search.Query buildRuntimeFilterQuery(ExecuteFragmentRequest request) {
+    if (!request.hasRuntimeFilter()) return null;
+
+    Set<Object> values = new LinkedHashSet<>();
+    String fieldType = request.getRfFieldType();
+    for (String v : request.getRfValues()) {
+      try {
+        switch (fieldType) {
+          case "integer":
+            values.add(Integer.parseInt(v));
+            break;
+          case "long":
+            values.add(Long.parseLong(v));
+            break;
+          default:
+            values.add(v);
+        }
+      } catch (NumberFormatException e) {
+        values.add(v);
+      }
+    }
+
+    return RuntimeFilterBuilder.build(request.getRfFieldName(), values, fieldType);
+  }
+
   private List<String> extractScanFieldsFromNode(PlanNode root, String targetScanId) {
     List<TableScanNode> scans = new ArrayList<>();
     collectTableScanNodes(root, scans);

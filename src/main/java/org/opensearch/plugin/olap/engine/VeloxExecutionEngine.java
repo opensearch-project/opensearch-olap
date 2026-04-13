@@ -10,8 +10,10 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.VectorSchemaRoot;
@@ -32,6 +34,7 @@ import org.boostscale.velox4j.data.BaseVector;
 import org.boostscale.velox4j.data.RowVector;
 import org.boostscale.velox4j.iterator.CloseableIterator;
 import org.boostscale.velox4j.iterator.UpIterators;
+import org.boostscale.velox4j.join.JoinType;
 import org.boostscale.velox4j.plan.HashJoinNode;
 import org.boostscale.velox4j.plan.PlanNode;
 import org.boostscale.velox4j.plan.TableScanNode;
@@ -216,13 +219,13 @@ public class VeloxExecutionEngine {
       PlanFragment coordinatorFragment,
       QueryId queryId) {
 
-    // Determine build side (smaller index by shard count)
+    // Determine build side. For outer joins, the build side is constrained by join semantics:
+    // - LEFT JOIN: build must be right (left rows are preserved, must be the probe)
+    // - RIGHT JOIN: build must be left (right rows are preserved, must be the probe)
+    // - INNER JOIN: build is the smaller side (CostEstimator decides)
     String leftIndex = leafFragments.get(0).getProperties().getSourceIndex();
     String rightIndex = leafFragments.get(1).getProperties().getSourceIndex();
-    CostEstimator estimator =
-        new CostEstimator(
-            queryScheduler.getClusterService(), veloxLifecycle.getBroadcastMaxShards());
-    String buildSide = estimator.selectBuildSide(leftIndex, rightIndex);
+    String buildSide = selectBroadcastBuildSide(coordinatorFragment, leftIndex, rightIndex);
 
     PlanFragment buildFragment;
     String probeIndex;
@@ -282,6 +285,25 @@ public class VeloxExecutionEngine {
     logger.info(
         "Broadcast: collected {} build-side batches for query {}", broadcastData.size(), queryId);
 
+    // Phase 1.5: Extract runtime filter from build-side data
+    String rfFieldName = null;
+    String rfFieldType = null;
+    List<String> rfValues = null;
+
+    if (veloxLifecycle.isRuntimeFilterEnabled()
+        && !broadcastData.isEmpty()
+        && isInnerJoin(coordinatorFragment)) {
+      rfValues = extractRuntimeFilter(coordinatorFragment, buildScanIndex, broadcastData, queryId);
+      if (rfValues != null) {
+        // Determine probe-side join key field name and type from the coordinator plan
+        rfFieldName = extractProbeJoinKeyField(coordinatorFragment, buildScanIndex);
+        rfFieldType = extractProbeJoinKeyType(relNode, rfFieldName);
+        if (rfFieldName == null || rfFieldType == null) {
+          rfValues = null; // can't build RF without field metadata
+        }
+      }
+    }
+
     // Phase 2: Dispatch broadcast join to probe-side nodes
     List<Stage> broadcastStages = new ArrayList<>();
     for (Stage stage : execution.getStages()) {
@@ -291,9 +313,18 @@ public class VeloxExecutionEngine {
       }
     }
 
+    final String finalRfFieldName = rfFieldName;
+    final String finalRfFieldType = rfFieldType;
+    final List<String> finalRfValues = rfValues;
     List<ExecuteFragmentResponse> joinResponses =
         collector.dispatchAndCollectBroadcast(
-            execution, broadcastStages, broadcastData, buildScanIndex);
+            execution,
+            broadcastStages,
+            broadcastData,
+            buildScanIndex,
+            finalRfFieldName,
+            finalRfFieldType,
+            finalRfValues);
 
     return buildQueryResponse(relNode.getRowType(), joinResponses);
   }
@@ -838,6 +869,171 @@ public class VeloxExecutionEngine {
           false);
     }
     return node;
+  }
+
+  // ---- Runtime Filter Helpers ----
+
+  /**
+   * Extract distinct join key values from build-side Velox native batches for runtime filter.
+   * Returns a list of string-encoded values, or null if RF should be skipped (too many values or
+   * error).
+   */
+  private List<String> extractRuntimeFilter(
+      PlanFragment coordinatorFragment,
+      int buildScanIndex,
+      List<byte[]> broadcastData,
+      QueryId queryId) {
+    try {
+      // Find the build-side join key column name from the HashJoinNode
+      HashJoinNode joinNode = findHashJoinNode(coordinatorFragment.getPlanRoot());
+      if (joinNode == null) return null;
+
+      // buildScanIndex=0 means build is left, so build keys = leftKeys
+      List<org.boostscale.velox4j.expression.FieldAccessTypedExpr> buildKeys =
+          (buildScanIndex == 0) ? joinNode.getLeftKeys() : joinNode.getRightKeys();
+      if (buildKeys.isEmpty()) return null;
+
+      // Use the first join key for RF (multi-key RF is future work)
+      String buildKeyName = buildKeys.get(0).getFieldName();
+
+      // Deserialize build batches and extract distinct values
+      Session session = veloxLifecycle.getSession();
+      Set<String> distinctValues = new LinkedHashSet<>();
+      int maxCardinality = veloxLifecycle.getRuntimeFilterMaxCardinality();
+
+      for (byte[] batch : broadcastData) {
+        BaseVector vec = session.baseVectorOps().deserializeOneFromBuf(batch);
+        RowVector rowVec = vec.asRowVector();
+        RowType rowType = (RowType) rowVec.getType();
+
+        // Find the column index for the build join key
+        int keyColIndex = rowType.getNames().indexOf(buildKeyName);
+        if (keyColIndex < 0) continue;
+
+        // Extract values from this batch
+        // RowVector columns are accessed by converting to Arrow and reading
+        // Simpler: serialize to JSON and parse (heavy), or use Velox accessors
+        // For now, use Arrow round-trip to read column values
+        BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+        try {
+          VectorSchemaRoot arrowRoot =
+              org.boostscale.velox4j.arrow.Arrow.toArrowVectorSchemaRoot(allocator, rowVec);
+          org.apache.arrow.vector.FieldVector fieldVec = arrowRoot.getVector(keyColIndex);
+          for (int row = 0; row < arrowRoot.getRowCount(); row++) {
+            Object val = fieldVec.getObject(row);
+            if (val != null) {
+              distinctValues.add(val.toString());
+            }
+            if (distinctValues.size() > maxCardinality) {
+              logger.info(
+                  "RF skipped for query {}: build cardinality {} exceeds max {}",
+                  queryId,
+                  distinctValues.size(),
+                  maxCardinality);
+              arrowRoot.close();
+              return null;
+            }
+          }
+          arrowRoot.close();
+        } finally {
+          try {
+            allocator.close();
+          } catch (IllegalStateException ex) {
+            logger.debug("Arrow allocator close warning: {}", ex.getMessage());
+          }
+        }
+      }
+
+      if (distinctValues.isEmpty()) return null;
+
+      logger.info(
+          "RF extracted for query {}: field={}, {} distinct values",
+          queryId,
+          buildKeyName,
+          distinctValues.size());
+      return new ArrayList<>(distinctValues);
+
+    } catch (Exception e) {
+      logger.warn("Failed to extract runtime filter for query {}: {}", queryId, e.getMessage());
+      return null;
+    }
+  }
+
+  /** Extract the probe-side join key field name from the coordinator fragment's HashJoinNode. */
+  private String extractProbeJoinKeyField(PlanFragment coordinatorFragment, int buildScanIndex) {
+    HashJoinNode joinNode = findHashJoinNode(coordinatorFragment.getPlanRoot());
+    if (joinNode == null) return null;
+
+    // If build is at index 0 (left), probe is right → probe keys = rightKeys
+    // If build is at index 1 (right), probe is left → probe keys = leftKeys
+    List<org.boostscale.velox4j.expression.FieldAccessTypedExpr> probeKeys =
+        (buildScanIndex == 0) ? joinNode.getRightKeys() : joinNode.getLeftKeys();
+    if (probeKeys.isEmpty()) return null;
+    return probeKeys.get(0).getFieldName();
+  }
+
+  /** Determine the OpenSearch field type for the RF field from the original RelNode. */
+  private String extractProbeJoinKeyType(RelNode relNode, String fieldName) {
+    if (fieldName == null) return null;
+    // Walk the RelNode tree to find the field's SQL type
+    for (org.apache.calcite.rel.type.RelDataTypeField field : relNode.getRowType().getFieldList()) {
+      if (field.getName().equals(fieldName)) {
+        switch (field.getType().getSqlTypeName()) {
+          case INTEGER:
+            return "integer";
+          case BIGINT:
+            return "long";
+          case VARCHAR:
+          case CHAR:
+            return "keyword";
+          default:
+            return null;
+        }
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Select which side to broadcast for a join. For outer joins, the preserved side must be the
+   * probe (reads from local shards); the non-preserved side is broadcast. For INNER joins, the
+   * smaller side is broadcast (CostEstimator decides).
+   */
+  private String selectBroadcastBuildSide(
+      PlanFragment coordinatorFragment, String leftIndex, String rightIndex) {
+    HashJoinNode joinNode = findHashJoinNode(coordinatorFragment.getPlanRoot());
+    if (joinNode != null) {
+      JoinType joinType = joinNode.getJoinType();
+      if (joinType == JoinType.LEFT || joinType == JoinType.LEFT_SEMI_FILTER) {
+        // LEFT JOIN preserves left rows → left must be probe → build is right
+        return "right";
+      }
+      if (joinType == JoinType.RIGHT) {
+        // RIGHT JOIN preserves right rows → right must be probe → build is left
+        return "left";
+      }
+    }
+    // INNER or FULL: use cost estimator to pick smaller side
+    CostEstimator estimator =
+        new CostEstimator(
+            queryScheduler.getClusterService(), veloxLifecycle.getBroadcastMaxShards());
+    return estimator.selectBuildSide(leftIndex, rightIndex);
+  }
+
+  /** Check if the coordinator fragment's join is INNER (RF is only safe for inner joins). */
+  private boolean isInnerJoin(PlanFragment coordinatorFragment) {
+    HashJoinNode joinNode = findHashJoinNode(coordinatorFragment.getPlanRoot());
+    return joinNode != null && joinNode.getJoinType() == JoinType.INNER;
+  }
+
+  /** Find the HashJoinNode in a plan tree. */
+  private HashJoinNode findHashJoinNode(PlanNode node) {
+    if (node instanceof HashJoinNode) return (HashJoinNode) node;
+    for (PlanNode source : node.getSources()) {
+      HashJoinNode found = findHashJoinNode(source);
+      if (found != null) return found;
+    }
+    return null;
   }
 
   // ---- Arrow/Type Helpers ----

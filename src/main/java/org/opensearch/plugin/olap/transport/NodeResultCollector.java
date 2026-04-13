@@ -96,6 +96,25 @@ public class NodeResultCollector {
       List<org.opensearch.plugin.olap.scheduler.Stage> stages,
       List<byte[]> broadcastData,
       int buildScanIndex) {
+    return dispatchAndCollectBroadcast(
+        execution, stages, broadcastData, buildScanIndex, null, null, null);
+  }
+
+  /**
+   * Dispatch broadcast join tasks with build scan index and optional runtime filter.
+   *
+   * @param rfFieldName probe-side join key field name (null to skip RF)
+   * @param rfFieldType field type ("keyword", "integer", "long")
+   * @param rfValues distinct build-side join key values as strings
+   */
+  public List<ExecuteFragmentResponse> dispatchAndCollectBroadcast(
+      QueryExecution execution,
+      List<org.opensearch.plugin.olap.scheduler.Stage> stages,
+      List<byte[]> broadcastData,
+      int buildScanIndex,
+      String rfFieldName,
+      String rfFieldType,
+      List<String> rfValues) {
     QueryId queryId = execution.getQueryId();
     List<TaskDescriptor> allTasks = new ArrayList<>();
     for (var stage : stages) {
@@ -108,6 +127,9 @@ public class NodeResultCollector {
         task -> {
           ExecuteFragmentRequest request = createNormalRequest(queryId, task);
           request.setBroadcastData(broadcastData, buildScanIndex);
+          if (rfFieldName != null && rfValues != null && !rfValues.isEmpty()) {
+            request.setRuntimeFilter(rfFieldName, rfFieldType, rfValues);
+          }
           return request;
         });
   }

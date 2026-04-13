@@ -93,6 +93,16 @@ public class OlapPlugin extends Plugin implements ActionPlugin {
         .getClusterSettings()
         .addSettingsUpdateConsumer(
             VeloxLifecycleService.TASK_MAX_RETRIES, veloxLifecycleService::setTaskMaxRetries);
+    clusterService
+        .getClusterSettings()
+        .addSettingsUpdateConsumer(
+            VeloxLifecycleService.RUNTIME_FILTER_ENABLED,
+            veloxLifecycleService::setRuntimeFilterEnabled);
+    clusterService
+        .getClusterSettings()
+        .addSettingsUpdateConsumer(
+            VeloxLifecycleService.RUNTIME_FILTER_MAX_CARDINALITY,
+            veloxLifecycleService::setRuntimeFilterMaxCardinality);
 
     return Arrays.asList(
         veloxLifecycleService, queryScheduler, veloxExecutionEngine, shuffleManager);
