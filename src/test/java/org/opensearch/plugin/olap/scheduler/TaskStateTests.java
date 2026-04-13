@@ -17,10 +17,11 @@ public class TaskStateTests extends OpenSearchTestCase {
   public void testNonTerminalStates() {
     assertFalse(TaskState.PENDING.isTerminal());
     assertFalse(TaskState.RUNNING.isTerminal());
+    assertFalse(TaskState.RETRYING.isTerminal());
   }
 
   public void testAllStatesAreDefined() {
     TaskState[] values = TaskState.values();
-    assertEquals(5, values.length);
+    assertEquals(6, values.length);
   }
 }

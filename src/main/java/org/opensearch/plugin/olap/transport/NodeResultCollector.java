@@ -4,8 +4,13 @@
 
 package org.opensearch.plugin.olap.transport;
 
+import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
@@ -15,10 +20,20 @@ import org.boostscale.velox4j.config.Config;
 import org.boostscale.velox4j.config.ConnectorConfig;
 import org.boostscale.velox4j.query.Query;
 import org.boostscale.velox4j.serde.Serde;
+import org.opensearch.cluster.node.DiscoveryNode;
+import org.opensearch.core.common.io.stream.StreamInput;
+import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.plugin.olap.common.QueryId;
+import org.opensearch.plugin.olap.scheduler.BadResourceTracker;
+import org.opensearch.plugin.olap.scheduler.ErrorClassifier;
+import org.opensearch.plugin.olap.scheduler.ErrorClassifier.ErrorCategory;
 import org.opensearch.plugin.olap.scheduler.QueryExecution;
 import org.opensearch.plugin.olap.scheduler.QueryScheduler;
+import org.opensearch.plugin.olap.scheduler.ShardRouter;
 import org.opensearch.plugin.olap.scheduler.TaskDescriptor;
+import org.opensearch.threadpool.ThreadPool;
+import org.opensearch.transport.TransportException;
+import org.opensearch.transport.TransportResponseHandler;
 import org.opensearch.transport.TransportService;
 
 /**
@@ -33,10 +48,17 @@ public class NodeResultCollector {
 
   private final TransportService transportService;
   private final QueryScheduler scheduler;
+  private final int maxRetries;
 
   public NodeResultCollector(TransportService transportService, QueryScheduler scheduler) {
+    this(transportService, scheduler, 0);
+  }
+
+  public NodeResultCollector(
+      TransportService transportService, QueryScheduler scheduler, int maxRetries) {
     this.transportService = transportService;
     this.scheduler = scheduler;
+    this.maxRetries = maxRetries;
   }
 
   /** Dispatch all tasks for a query execution and collect results. */
@@ -159,50 +181,21 @@ public class NodeResultCollector {
       QueryId queryId, List<TaskDescriptor> tasks, RequestFactory requestFactory) {
     CountDownLatch latch = new CountDownLatch(tasks.size());
     List<ExecuteFragmentResponse> responses =
-        new ArrayList<>(java.util.Collections.nCopies(tasks.size(), null));
+        new ArrayList<>(Collections.nCopies(tasks.size(), null));
     AtomicReference<Exception> firstError = new AtomicReference<>();
+    BadResourceTracker tracker = new BadResourceTracker();
 
     for (int i = 0; i < tasks.size(); i++) {
-      final int index = i;
-      TaskDescriptor task = tasks.get(i);
-      ExecuteFragmentRequest request = requestFactory.create(task);
-
-      transportService.sendRequest(
-          task.getTargetNode(),
-          ExecuteFragmentAction.NAME,
-          request,
-          new org.opensearch.transport.TransportResponseHandler<ExecuteFragmentResponse>() {
-            @Override
-            public ExecuteFragmentResponse read(org.opensearch.core.common.io.stream.StreamInput in)
-                throws java.io.IOException {
-              return new ExecuteFragmentResponse(in);
-            }
-
-            @Override
-            public void handleResponse(ExecuteFragmentResponse response) {
-              responses.set(index, response);
-              if (response.getStatus() == ExecuteFragmentResponse.Status.SUCCESS) {
-                scheduler.onTaskCompleted(queryId, task.getTaskId());
-              } else {
-                scheduler.onTaskFailed(queryId, task.getTaskId(), response.getErrorMessage());
-                firstError.compareAndSet(null, new RuntimeException(response.getErrorMessage()));
-              }
-              latch.countDown();
-            }
-
-            @Override
-            public void handleException(org.opensearch.transport.TransportException exp) {
-              logger.error("Transport error for task {}", task.getTaskId(), exp);
-              scheduler.onTaskFailed(queryId, task.getTaskId(), exp.getMessage());
-              firstError.compareAndSet(null, exp);
-              latch.countDown();
-            }
-
-            @Override
-            public String executor() {
-              return org.opensearch.threadpool.ThreadPool.Names.SEARCH;
-            }
-          });
+      dispatchWithRetry(
+          queryId,
+          tasks.get(i),
+          i,
+          responses,
+          latch,
+          requestFactory,
+          tracker,
+          firstError,
+          maxRetries);
     }
 
     try {
@@ -220,6 +213,185 @@ public class NodeResultCollector {
     }
 
     return responses;
+  }
+
+  private void dispatchWithRetry(
+      QueryId queryId,
+      TaskDescriptor task,
+      int index,
+      List<ExecuteFragmentResponse> responses,
+      CountDownLatch latch,
+      RequestFactory requestFactory,
+      BadResourceTracker tracker,
+      AtomicReference<Exception> firstError,
+      int retriesLeft) {
+
+    ExecuteFragmentRequest request = requestFactory.create(task);
+
+    transportService.sendRequest(
+        task.getTargetNode(),
+        ExecuteFragmentAction.NAME,
+        request,
+        new TransportResponseHandler<ExecuteFragmentResponse>() {
+          @Override
+          public ExecuteFragmentResponse read(StreamInput in) throws IOException {
+            return new ExecuteFragmentResponse(in);
+          }
+
+          @Override
+          public void handleResponse(ExecuteFragmentResponse response) {
+            if (response.getStatus() == ExecuteFragmentResponse.Status.SUCCESS) {
+              responses.set(index, response);
+              scheduler.onTaskCompleted(queryId, task.getTaskId());
+              latch.countDown();
+              return;
+            }
+
+            // Task failed — classify and decide retry
+            ErrorCategory category = ErrorClassifier.classify(response.getErrorMessage());
+            if (retriesLeft > 0 && category != ErrorCategory.FATAL) {
+              logger.warn(
+                  "Task {} failed ({}), retrying ({} left): {}",
+                  task.getTaskId(),
+                  category,
+                  retriesLeft,
+                  response.getErrorMessage());
+              TaskDescriptor retryTask = prepareRetry(task, category, tracker);
+              if (retryTask != null) {
+                dispatchWithRetry(
+                    queryId,
+                    retryTask,
+                    index,
+                    responses,
+                    latch,
+                    requestFactory,
+                    tracker,
+                    firstError,
+                    retriesLeft - 1);
+                return;
+              }
+              logger.warn("No alternative node for task {}, failing", task.getTaskId());
+            }
+
+            // No retry — record failure
+            responses.set(index, response);
+            scheduler.onTaskFailed(queryId, task.getTaskId(), response.getErrorMessage());
+            firstError.compareAndSet(null, new RuntimeException(response.getErrorMessage()));
+            latch.countDown();
+          }
+
+          @Override
+          public void handleException(TransportException exp) {
+            // Transport exception — node likely unreachable
+            ErrorCategory category = ErrorClassifier.classify(exp);
+            if (retriesLeft > 0 && category != ErrorCategory.FATAL) {
+              logger.warn(
+                  "Transport error for task {} ({}), retrying ({} left): {}",
+                  task.getTaskId(),
+                  category,
+                  retriesLeft,
+                  exp.getMessage());
+              TaskDescriptor retryTask = prepareRetry(task, category, tracker);
+              if (retryTask != null) {
+                dispatchWithRetry(
+                    queryId,
+                    retryTask,
+                    index,
+                    responses,
+                    latch,
+                    requestFactory,
+                    tracker,
+                    firstError,
+                    retriesLeft - 1);
+                return;
+              }
+              logger.warn("No alternative node for task {}, failing", task.getTaskId());
+            }
+
+            logger.error("Task {} failed permanently: {}", task.getTaskId(), exp.getMessage());
+            scheduler.onTaskFailed(queryId, task.getTaskId(), exp.getMessage());
+            firstError.compareAndSet(null, exp);
+            latch.countDown();
+          }
+
+          @Override
+          public String executor() {
+            return ThreadPool.Names.SEARCH;
+          }
+        });
+  }
+
+  /**
+   * Prepare a retry by marking bad resources and finding an alternative node. Returns a new
+   * TaskDescriptor targeting a different node, or null if no alternative is available.
+   */
+  private TaskDescriptor prepareRetry(
+      TaskDescriptor failed, ErrorCategory category, BadResourceTracker tracker) {
+    String failedNodeId = failed.getTargetNode().getId();
+
+    switch (category) {
+      case RETRYABLE_NODE:
+        tracker.addBadNode(failedNodeId);
+        break;
+      case RETRYABLE_SHARD:
+        for (ShardId shardId : failed.getShardIds()) {
+          tracker.addBadShardOnNode(failedNodeId, shardId);
+        }
+        break;
+      case RETRYABLE_TRANSIENT:
+        // Transient error — retry on same node (don't mark as bad)
+        return failed;
+      default:
+        return null;
+    }
+
+    // Find alternative routing excluding bad resources
+    String sourceIndex = failed.getFragment().getProperties().getSourceIndex();
+    if (sourceIndex == null) {
+      return null;
+    }
+
+    try {
+      ShardRouter router = new ShardRouter();
+      Map<DiscoveryNode, List<ShardId>> newRouting =
+          router.routeShardsWithExclusions(
+              scheduler.getClusterService().state(), sourceIndex, tracker);
+
+      // Find the node that covers the most of the failed task's shards.
+      // Replicas may be spread across multiple nodes — pick the best single node.
+      // Any shards not covered will be lost, but this is better than failing entirely.
+      Set<ShardId> failedShards = new HashSet<>(failed.getShardIds());
+      DiscoveryNode bestNode = null;
+      List<ShardId> bestShards = Collections.emptyList();
+
+      for (Map.Entry<DiscoveryNode, List<ShardId>> entry : newRouting.entrySet()) {
+        List<ShardId> overlap = new ArrayList<>();
+        for (ShardId s : entry.getValue()) {
+          if (failedShards.contains(s)) {
+            overlap.add(s);
+          }
+        }
+        if (overlap.size() > bestShards.size()) {
+          bestNode = entry.getKey();
+          bestShards = overlap;
+        }
+      }
+
+      if (bestNode != null && !bestShards.isEmpty()) {
+        logger.info(
+            "Retrying task {} on node {} ({}/{} shards, was {})",
+            failed.getTaskId(),
+            bestNode.getName(),
+            bestShards.size(),
+            failed.getShardIds().size(),
+            failed.getTargetNode().getName());
+        return new TaskDescriptor(failed.getTaskId(), failed.getFragment(), bestNode, bestShards);
+      }
+    } catch (Exception e) {
+      logger.warn("Failed to find alternative node for retry: {}", e.getMessage());
+    }
+
+    return null;
   }
 
   private ExecuteFragmentRequest createNormalRequest(QueryId queryId, TaskDescriptor task) {
