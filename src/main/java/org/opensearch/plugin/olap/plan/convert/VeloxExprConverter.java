@@ -9,7 +9,9 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import org.apache.calcite.jdbc.JavaTypeFactoryImpl;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rel.type.RelDataTypeField;
 import org.apache.calcite.rex.RexBuilder;
@@ -26,8 +28,15 @@ import org.boostscale.velox4j.expression.CastTypedExpr;
 import org.boostscale.velox4j.expression.ConstantTypedExpr;
 import org.boostscale.velox4j.expression.FieldAccessTypedExpr;
 import org.boostscale.velox4j.expression.TypedExpr;
+import org.boostscale.velox4j.type.BigIntType;
 import org.boostscale.velox4j.type.BooleanType;
+import org.boostscale.velox4j.type.DoubleType;
+import org.boostscale.velox4j.type.IntegerType;
+import org.boostscale.velox4j.type.RealType;
+import org.boostscale.velox4j.type.SmallIntType;
+import org.boostscale.velox4j.type.TinyIntType;
 import org.boostscale.velox4j.type.Type;
+import org.boostscale.velox4j.type.VarCharType;
 import org.boostscale.velox4j.variant.BigIntValue;
 import org.boostscale.velox4j.variant.BooleanValue;
 import org.boostscale.velox4j.variant.DoubleValue;
@@ -75,7 +84,7 @@ public class VeloxExprConverter {
 
   public VeloxExprConverter(RelDataType inputRowType) {
     this.inputRowType = inputRowType;
-    this.rexBuilder = new RexBuilder(new org.apache.calcite.jdbc.JavaTypeFactoryImpl());
+    this.rexBuilder = new RexBuilder(new JavaTypeFactoryImpl());
   }
 
   public TypedExpr convert(RexNode rexNode) {
@@ -117,17 +126,17 @@ public class VeloxExprConverter {
 
   private Type variantToType(Variant variant) {
     if (variant instanceof IntegerValue) {
-      return new org.boostscale.velox4j.type.IntegerType();
+      return new IntegerType();
     } else if (variant instanceof BigIntValue) {
-      return new org.boostscale.velox4j.type.BigIntType();
+      return new BigIntType();
     } else if (variant instanceof DoubleValue) {
-      return new org.boostscale.velox4j.type.DoubleType();
+      return new DoubleType();
     } else if (variant instanceof RealValue) {
-      return new org.boostscale.velox4j.type.RealType();
+      return new RealType();
     } else if (variant instanceof BooleanValue) {
-      return new org.boostscale.velox4j.type.BooleanType();
+      return new BooleanType();
     } else if (variant instanceof VarCharValue) {
-      return new org.boostscale.velox4j.type.VarCharType();
+      return new VarCharType();
     }
     throw new UnsupportedOperationException("Unknown variant type: " + variant.getClass());
   }
@@ -206,7 +215,7 @@ public class VeloxExprConverter {
     String functionName = FUNCTION_MAP.get(kind);
     if (functionName == null) {
       // Fallback: use the operator name in lower case
-      functionName = call.getOperator().getName().toLowerCase(java.util.Locale.ROOT);
+      functionName = call.getOperator().getName().toLowerCase(Locale.ROOT);
     }
 
     List<TypedExpr> inputs = new ArrayList<>(call.getOperands().size());
@@ -305,12 +314,12 @@ public class VeloxExprConverter {
   }
 
   private int numericRank(Type t) {
-    if (t instanceof org.boostscale.velox4j.type.TinyIntType) return 0;
-    if (t instanceof org.boostscale.velox4j.type.SmallIntType) return 1;
-    if (t instanceof org.boostscale.velox4j.type.IntegerType) return 2;
-    if (t instanceof org.boostscale.velox4j.type.BigIntType) return 3;
-    if (t instanceof org.boostscale.velox4j.type.RealType) return 4;
-    if (t instanceof org.boostscale.velox4j.type.DoubleType) return 5;
+    if (t instanceof TinyIntType) return 0;
+    if (t instanceof SmallIntType) return 1;
+    if (t instanceof IntegerType) return 2;
+    if (t instanceof BigIntType) return 3;
+    if (t instanceof RealType) return 4;
+    if (t instanceof DoubleType) return 5;
     return -1;
   }
 }

@@ -4,6 +4,7 @@
 
 package org.opensearch.plugin.olap.transport;
 
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -14,6 +15,7 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.boostscale.velox4j.connector.ExternalStreams;
 import org.boostscale.velox4j.data.BaseVector;
+import org.boostscale.velox4j.data.BaseVectors;
 import org.boostscale.velox4j.data.RowVector;
 import org.boostscale.velox4j.expression.TypedExpr;
 import org.boostscale.velox4j.iterator.CloseableIterator;
@@ -32,6 +34,7 @@ import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.inject.Inject;
 import org.opensearch.core.action.ActionListener;
+import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.indices.IndicesService;
 import org.opensearch.plugin.olap.engine.VeloxExecutionEngine;
@@ -43,6 +46,8 @@ import org.opensearch.plugin.olap.execution.VeloxExecutor;
 import org.opensearch.plugin.olap.execution.VeloxLifecycleService;
 import org.opensearch.tasks.Task;
 import org.opensearch.threadpool.ThreadPool;
+import org.opensearch.transport.TransportException;
+import org.opensearch.transport.TransportResponseHandler;
 import org.opensearch.transport.TransportService;
 
 /**
@@ -449,8 +454,7 @@ public class TransportExecuteFragmentAction
         byte[][] partitions = new byte[partitionVectors.size()][];
         for (int p = 0; p < partitionVectors.size(); p++) {
           if (partitionVectors.get(p) != null) {
-            partitions[p] =
-                org.boostscale.velox4j.data.BaseVectors.serializeOneToBuf(partitionVectors.get(p));
+            partitions[p] = BaseVectors.serializeOneToBuf(partitionVectors.get(p));
           }
         }
 
@@ -617,10 +621,9 @@ public class TransportExecuteFragmentAction
         target,
         ShuffleDataAction.NAME,
         shuffleRequest,
-        new org.opensearch.transport.TransportResponseHandler<ShuffleDataResponse>() {
+        new TransportResponseHandler<ShuffleDataResponse>() {
           @Override
-          public ShuffleDataResponse read(org.opensearch.core.common.io.stream.StreamInput in)
-              throws java.io.IOException {
+          public ShuffleDataResponse read(StreamInput in) throws IOException {
             return new ShuffleDataResponse(in);
           }
 
@@ -630,7 +633,7 @@ public class TransportExecuteFragmentAction
           }
 
           @Override
-          public void handleException(org.opensearch.transport.TransportException exp) {
+          public void handleException(TransportException exp) {
             logger.error(
                 "Failed to send shuffle data to {}: {}", target.getName(), exp.getMessage());
           }

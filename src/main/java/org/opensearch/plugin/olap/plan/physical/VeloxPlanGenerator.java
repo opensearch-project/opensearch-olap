@@ -6,15 +6,21 @@ package org.opensearch.plugin.olap.plan.physical;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
+import org.apache.calcite.plan.volcano.RelSubset;
 import org.apache.calcite.rel.RelDistribution;
 import org.apache.calcite.rel.RelFieldCollation;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.core.AggregateCall;
+import org.apache.calcite.rel.core.JoinRelType;
 import org.apache.calcite.rel.core.TableScan;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rel.type.RelDataTypeField;
+import org.apache.calcite.rex.RexCall;
 import org.apache.calcite.rex.RexInputRef;
 import org.apache.calcite.rex.RexLiteral;
 import org.apache.calcite.rex.RexNode;
@@ -25,6 +31,7 @@ import org.apache.logging.log4j.Logger;
 import org.boostscale.velox4j.aggregate.Aggregate;
 import org.boostscale.velox4j.aggregate.AggregateStep;
 import org.boostscale.velox4j.connector.ExternalStreamTableHandle;
+import org.boostscale.velox4j.expression.CallTypedExpr;
 import org.boostscale.velox4j.expression.FieldAccessTypedExpr;
 import org.boostscale.velox4j.expression.TypedExpr;
 import org.boostscale.velox4j.join.JoinType;
@@ -37,6 +44,9 @@ import org.boostscale.velox4j.plan.PlanNode;
 import org.boostscale.velox4j.plan.ProjectNode;
 import org.boostscale.velox4j.plan.TableScanNode;
 import org.boostscale.velox4j.sort.SortOrder;
+import org.boostscale.velox4j.type.BigIntType;
+import org.boostscale.velox4j.type.DoubleType;
+import org.boostscale.velox4j.type.RealType;
 import org.boostscale.velox4j.type.RowType;
 import org.boostscale.velox4j.type.Type;
 import org.opensearch.plugin.olap.plan.convert.PlanIdGenerator;
@@ -63,8 +73,8 @@ public class VeloxPlanGenerator {
   private static final Logger logger = LogManager.getLogger(VeloxPlanGenerator.class);
   private static final String CONNECTOR_ID = "connector-external-stream";
 
-  private static final java.util.Set<String> METADATA_COLUMNS =
-      java.util.Set.of("_id", "_index", "_score", "_maxscore", "_sort", "_routing");
+  private static final Set<String> METADATA_COLUMNS =
+      Set.of("_id", "_index", "_score", "_maxscore", "_sort", "_routing");
 
   private final PlanIdGenerator idGen = new PlanIdGenerator();
   private final AtomicInteger fragmentId = new AtomicInteger(0);
@@ -125,8 +135,8 @@ public class VeloxPlanGenerator {
 
   private PlanNode toVeloxPlan(RelNode node) {
     // VolcanoPlanner wraps nodes in RelSubset — unwrap to get the actual physical node
-    if (node instanceof org.apache.calcite.plan.volcano.RelSubset) {
-      RelNode best = ((org.apache.calcite.plan.volcano.RelSubset) node).getBest();
+    if (node instanceof RelSubset) {
+      RelNode best = ((RelSubset) node).getBest();
       if (best != null) {
         return toVeloxPlan(best);
       }
@@ -244,8 +254,8 @@ public class VeloxPlanGenerator {
     // After VolcanoPlanner, inputs may be wrapped in RelSubset. Unwrap to find the
     // actual PhysicalExchange.
     RelNode rawInput = agg.getInput();
-    if (rawInput instanceof org.apache.calcite.plan.volcano.RelSubset) {
-      RelNode best = ((org.apache.calcite.plan.volcano.RelSubset) rawInput).getBest();
+    if (rawInput instanceof RelSubset) {
+      RelNode best = ((RelSubset) rawInput).getBest();
       if (best != null) rawInput = best;
     }
     if (agg.getStep() == PhysicalAggregate.Step.SINGLE && rawInput instanceof PhysicalExchange) {
@@ -338,8 +348,8 @@ public class VeloxPlanGenerator {
               orig.getCall().getFunctionName(),
               orig.getCall().getReturnType(),
               orig.getRawInputTypes());
-      org.boostscale.velox4j.expression.CallTypedExpr partialCall =
-          new org.boostscale.velox4j.expression.CallTypedExpr(
+      CallTypedExpr partialCall =
+          new CallTypedExpr(
               intermediateType, orig.getCall().getInputs(), orig.getCall().getFunctionName());
       partialAggs.add(
           new Aggregate(
@@ -383,8 +393,8 @@ public class VeloxPlanGenerator {
       String intermediateName = aggregateNames.get(i);
       TypedExpr intermediateRef =
           FieldAccessTypedExpr.create(orig.getCall().getReturnType(), intermediateName);
-      org.boostscale.velox4j.expression.CallTypedExpr finalCall =
-          new org.boostscale.velox4j.expression.CallTypedExpr(
+      CallTypedExpr finalCall =
+          new CallTypedExpr(
               orig.getCall().getReturnType(),
               List.of(intermediateRef),
               orig.getCall().getFunctionName());
@@ -417,22 +427,17 @@ public class VeloxPlanGenerator {
       String functionName, Type finalType, List<Type> rawInputTypes) {
     switch (functionName) {
       case "avg":
-        return new RowType(
-            List.of("sum", "count"),
-            List.of(
-                new org.boostscale.velox4j.type.DoubleType(),
-                new org.boostscale.velox4j.type.BigIntType()));
+        return new RowType(List.of("sum", "count"), List.of(new DoubleType(), new BigIntType()));
       case "count":
-        return new org.boostscale.velox4j.type.BigIntType();
+        return new BigIntType();
       case "sum":
         if (!rawInputTypes.isEmpty()) {
           Type inputType = rawInputTypes.get(0);
-          if (inputType instanceof org.boostscale.velox4j.type.RealType
-              || inputType instanceof org.boostscale.velox4j.type.DoubleType) {
-            return new org.boostscale.velox4j.type.DoubleType();
+          if (inputType instanceof RealType || inputType instanceof DoubleType) {
+            return new DoubleType();
           }
         }
-        return new org.boostscale.velox4j.type.BigIntType();
+        return new BigIntType();
       case "min":
       case "max":
         return finalType;
@@ -461,7 +466,7 @@ public class VeloxPlanGenerator {
     int leftFieldCount = leftRowType.getFieldCount();
 
     // Check for name conflicts and wrap right side in rename project if needed
-    java.util.Map<String, String> rightRenames = new java.util.LinkedHashMap<>();
+    Map<String, String> rightRenames = new LinkedHashMap<>();
     boolean hasConflict = false;
     for (int i = 0; i < rightRowType.getFieldCount(); i++) {
       String originalName = rightRowType.getFieldList().get(i).getName();
@@ -509,31 +514,100 @@ public class VeloxPlanGenerator {
   }
 
   private PlanNode convertSort(PhysicalSort sort) {
+    // Check for two-stage TopN split: Sort(with fetch) above an Exchange
+    RelNode rawInput = sort.getInput();
+    if (rawInput instanceof RelSubset) {
+      RelNode best = ((RelSubset) rawInput).getBest();
+      if (best != null) rawInput = best;
+    }
+    if (sort.fetch != null && rawInput instanceof PhysicalExchange) {
+      return convertTwoStageSort(sort, (PhysicalExchange) rawInput);
+    }
+
+    // Single-stage sort (no exchange below, or no limit)
     PlanNode source = toVeloxPlan(sort.getInput());
     if (source == null) {
       source = createExchangeScan(sort.getInput().getRowType());
     }
-    RelDataType inputRowType = sort.getInput().getRowType();
 
+    return buildSortNodes(source, sort.getInput().getRowType(), sort);
+  }
+
+  /**
+   * Split a Sort(with fetch) above an Exchange into two stages:
+   *
+   * <ul>
+   *   <li>Leaf fragment: scan → OrderByNode → LimitNode(0, offset+limit) — partial TopN per shard
+   *   <li>Coordinator fragment: ExchangeScan → OrderByNode → LimitNode(offset, limit) — final TopN
+   * </ul>
+   */
+  private PlanNode convertTwoStageSort(PhysicalSort sort, PhysicalExchange exchange) {
+    // 1. Convert the subtree below the exchange (scan + filter + project)
+    PlanNode scanPlan = toVeloxPlan(exchange.getInput());
+    RelDataType inputRowType = exchange.getInput().getRowType();
+
+    // 2. Build PARTIAL sort+limit on the leaf (data node)
+    long origOffset = sort.offset != null ? RexLiteral.intValue(sort.offset) : 0;
+    long origLimit = sort.fetch != null ? RexLiteral.intValue(sort.fetch) : Long.MAX_VALUE;
+    long partialLimit = origOffset + origLimit; // local top-K includes offset rows
+
+    PlanNode partialPlan = scanPlan;
     if (sort.getCollation() != null && !sort.getCollation().getFieldCollations().isEmpty()) {
-      String orderNodeId = idGen.next();
-      List<FieldAccessTypedExpr> sortingKeys = new ArrayList<>();
-      List<SortOrder> sortingOrders = new ArrayList<>();
+      partialPlan = buildOrderByNode(partialPlan, inputRowType, sort);
+    }
+    String partialLimitId = idGen.next() + "_partial_limit";
+    partialPlan =
+        new LimitNode(
+            partialLimitId, Collections.singletonList(partialPlan), 0, partialLimit, true);
 
-      for (RelFieldCollation fieldCollation : sort.getCollation().getFieldCollations()) {
-        int fieldIndex = fieldCollation.getFieldIndex();
-        RelDataTypeField field = inputRowType.getFieldList().get(fieldIndex);
-        Type veloxType = VeloxTypeConverter.toVeloxType(field.getType());
-        sortingKeys.add(FieldAccessTypedExpr.create(veloxType, field.getName()));
+    // 3. Create the leaf fragment with partial sort+limit
+    String sourceIndex = extractSourceIndex(exchange.getInput());
+    int leafFragId = fragmentId.getAndIncrement();
+    fragments.add(
+        new PlanFragment(
+            leafFragId,
+            partialPlan,
+            FragmentProperties.source(sourceIndex),
+            Collections.emptyList()));
 
-        boolean ascending = !fieldCollation.getDirection().isDescending();
-        boolean nullsFirst = fieldCollation.nullDirection == RelFieldCollation.NullDirection.FIRST;
-        sortingOrders.add(new SortOrder(ascending, nullsFirst));
-      }
+    // 4. Build FINAL sort+limit on the coordinator (with empty sources — wired during execution)
+    PlanNode finalPlan = createExchangeScan(inputRowType);
+    if (sort.getCollation() != null && !sort.getCollation().getFieldCollations().isEmpty()) {
+      finalPlan = buildOrderByNode(finalPlan, inputRowType, sort);
+    }
+    String finalLimitId = idGen.next() + "_final_limit";
+    finalPlan =
+        new LimitNode(
+            finalLimitId, Collections.singletonList(finalPlan), origOffset, origLimit, false);
 
-      source =
-          new OrderByNode(
-              orderNodeId, Collections.singletonList(source), sortingKeys, sortingOrders, false);
+    return finalPlan;
+  }
+
+  /** Build OrderByNode from a PhysicalSort's collation. */
+  private PlanNode buildOrderByNode(PlanNode source, RelDataType inputRowType, PhysicalSort sort) {
+    String orderNodeId = idGen.next();
+    List<FieldAccessTypedExpr> sortingKeys = new ArrayList<>();
+    List<SortOrder> sortingOrders = new ArrayList<>();
+
+    for (RelFieldCollation fieldCollation : sort.getCollation().getFieldCollations()) {
+      int fieldIndex = fieldCollation.getFieldIndex();
+      RelDataTypeField field = inputRowType.getFieldList().get(fieldIndex);
+      Type veloxType = VeloxTypeConverter.toVeloxType(field.getType());
+      sortingKeys.add(FieldAccessTypedExpr.create(veloxType, field.getName()));
+
+      boolean ascending = !fieldCollation.getDirection().isDescending();
+      boolean nullsFirst = fieldCollation.nullDirection == RelFieldCollation.NullDirection.FIRST;
+      sortingOrders.add(new SortOrder(ascending, nullsFirst));
+    }
+
+    return new OrderByNode(
+        orderNodeId, Collections.singletonList(source), sortingKeys, sortingOrders, false);
+  }
+
+  /** Build sort + limit nodes for single-stage execution. */
+  private PlanNode buildSortNodes(PlanNode source, RelDataType inputRowType, PhysicalSort sort) {
+    if (sort.getCollation() != null && !sort.getCollation().getFieldCollations().isEmpty()) {
+      source = buildOrderByNode(source, inputRowType, sort);
     }
 
     if (sort.fetch != null || sort.offset != null) {
@@ -568,15 +642,15 @@ public class VeloxPlanGenerator {
       RexNode condition,
       RelDataType leftRowType,
       RelDataType rightRowType,
-      java.util.Map<String, String> rightRenames,
+      Map<String, String> rightRenames,
       boolean hasConflict,
       List<FieldAccessTypedExpr> leftKeys,
       List<FieldAccessTypedExpr> rightKeys) {
     if (condition == null) return;
     int leftFieldCount = leftRowType.getFieldCount();
 
-    if (condition instanceof org.apache.calcite.rex.RexCall) {
-      org.apache.calcite.rex.RexCall call = (org.apache.calcite.rex.RexCall) condition;
+    if (condition instanceof RexCall) {
+      RexCall call = (RexCall) condition;
 
       if (call.getKind() == SqlKind.EQUALS) {
         RexNode op0 = call.getOperands().get(0);
@@ -621,7 +695,7 @@ public class VeloxPlanGenerator {
     }
   }
 
-  private JoinType convertJoinType(org.apache.calcite.rel.core.JoinRelType calciteType) {
+  private JoinType convertJoinType(JoinRelType calciteType) {
     switch (calciteType) {
       case INNER:
         return JoinType.INNER;

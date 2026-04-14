@@ -6,6 +6,7 @@ package org.opensearch.plugin.olap.execution;
 
 import java.io.ByteArrayOutputStream;
 import java.nio.channels.Channels;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import org.apache.arrow.memory.BufferAllocator;
@@ -110,7 +111,7 @@ public class VeloxExecutor {
     serialTask.noMoreSplits(scanNodeId);
 
     CloseableIterator<RowVector> resultIterator = UpIterators.asJavaIterator(serialTask);
-    List<byte[]> results = new java.util.ArrayList<>();
+    List<byte[]> results = new ArrayList<>();
 
     try {
       while (resultIterator.hasNext()) {
@@ -195,7 +196,7 @@ public class VeloxExecutor {
     serialTask.noMoreSplits(rightScanNodeId);
 
     CloseableIterator<RowVector> resultIterator = UpIterators.asJavaIterator(serialTask);
-    List<byte[]> results = new java.util.ArrayList<>();
+    List<byte[]> results = new ArrayList<>();
 
     try {
       while (resultIterator.hasNext()) {
@@ -296,13 +297,13 @@ public class VeloxExecutor {
    * Find all TableScanNode IDs in the plan tree, ordered left-to-right (depth-first). For join
    * plans, returns [leftScanId, rightScanId].
    */
-  public java.util.List<String> findAllTableScanNodeIds(PlanNode node) {
-    java.util.List<String> ids = new java.util.ArrayList<>();
+  public List<String> findAllTableScanNodeIds(PlanNode node) {
+    List<String> ids = new ArrayList<>();
     collectTableScanNodeIds(node, ids);
     return ids;
   }
 
-  private void collectTableScanNodeIds(PlanNode node, java.util.List<String> ids) {
+  private void collectTableScanNodeIds(PlanNode node, List<String> ids) {
     if (node instanceof TableScanNode) {
       ids.add(node.getId());
       return;
