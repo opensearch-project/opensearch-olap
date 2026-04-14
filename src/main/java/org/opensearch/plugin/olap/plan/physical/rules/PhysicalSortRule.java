@@ -5,6 +5,7 @@
 package org.opensearch.plugin.olap.plan.physical.rules;
 
 import org.apache.calcite.plan.Convention;
+import org.apache.calcite.rel.RelDistributions;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.convert.ConverterRule;
 import org.apache.calcite.rel.core.Sort;
@@ -12,8 +13,13 @@ import org.opensearch.plugin.olap.plan.physical.PhysicalConvention;
 import org.opensearch.plugin.olap.plan.physical.PhysicalSort;
 
 /**
- * Converts Sort -> PhysicalSort. Requests SINGLETON from input because global sorting requires all
- * data at one node.
+ * Converts Sort -> PhysicalSort. When the sort has a LIMIT (fetch), declares SINGLETON distribution
+ * so Convention.enforce() auto-inserts PhysicalExchange between scan (RANDOM) and sort (SINGLETON).
+ * This enables VeloxPlanGenerator to split into two-stage TopN (partial sort+limit on data nodes,
+ * final sort+limit on coordinator).
+ *
+ * <p>When the sort sits above an aggregate or join that already produced SINGLETON, enforce() is a
+ * no-op (SINGLETON satisfies SINGLETON).
  */
 public class PhysicalSortRule extends ConverterRule {
 
@@ -33,12 +39,12 @@ public class PhysicalSortRule extends ConverterRule {
     RelNode input =
         convert(
             sort.getInput(), sort.getInput().getTraitSet().replace(PhysicalConvention.INSTANCE));
-    // Do NOT insert exchange here. Sort/Limit is always the outermost operator,
-    // applied on the coordinator after aggregation/join which already inserted
-    // their own exchanges. Adding another exchange would create double fragmentation.
+    // Declare SINGLETON distribution. Convention.enforce() inserts PhysicalExchange when the
+    // child's distribution (e.g. RANDOM from scan) doesn't satisfy SINGLETON. When the child
+    // already produces SINGLETON (e.g. from aggregation/join), no exchange is added.
     return new PhysicalSort(
         rel.getCluster(),
-        rel.getTraitSet().replace(PhysicalConvention.INSTANCE),
+        rel.getTraitSet().replace(PhysicalConvention.INSTANCE).replace(RelDistributions.SINGLETON),
         input,
         sort.getCollation(),
         sort.offset,

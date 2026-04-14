@@ -5,7 +5,9 @@
 package org.opensearch.plugin.olap.engine;
 
 import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.nio.channels.Channels;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -14,39 +16,72 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.stream.Collectors;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowStreamReader;
+import org.apache.arrow.vector.ipc.ArrowStreamWriter;
+import org.apache.arrow.vector.types.FloatingPointPrecision;
+import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
+import org.apache.arrow.vector.types.pojo.Schema;
+import org.apache.arrow.vector.util.Text;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rel.type.RelDataTypeField;
 import org.apache.calcite.sql.type.SqlTypeName;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.boostscale.velox4j.aggregate.Aggregate;
+import org.boostscale.velox4j.arrow.Arrow;
 import org.boostscale.velox4j.config.Config;
 import org.boostscale.velox4j.config.ConnectorConfig;
 import org.boostscale.velox4j.connector.ExternalStreamConnectorSplit;
 import org.boostscale.velox4j.connector.ExternalStreamTableHandle;
 import org.boostscale.velox4j.connector.ExternalStreams.BlockingQueue;
 import org.boostscale.velox4j.data.BaseVector;
+import org.boostscale.velox4j.data.BaseVectors;
 import org.boostscale.velox4j.data.RowVector;
+import org.boostscale.velox4j.expression.CallTypedExpr;
+import org.boostscale.velox4j.expression.FieldAccessTypedExpr;
+import org.boostscale.velox4j.expression.TypedExpr;
 import org.boostscale.velox4j.iterator.CloseableIterator;
 import org.boostscale.velox4j.iterator.UpIterators;
 import org.boostscale.velox4j.join.JoinType;
+import org.boostscale.velox4j.plan.AggregationNode;
+import org.boostscale.velox4j.plan.FilterNode;
 import org.boostscale.velox4j.plan.HashJoinNode;
+import org.boostscale.velox4j.plan.LimitNode;
 import org.boostscale.velox4j.plan.PlanNode;
+import org.boostscale.velox4j.plan.ProjectNode;
 import org.boostscale.velox4j.plan.TableScanNode;
 import org.boostscale.velox4j.query.Query;
 import org.boostscale.velox4j.query.SerialTask;
 import org.boostscale.velox4j.session.Session;
+import org.boostscale.velox4j.type.BigIntType;
+import org.boostscale.velox4j.type.BooleanType;
+import org.boostscale.velox4j.type.DoubleType;
+import org.boostscale.velox4j.type.IntegerType;
+import org.boostscale.velox4j.type.RealType;
 import org.boostscale.velox4j.type.RowType;
 import org.boostscale.velox4j.type.Type;
+import org.boostscale.velox4j.type.VarCharType;
+import org.boostscale.velox4j.type.VarbinaryType;
+import org.opensearch.common.util.concurrent.FutureUtils;
 import org.opensearch.plugin.olap.common.QueryId;
+import org.opensearch.plugin.olap.execution.VeloxExecutor;
 import org.opensearch.plugin.olap.execution.VeloxLifecycleService;
 import org.opensearch.plugin.olap.plan.fragment.FragmentProperties;
 import org.opensearch.plugin.olap.plan.fragment.PlanFragment;
+import org.opensearch.plugin.olap.plan.physical.PhysicalOptimizer;
+import org.opensearch.plugin.olap.plan.physical.VeloxPlanGenerator;
 import org.opensearch.plugin.olap.scheduler.CostEstimator;
 import org.opensearch.plugin.olap.scheduler.ExecutionPolicy;
 import org.opensearch.plugin.olap.scheduler.JoinStrategy;
@@ -101,14 +136,11 @@ public class VeloxExecutionEngine {
 
     try {
       // Physical optimization: VolcanoPlanner with PhysicalConvention
-      org.opensearch.plugin.olap.plan.physical.PhysicalOptimizer optimizer =
-          new org.opensearch.plugin.olap.plan.physical.PhysicalOptimizer(
-              veloxLifecycle.isMppEnabled());
+      PhysicalOptimizer optimizer = new PhysicalOptimizer(veloxLifecycle.isMppEnabled());
       RelNode physicalPlan = optimizer.optimize(relNode);
 
       // Generate Velox PlanNodes + PlanFragments from the physical plan
-      org.opensearch.plugin.olap.plan.physical.VeloxPlanGenerator generator =
-          new org.opensearch.plugin.olap.plan.physical.VeloxPlanGenerator();
+      VeloxPlanGenerator generator = new VeloxPlanGenerator();
       List<PlanFragment> fragments = generator.generate(physicalPlan);
 
       return executeFragments(relNode, fragments, queryId);
@@ -134,7 +166,7 @@ public class VeloxExecutionEngine {
 
     // Collect leaf fragments (SOURCE or shuffle scan)
     List<PlanFragment> leafFragments =
-        fragments.stream().filter(f -> f.isLeaf()).collect(java.util.stream.Collectors.toList());
+        fragments.stream().filter(f -> f.isLeaf()).collect(Collectors.toList());
 
     // MPP join strategy selection: when mpp_enabled=true and this is a multi-table join,
     // CostEstimator decides between BROADCAST and HASH_SHUFFLE.
@@ -471,8 +503,7 @@ public class VeloxExecutionEngine {
 
     // The coordinator plan already has exchange scan placeholders from VeloxPlanGenerator.
     // Find their IDs so we can wire splits to the correct scan nodes.
-    org.opensearch.plugin.olap.execution.VeloxExecutor tempExecutor =
-        new org.opensearch.plugin.olap.execution.VeloxExecutor(session);
+    VeloxExecutor tempExecutor = new VeloxExecutor(session);
     List<String> scanIds = tempExecutor.findAllTableScanNodeIds(coordinatorFragment.getPlanRoot());
 
     if (scanIds.size() < 2) {
@@ -618,13 +649,11 @@ public class VeloxExecutionEngine {
   /** Wire a single source into a plan with empty sources (for FINAL agg). */
   private PlanNode wireSourceIntoPlan(
       PlanNode node, TableScanNode source, RowType intermediateRowType) {
-    if (node instanceof org.boostscale.velox4j.plan.AggregationNode) {
-      org.boostscale.velox4j.plan.AggregationNode agg =
-          (org.boostscale.velox4j.plan.AggregationNode) node;
+    if (node instanceof AggregationNode) {
+      AggregationNode agg = (AggregationNode) node;
       if (agg.getSources().isEmpty()) {
-        List<org.boostscale.velox4j.aggregate.Aggregate> fixedAggregates =
-            fixFinalAggregateTypes(agg, intermediateRowType);
-        return new org.boostscale.velox4j.plan.AggregationNode(
+        List<Aggregate> fixedAggregates = fixFinalAggregateTypes(agg, intermediateRowType);
+        return new AggregationNode(
             agg.getId(),
             agg.getStep(),
             agg.getGroupingKeys(),
@@ -655,29 +684,27 @@ public class VeloxExecutionEngine {
     return node;
   }
 
-  private List<org.boostscale.velox4j.aggregate.Aggregate> fixFinalAggregateTypes(
-      org.boostscale.velox4j.plan.AggregationNode agg, RowType intermediateRowType) {
+  private List<Aggregate> fixFinalAggregateTypes(AggregationNode agg, RowType intermediateRowType) {
     int groupKeyCount = agg.getGroupingKeys().size();
-    List<org.boostscale.velox4j.aggregate.Aggregate> origAggs = agg.getAggregates();
+    List<Aggregate> origAggs = agg.getAggregates();
     List<String> aggNames = agg.getAggregateNames();
-    List<org.boostscale.velox4j.aggregate.Aggregate> fixed = new ArrayList<>(origAggs.size());
+    List<Aggregate> fixed = new ArrayList<>(origAggs.size());
 
     for (int i = 0; i < origAggs.size(); i++) {
-      org.boostscale.velox4j.aggregate.Aggregate orig = origAggs.get(i);
+      Aggregate orig = origAggs.get(i);
       Type intermediateColType = intermediateRowType.getChildren().get(groupKeyCount + i);
       String intermediateName = aggNames.get(i);
 
-      org.boostscale.velox4j.expression.TypedExpr intermediateRef =
-          org.boostscale.velox4j.expression.FieldAccessTypedExpr.create(
-              intermediateColType, intermediateName);
-      org.boostscale.velox4j.expression.CallTypedExpr fixedCall =
-          new org.boostscale.velox4j.expression.CallTypedExpr(
+      TypedExpr intermediateRef =
+          FieldAccessTypedExpr.create(intermediateColType, intermediateName);
+      CallTypedExpr fixedCall =
+          new CallTypedExpr(
               orig.getCall().getReturnType(),
               List.of(intermediateRef),
               orig.getCall().getFunctionName());
 
       fixed.add(
-          new org.boostscale.velox4j.aggregate.Aggregate(
+          new Aggregate(
               fixedCall,
               orig.getRawInputTypes(),
               orig.getMask(),
@@ -700,7 +727,7 @@ public class VeloxExecutionEngine {
       while (reader.loadNextBatch()) {
         VectorSchemaRoot root = reader.getVectorSchemaRoot();
         RowVector rv = session.arrowOps().fromArrowVectorSchemaRoot(allocator, root);
-        nativeBatches.add(org.boostscale.velox4j.data.BaseVectors.serializeOneToBuf(rv));
+        nativeBatches.add(BaseVectors.serializeOneToBuf(rv));
       }
     } catch (Exception e) {
       logger.warn("Cannot convert Arrow IPC to native: {}", e.getMessage());
@@ -765,30 +792,27 @@ public class VeloxExecutionEngine {
 
   private byte[] collectResultsWithTimeout(
       Session session, SerialTask serialTask, BufferAllocator allocator, int timeoutSeconds) {
-    java.util.concurrent.ExecutorService executor =
-        java.util.concurrent.Executors.newSingleThreadExecutor(
+    ExecutorService executor =
+        Executors.newSingleThreadExecutor(
             r -> {
               Thread t = new Thread(r, "olap-coordinator-collector");
               t.setDaemon(true);
               return t;
             });
-    java.util.concurrent.Future<byte[]> resultFuture =
+    Future<byte[]> resultFuture =
         executor.submit(
             () -> {
-              java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
-              org.apache.arrow.vector.ipc.ArrowStreamWriter writer = null;
+              ByteArrayOutputStream baos = new ByteArrayOutputStream();
+              ArrowStreamWriter writer = null;
               boolean hasData = false;
               CloseableIterator<RowVector> iter = UpIterators.asJavaIterator(serialTask);
               try {
                 while (iter.hasNext()) {
                   RowVector batch = iter.next();
                   if (batch == null) break;
-                  VectorSchemaRoot arrowRoot =
-                      org.boostscale.velox4j.arrow.Arrow.toArrowVectorSchemaRoot(allocator, batch);
+                  VectorSchemaRoot arrowRoot = Arrow.toArrowVectorSchemaRoot(allocator, batch);
                   if (writer == null) {
-                    writer =
-                        new org.apache.arrow.vector.ipc.ArrowStreamWriter(
-                            arrowRoot, null, java.nio.channels.Channels.newChannel(baos));
+                    writer = new ArrowStreamWriter(arrowRoot, null, Channels.newChannel(baos));
                     writer.start();
                   }
                   writer.writeBatch();
@@ -807,9 +831,9 @@ public class VeloxExecutionEngine {
             });
 
     try {
-      return resultFuture.get(timeoutSeconds, java.util.concurrent.TimeUnit.SECONDS);
-    } catch (java.util.concurrent.TimeoutException e) {
-      org.opensearch.common.util.concurrent.FutureUtils.cancel(resultFuture);
+      return resultFuture.get(timeoutSeconds, TimeUnit.SECONDS);
+    } catch (TimeoutException e) {
+      FutureUtils.cancel(resultFuture);
       throw new RuntimeException("Execution timed out after " + timeoutSeconds + "s");
     } catch (Exception e) {
       throw new RuntimeException("Execution failed", e);
@@ -828,21 +852,18 @@ public class VeloxExecutionEngine {
   }
 
   private PlanNode reconstructNode(PlanNode node, List<PlanNode> newSources) {
-    if (node instanceof org.boostscale.velox4j.plan.ProjectNode) {
-      org.boostscale.velox4j.plan.ProjectNode p = (org.boostscale.velox4j.plan.ProjectNode) node;
-      return new org.boostscale.velox4j.plan.ProjectNode(
-          p.getId(), newSources, p.getNames(), p.getProjections());
-    } else if (node instanceof org.boostscale.velox4j.plan.LimitNode) {
-      org.boostscale.velox4j.plan.LimitNode l = (org.boostscale.velox4j.plan.LimitNode) node;
-      return new org.boostscale.velox4j.plan.LimitNode(
-          l.getId(), newSources, l.getOffset(), l.getCount(), l.isPartial());
-    } else if (node instanceof org.boostscale.velox4j.plan.FilterNode) {
-      org.boostscale.velox4j.plan.FilterNode f = (org.boostscale.velox4j.plan.FilterNode) node;
-      return new org.boostscale.velox4j.plan.FilterNode(f.getId(), newSources, f.getFilter());
-    } else if (node instanceof org.boostscale.velox4j.plan.AggregationNode) {
-      org.boostscale.velox4j.plan.AggregationNode a =
-          (org.boostscale.velox4j.plan.AggregationNode) node;
-      return new org.boostscale.velox4j.plan.AggregationNode(
+    if (node instanceof ProjectNode) {
+      ProjectNode p = (ProjectNode) node;
+      return new ProjectNode(p.getId(), newSources, p.getNames(), p.getProjections());
+    } else if (node instanceof LimitNode) {
+      LimitNode l = (LimitNode) node;
+      return new LimitNode(l.getId(), newSources, l.getOffset(), l.getCount(), l.isPartial());
+    } else if (node instanceof FilterNode) {
+      FilterNode f = (FilterNode) node;
+      return new FilterNode(f.getId(), newSources, f.getFilter());
+    } else if (node instanceof AggregationNode) {
+      AggregationNode a = (AggregationNode) node;
+      return new AggregationNode(
           a.getId(),
           a.getStep(),
           a.getGroupingKeys(),
@@ -889,7 +910,7 @@ public class VeloxExecutionEngine {
       if (joinNode == null) return null;
 
       // buildScanIndex=0 means build is left, so build keys = leftKeys
-      List<org.boostscale.velox4j.expression.FieldAccessTypedExpr> buildKeys =
+      List<FieldAccessTypedExpr> buildKeys =
           (buildScanIndex == 0) ? joinNode.getLeftKeys() : joinNode.getRightKeys();
       if (buildKeys.isEmpty()) return null;
 
@@ -916,9 +937,8 @@ public class VeloxExecutionEngine {
         // For now, use Arrow round-trip to read column values
         BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE);
         try {
-          VectorSchemaRoot arrowRoot =
-              org.boostscale.velox4j.arrow.Arrow.toArrowVectorSchemaRoot(allocator, rowVec);
-          org.apache.arrow.vector.FieldVector fieldVec = arrowRoot.getVector(keyColIndex);
+          VectorSchemaRoot arrowRoot = Arrow.toArrowVectorSchemaRoot(allocator, rowVec);
+          FieldVector fieldVec = arrowRoot.getVector(keyColIndex);
           for (int row = 0; row < arrowRoot.getRowCount(); row++) {
             Object val = fieldVec.getObject(row);
             if (val != null) {
@@ -966,7 +986,7 @@ public class VeloxExecutionEngine {
 
     // If build is at index 0 (left), probe is right → probe keys = rightKeys
     // If build is at index 1 (right), probe is left → probe keys = leftKeys
-    List<org.boostscale.velox4j.expression.FieldAccessTypedExpr> probeKeys =
+    List<FieldAccessTypedExpr> probeKeys =
         (buildScanIndex == 0) ? joinNode.getRightKeys() : joinNode.getLeftKeys();
     if (probeKeys.isEmpty()) return null;
     return probeKeys.get(0).getFieldName();
@@ -976,7 +996,7 @@ public class VeloxExecutionEngine {
   private String extractProbeJoinKeyType(RelNode relNode, String fieldName) {
     if (fieldName == null) return null;
     // Walk the RelNode tree to find the field's SQL type
-    for (org.apache.calcite.rel.type.RelDataTypeField field : relNode.getRowType().getFieldList()) {
+    for (RelDataTypeField field : relNode.getRowType().getFieldList()) {
       if (field.getName().equals(fieldName)) {
         switch (field.getType().getSqlTypeName()) {
           case INTEGER:
@@ -1038,7 +1058,7 @@ public class VeloxExecutionEngine {
 
   // ---- Arrow/Type Helpers ----
 
-  private RowType arrowSchemaToVeloxRowType(org.apache.arrow.vector.types.pojo.Schema schema) {
+  private RowType arrowSchemaToVeloxRowType(Schema schema) {
     List<String> names = new ArrayList<>();
     List<Type> types = new ArrayList<>();
     for (Field field : schema.getFields()) {
@@ -1049,25 +1069,24 @@ public class VeloxExecutionEngine {
   }
 
   private Type arrowTypeToVeloxType(Field field) {
-    org.apache.arrow.vector.types.pojo.ArrowType arrowType = field.getType();
-    if (arrowType instanceof org.apache.arrow.vector.types.pojo.ArrowType.Bool) {
-      return new org.boostscale.velox4j.type.BooleanType();
-    } else if (arrowType instanceof org.apache.arrow.vector.types.pojo.ArrowType.Int) {
-      int bitWidth = ((org.apache.arrow.vector.types.pojo.ArrowType.Int) arrowType).getBitWidth();
-      if (bitWidth <= 32) return new org.boostscale.velox4j.type.IntegerType();
-      return new org.boostscale.velox4j.type.BigIntType();
-    } else if (arrowType instanceof org.apache.arrow.vector.types.pojo.ArrowType.FloatingPoint) {
-      var precision =
-          ((org.apache.arrow.vector.types.pojo.ArrowType.FloatingPoint) arrowType).getPrecision();
-      if (precision == org.apache.arrow.vector.types.FloatingPointPrecision.SINGLE) {
-        return new org.boostscale.velox4j.type.RealType();
+    ArrowType arrowType = field.getType();
+    if (arrowType instanceof ArrowType.Bool) {
+      return new BooleanType();
+    } else if (arrowType instanceof ArrowType.Int) {
+      int bitWidth = ((ArrowType.Int) arrowType).getBitWidth();
+      if (bitWidth <= 32) return new IntegerType();
+      return new BigIntType();
+    } else if (arrowType instanceof ArrowType.FloatingPoint) {
+      var precision = ((ArrowType.FloatingPoint) arrowType).getPrecision();
+      if (precision == FloatingPointPrecision.SINGLE) {
+        return new RealType();
       }
-      return new org.boostscale.velox4j.type.DoubleType();
-    } else if (arrowType instanceof org.apache.arrow.vector.types.pojo.ArrowType.Utf8) {
-      return new org.boostscale.velox4j.type.VarCharType();
-    } else if (arrowType instanceof org.apache.arrow.vector.types.pojo.ArrowType.Binary) {
-      return new org.boostscale.velox4j.type.VarbinaryType();
-    } else if (arrowType instanceof org.apache.arrow.vector.types.pojo.ArrowType.Struct) {
+      return new DoubleType();
+    } else if (arrowType instanceof ArrowType.Utf8) {
+      return new VarCharType();
+    } else if (arrowType instanceof ArrowType.Binary) {
+      return new VarbinaryType();
+    } else if (arrowType instanceof ArrowType.Struct) {
       List<String> childNames = new ArrayList<>();
       List<Type> childTypes = new ArrayList<>();
       for (Field child : field.getChildren()) {
@@ -1076,7 +1095,7 @@ public class VeloxExecutionEngine {
       }
       return new RowType(childNames, childTypes);
     }
-    return new org.boostscale.velox4j.type.VarbinaryType();
+    return new VarbinaryType();
   }
 
   // ---- SQL Plugin Response Building ----
@@ -1120,7 +1139,7 @@ public class VeloxExecutionEngine {
           for (int col = 0; col < fields.size(); col++) {
             String name = fields.get(col).getName();
             Object value = root.getVector(col).getObject(row);
-            if (value instanceof org.apache.arrow.vector.util.Text) {
+            if (value instanceof Text) {
               value = value.toString();
             }
             tupleValues.put(name, value);

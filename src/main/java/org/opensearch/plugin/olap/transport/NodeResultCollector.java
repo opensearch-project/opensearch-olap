@@ -30,6 +30,7 @@ import org.opensearch.plugin.olap.scheduler.ErrorClassifier.ErrorCategory;
 import org.opensearch.plugin.olap.scheduler.QueryExecution;
 import org.opensearch.plugin.olap.scheduler.QueryScheduler;
 import org.opensearch.plugin.olap.scheduler.ShardRouter;
+import org.opensearch.plugin.olap.scheduler.Stage;
 import org.opensearch.plugin.olap.scheduler.TaskDescriptor;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.TransportException;
@@ -68,7 +69,7 @@ public class NodeResultCollector {
 
   /** Dispatch tasks for specific stages and collect results. */
   public List<ExecuteFragmentResponse> dispatchAndCollect(
-      QueryExecution execution, List<org.opensearch.plugin.olap.scheduler.Stage> stages) {
+      QueryExecution execution, List<Stage> stages) {
     QueryId queryId = execution.getQueryId();
     List<TaskDescriptor> allTasks = new ArrayList<>();
     for (var stage : stages) {
@@ -80,9 +81,7 @@ public class NodeResultCollector {
 
   /** Dispatch broadcast join tasks: each task receives the broadcast data along with the plan. */
   public List<ExecuteFragmentResponse> dispatchAndCollectBroadcast(
-      QueryExecution execution,
-      List<org.opensearch.plugin.olap.scheduler.Stage> stages,
-      List<byte[]> broadcastData) {
+      QueryExecution execution, List<Stage> stages, List<byte[]> broadcastData) {
     return dispatchAndCollectBroadcast(execution, stages, broadcastData, 1);
   }
 
@@ -93,7 +92,7 @@ public class NodeResultCollector {
    */
   public List<ExecuteFragmentResponse> dispatchAndCollectBroadcast(
       QueryExecution execution,
-      List<org.opensearch.plugin.olap.scheduler.Stage> stages,
+      List<Stage> stages,
       List<byte[]> broadcastData,
       int buildScanIndex) {
     return dispatchAndCollectBroadcast(
@@ -109,7 +108,7 @@ public class NodeResultCollector {
    */
   public List<ExecuteFragmentResponse> dispatchAndCollectBroadcast(
       QueryExecution execution,
-      List<org.opensearch.plugin.olap.scheduler.Stage> stages,
+      List<Stage> stages,
       List<byte[]> broadcastData,
       int buildScanIndex,
       String rfFieldName,
@@ -139,10 +138,7 @@ public class NodeResultCollector {
    * and where to send data.
    */
   public List<ExecuteFragmentResponse> dispatchAndCollectShuffle(
-      QueryExecution execution,
-      List<org.opensearch.plugin.olap.scheduler.Stage> stages,
-      List<String> workerNodeIds,
-      int targetStageId) {
+      QueryExecution execution, List<Stage> stages, List<String> workerNodeIds, int targetStageId) {
     QueryId queryId = execution.getQueryId();
     List<TaskDescriptor> allTasks = new ArrayList<>();
     for (var stage : stages) {
@@ -170,7 +166,7 @@ public class NodeResultCollector {
   /** Dispatch shuffle join tasks: each task reads from ShuffleManager buffer. */
   public List<ExecuteFragmentResponse> dispatchAndCollectShuffleJoin(
       QueryExecution execution,
-      List<org.opensearch.plugin.olap.scheduler.Stage> stages,
+      List<Stage> stages,
       String shuffleQueryId,
       int shuffleStageId,
       int expectedLeftSenders,

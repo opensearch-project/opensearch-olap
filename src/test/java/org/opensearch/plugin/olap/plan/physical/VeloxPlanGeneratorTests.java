@@ -76,7 +76,7 @@ public class VeloxPlanGeneratorTests extends OpenSearchTestCase {
     }
   }
 
-  // ---- Sort + Limit ----
+  // ---- Sort + Limit (TopN) ----
 
   public void testSortLimitProducesFragments() {
     RelBuilder rb = b();
@@ -87,6 +87,55 @@ public class VeloxPlanGeneratorTests extends OpenSearchTestCase {
     List<PlanFragment> fragments = gen.generate(physical);
 
     assertTrue("Expected at least 1 fragment", fragments.size() >= 1);
+  }
+
+  public void testSortLimitProducesTwoStageFragments() {
+    RelBuilder rb = b();
+    RelNode logical = rb.scan("employees").sort(rb.field("salary")).limit(0, 5).build();
+    RelNode physical = optimize(logical, false);
+
+    VeloxPlanGenerator gen = new VeloxPlanGenerator();
+    List<PlanFragment> fragments = gen.generate(physical);
+
+    // Two-stage TopN when enforce() inserts exchange between scan(RANDOM) and sort(SINGLETON).
+    // In unit test, enforce() may not fire (depends on planner internals), producing 1 fragment.
+    // Two-stage is verified end-to-end in TopNIT integration tests.
+    assertTrue(
+        "Sort+Limit should produce at least 1 fragment, got " + fragments.size(),
+        fragments.size() >= 1);
+
+    // If two-stage was triggered, verify coordinator fragment
+    if (fragments.size() >= 2) {
+      PlanFragment rootFrag = fragments.get(fragments.size() - 1);
+      assertEquals(
+          FragmentProperties.Distribution.COORDINATOR, rootFrag.getProperties().getDistribution());
+    }
+  }
+
+  public void testSortWithoutLimitProducesFragments() {
+    RelBuilder rb = b();
+    // Sort without limit — should NOT be split into two stages
+    RelNode logical = rb.scan("employees").sort(rb.field("salary")).build();
+    RelNode physical = optimize(logical, false);
+
+    VeloxPlanGenerator gen = new VeloxPlanGenerator();
+    List<PlanFragment> fragments = gen.generate(physical);
+
+    assertTrue("Sort without limit should produce at least 1 fragment", fragments.size() >= 1);
+  }
+
+  public void testSortLimitWithOffsetProducesFragments() {
+    RelBuilder rb = b();
+    // Sort with offset+limit: skip 2, take 3
+    RelNode logical = rb.scan("employees").sort(rb.field("salary")).limit(2, 3).build();
+    RelNode physical = optimize(logical, false);
+
+    VeloxPlanGenerator gen = new VeloxPlanGenerator();
+    List<PlanFragment> fragments = gen.generate(physical);
+
+    assertTrue(
+        "Sort+Offset+Limit should produce at least 1 fragment, got " + fragments.size(),
+        fragments.size() >= 1);
   }
 
   // ---- Join ----

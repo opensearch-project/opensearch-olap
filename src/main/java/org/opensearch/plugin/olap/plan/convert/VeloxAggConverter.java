@@ -8,6 +8,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import org.apache.calcite.rel.core.AggregateCall;
 import org.apache.calcite.rel.type.RelDataType;
@@ -69,7 +70,7 @@ public class VeloxAggConverter {
     if (mapped != null) {
       return mapped;
     }
-    return aggCall.getAggregation().getName().toLowerCase(java.util.Locale.ROOT);
+    return aggCall.getAggregation().getName().toLowerCase(Locale.ROOT);
   }
 
   private List<TypedExpr> convertArgs(AggregateCall aggCall) {

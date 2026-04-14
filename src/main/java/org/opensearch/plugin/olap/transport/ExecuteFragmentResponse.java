@@ -5,6 +5,8 @@
 package org.opensearch.plugin.olap.transport;
 
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
 import org.opensearch.core.action.ActionResponse;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
@@ -30,7 +32,7 @@ public class ExecuteFragmentResponse extends ActionResponse implements ToXConten
   private byte[] resultData;
 
   /** Velox native serialized partial results (preserves intermediate accumulator state). */
-  private java.util.List<byte[]> nativeResultBatches;
+  private List<byte[]> nativeResultBatches;
 
   private String errorMessage;
 
@@ -48,7 +50,7 @@ public class ExecuteFragmentResponse extends ActionResponse implements ToXConten
     // Read native result batches
     int nativeBatchCount = in.readVInt();
     if (nativeBatchCount > 0) {
-      this.nativeResultBatches = new java.util.ArrayList<>(nativeBatchCount);
+      this.nativeResultBatches = new ArrayList<>(nativeBatchCount);
       for (int i = 0; i < nativeBatchCount; i++) {
         this.nativeResultBatches.add(in.readByteArray());
       }
@@ -66,8 +68,7 @@ public class ExecuteFragmentResponse extends ActionResponse implements ToXConten
     return new ExecuteFragmentResponse(Status.SUCCESS, rowCount, resultData);
   }
 
-  public static ExecuteFragmentResponse successNative(
-      long rowCount, java.util.List<byte[]> nativeBatches) {
+  public static ExecuteFragmentResponse successNative(long rowCount, List<byte[]> nativeBatches) {
     ExecuteFragmentResponse response = new ExecuteFragmentResponse(Status.SUCCESS, rowCount, null);
     response.nativeResultBatches = nativeBatches;
     return response;
@@ -127,7 +128,7 @@ public class ExecuteFragmentResponse extends ActionResponse implements ToXConten
     return resultData;
   }
 
-  public java.util.List<byte[]> getNativeResultBatches() {
+  public List<byte[]> getNativeResultBatches() {
     return nativeResultBatches;
   }
 

@@ -13,17 +13,20 @@ import org.apache.calcite.plan.RelOptRule;
 import org.apache.calcite.plan.RelTraitSet;
 import org.apache.calcite.plan.hep.HepPlanner;
 import org.apache.calcite.plan.hep.HepProgram;
+import org.apache.calcite.plan.volcano.AbstractConverter;
 import org.apache.calcite.plan.volcano.VolcanoPlanner;
 import org.apache.calcite.rel.RelCollationTraitDef;
 import org.apache.calcite.rel.RelDistributionTraitDef;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.RelShuttleImpl;
+import org.apache.calcite.rel.core.Sort;
 import org.apache.calcite.rel.core.TableScan;
 import org.apache.calcite.rel.logical.LogicalAggregate;
 import org.apache.calcite.rel.logical.LogicalFilter;
 import org.apache.calcite.rel.logical.LogicalJoin;
 import org.apache.calcite.rel.logical.LogicalProject;
 import org.apache.calcite.rel.logical.LogicalSort;
+import org.apache.calcite.rel.logical.LogicalTableScan;
 import org.apache.calcite.rel.rules.FilterMergeRule;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -89,7 +92,7 @@ public class PhysicalOptimizer {
     allRules.addAll(PhysicalRules.OPTIMIZATION_RULES);
     // AbstractConverter.ExpandConversionRule enables Convention.enforce() to fire
     // for distribution trait mismatches (e.g., RANDOM → SINGLETON via PhysicalExchange).
-    allRules.add(org.apache.calcite.plan.volcano.AbstractConverter.ExpandConversionRule.INSTANCE);
+    allRules.add(AbstractConverter.ExpandConversionRule.INSTANCE);
 
     // Step 5: Register rules and run optimization directly on our planner
     for (RelOptRule rule : allRules) {
@@ -135,7 +138,7 @@ public class PhysicalOptimizer {
       // Create a plain LogicalTableScan in the new cluster.
       // This strips CalciteLogicalIndexScan's PushDownContext and prevents
       // its register() from adding pushdown rules to our planner.
-      return new org.apache.calcite.rel.logical.LogicalTableScan(
+      return new LogicalTableScan(
           targetCluster, mapTraits(scan.getTraitSet()), scan.getHints(), scan.getTable());
     }
 
@@ -187,8 +190,8 @@ public class PhysicalOptimizer {
       // Handle Sort subclasses (LogicalSystemLimit extends Sort but doesn't
       // dispatch to visit(LogicalSort)). LogicalSort.create() uses the input's
       // cluster, ensuring the new node belongs to our cluster.
-      if (other instanceof org.apache.calcite.rel.core.Sort) {
-        org.apache.calcite.rel.core.Sort sort = (org.apache.calcite.rel.core.Sort) other;
+      if (other instanceof Sort) {
+        Sort sort = (Sort) other;
         RelNode newInput = sort.getInput().accept(this);
         return LogicalSort.create(newInput, sort.getCollation(), sort.offset, sort.fetch);
       }

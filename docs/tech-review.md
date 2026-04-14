@@ -442,6 +442,7 @@ Our design extends the SQL plugin rather than rewriting it, while adopting key R
 - Segment-level parallel reads: each Lucene segment read by a separate thread, configurable via `plugins.velox.segment_parallelism` (default 4, dynamic)
 - Fault tolerance with task retry: per-task retry with error classification (node/shard/transient), bad resource tracking, and replica failover via `plugins.velox.task_max_retries` (default 2, dynamic)
 - Runtime Filter (TERMS): extracts build-side join key values and pushes as Lucene TermInSetQuery/PointInSetQuery to probe scan, skipping non-matching docs at the index level. Configurable via `plugins.velox.runtime_filter_enabled` and `runtime_filter_max_cardinality` (both dynamic).
+- Two-stage TopN: Sort+Limit queries split into partial sort+limit on data nodes (top-K per shard) + final sort+limit on coordinator, reducing data transfer from O(N) to O(K × shards)
 - Per-query session creation (prevents memory pool collisions)
 - Graceful degradation on unsupported platforms
 - Data types: boolean, integer, long, float, double, keyword, date, timestamp
@@ -466,7 +467,7 @@ Gaps identified by comparison with [RFC #4812](https://github.com/opensearch-pro
 | **High** | CBO statistics + join reorder | RFC uses runtime statistics + DP algorithm for bushy join reordering | Fixed join order, shard-count heuristic for strategy selection |
 | **High** | Cost-based join strategy (real stats) | RFC uses table cardinality + selectivity estimation | Shard count proxy only (`CostEstimator.getShardCount()`) |
 | **Medium** | Runtime Filter (BLOOM) | RFC supports probabilistic BLOOM variant for high-cardinality keys | Not implemented (depends on TERMS RF) |
-| **Medium** | TopN optimization | RFC pushes ORDER BY + LIMIT as ranking subquery to data nodes | Sort/Limit runs on coordinator after full data collection |
+| ~~**Medium**~~ | ~~TopN optimization~~ | ~~RFC pushes ORDER BY + LIMIT as ranking subquery to data nodes~~ | **Done** — two-stage TopN splits Sort+Limit into partial (data nodes) + final (coordinator); subquery push deferred |
 
 #### Phase 3 — Advanced Distributed Execution
 
