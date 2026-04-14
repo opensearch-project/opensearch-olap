@@ -120,6 +120,17 @@ public class VeloxLifecycleService implements Closeable {
           Setting.Property.NodeScope,
           Setting.Property.Dynamic);
 
+  /**
+   * CBO statistics mode. RUNTIME collects row counts from IndicesStatsResponse before optimization.
+   * NONE skips statistics collection (uses Calcite defaults).
+   */
+  public static final Setting<String> CBO_STATISTICS_MODE =
+      Setting.simpleString(
+          "plugins.velox.cbo_statistics_mode",
+          "RUNTIME",
+          Setting.Property.NodeScope,
+          Setting.Property.Dynamic);
+
   private volatile boolean enabled;
   private volatile boolean mppEnabled;
   private volatile int broadcastMaxShards;
@@ -128,6 +139,7 @@ public class VeloxLifecycleService implements Closeable {
   private volatile int taskMaxRetries;
   private volatile boolean runtimeFilterEnabled;
   private volatile int runtimeFilterMaxCardinality;
+  private volatile String cboStatisticsMode;
   private volatile MemoryManager memoryManager;
   private volatile Session session;
   private volatile boolean initialized = false;
@@ -141,6 +153,7 @@ public class VeloxLifecycleService implements Closeable {
     this.taskMaxRetries = TASK_MAX_RETRIES.get(settings);
     this.runtimeFilterEnabled = RUNTIME_FILTER_ENABLED.get(settings);
     this.runtimeFilterMaxCardinality = RUNTIME_FILTER_MAX_CARDINALITY.get(settings);
+    this.cboStatisticsMode = CBO_STATISTICS_MODE.get(settings);
 
     if (enabled) {
       try {
@@ -266,6 +279,18 @@ public class VeloxLifecycleService implements Closeable {
     this.runtimeFilterMaxCardinality = runtimeFilterMaxCardinality;
   }
 
+  public String getCboStatisticsMode() {
+    return cboStatisticsMode;
+  }
+
+  public void setCboStatisticsMode(String cboStatisticsMode) {
+    this.cboStatisticsMode = cboStatisticsMode;
+  }
+
+  public boolean isCboEnabled() {
+    return "RUNTIME".equalsIgnoreCase(cboStatisticsMode);
+  }
+
   public static List<Setting<?>> getSettings() {
     return List.of(
         OLAP_ENABLED,
@@ -277,7 +302,8 @@ public class VeloxLifecycleService implements Closeable {
         SEGMENT_PARALLELISM,
         TASK_MAX_RETRIES,
         RUNTIME_FILTER_ENABLED,
-        RUNTIME_FILTER_MAX_CARDINALITY);
+        RUNTIME_FILTER_MAX_CARDINALITY,
+        CBO_STATISTICS_MODE);
   }
 
   @Override

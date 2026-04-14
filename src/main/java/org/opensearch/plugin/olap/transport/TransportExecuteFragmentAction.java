@@ -281,12 +281,15 @@ public class TransportExecuteFragmentAction
             request.getRfValues().size());
       }
 
-      // For broadcast join, don't extract pushdown from the full join plan — the plan
-      // contains both probe and build branches, and extractPushdownQuery could return a
-      // build-side filter that doesn't apply to probe-side shards. Predicate pushdown for
-      // the probe side is handled by Velox's FilterNode in the join plan. Only the RF
-      // (explicitly targeting the probe join key) is safe to push to Lucene here.
-      org.apache.lucene.search.Query combinedQuery = rfQuery;
+      // Extract pushdown from the probe-side leaf fragment plan (safe — only probe branch).
+      // The coordinator join plan has no FilterNode for probe-side predicates, so we extract
+      // pushdown from the probe leaf and apply it at the Lucene level here.
+      org.apache.lucene.search.Query probePushdown = null;
+      if (request.getProbePlanJson() != null) {
+        probePushdown = extractPushdownQuery(request.getProbePlanJson());
+      }
+      org.apache.lucene.search.Query combinedQuery =
+          RuntimeFilterBuilder.combine(probePushdown, rfQuery);
 
       // Start probe-side feeder thread (reads local shards with RF pushdown)
       final org.apache.lucene.search.Query finalCombinedQuery = combinedQuery;

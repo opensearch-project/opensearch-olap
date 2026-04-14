@@ -7,6 +7,7 @@ package org.opensearch.plugin.olap.scheduler;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
+import java.util.Map;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.Metadata;
@@ -115,6 +116,99 @@ public class CostEstimatorTests extends OpenSearchTestCase {
     // Both "missing" indices return Integer.MAX_VALUE shards → hash shuffle
     JoinStrategy strategy = estimator.selectJoinStrategy("missing1", "missing2");
     assertEquals(JoinStrategy.HASH_SHUFFLE, strategy);
+  }
+
+  // ---- CBO: selectBuildSide uses row counts when available ----
+
+  /**
+   * Without CBO: both indices have 1 shard → selectBuildSide returns "left" (1 <= 1). With CBO:
+   * employees=5 rows, departments=3 rows → selectBuildSide returns "right" (3 < 5). This is the
+   * exact scenario that caused the broadcast join filter bug.
+   */
+  public void testCboBuildSideUsesRowCountsNotShardCount() {
+    // Both have 1 shard — shard-count heuristic would pick "left"
+    ClusterService cs = mockClusterService("employees", 1, "departments", 1);
+
+    // Without CBO stats
+    CostEstimator noCbo = new CostEstimator(cs, 2);
+    assertEquals(
+        "Without CBO: equal shards → left",
+        "left",
+        noCbo.selectBuildSide("employees", "departments"));
+
+    // With CBO stats: employees=5 rows, departments=3 rows
+    Map<String, TableStatistics> stats =
+        Map.of(
+            "employees", new TableStatistics("employees", 5, 5000, 1),
+            "departments", new TableStatistics("departments", 3, 3000, 1));
+    CostEstimator withCbo = new CostEstimator(cs, 2, stats);
+    assertEquals(
+        "With CBO: departments has fewer rows → right",
+        "right",
+        withCbo.selectBuildSide("employees", "departments"));
+  }
+
+  public void testCboBuildSideLargeVsSmallTable() {
+    ClusterService cs = mockClusterService("fact_table", 10, "dim_table", 5);
+
+    // Shard count: fact=10, dim=5 → "right" (fewer shards)
+    CostEstimator noCbo = new CostEstimator(cs, 2);
+    assertEquals("right", noCbo.selectBuildSide("fact_table", "dim_table"));
+
+    // Row count: fact=1000000, dim=100 → "right" (far fewer rows) — same direction
+    Map<String, TableStatistics> stats =
+        Map.of(
+            "fact_table", new TableStatistics("fact_table", 1000000, 100000000, 10),
+            "dim_table", new TableStatistics("dim_table", 100, 10000, 5));
+    CostEstimator withCbo = new CostEstimator(cs, 2, stats);
+    assertEquals("right", withCbo.selectBuildSide("fact_table", "dim_table"));
+  }
+
+  public void testCboBuildSideFlipsWhenRowCountDisagreesWithShardCount() {
+    // Shard count says left is smaller (1 shard), but row count says left is MUCH larger
+    ClusterService cs = mockClusterService("big_single_shard", 1, "small_multi_shard", 10);
+
+    // Without CBO: 1 shard vs 10 shards → "left" (fewer shards)
+    CostEstimator noCbo = new CostEstimator(cs, 2);
+    assertEquals("left", noCbo.selectBuildSide("big_single_shard", "small_multi_shard"));
+
+    // With CBO: big=10M rows, small=100 rows → "right" (fewer rows)
+    Map<String, TableStatistics> stats =
+        Map.of(
+            "big_single_shard", new TableStatistics("big_single_shard", 10000000, 1000000000, 1),
+            "small_multi_shard", new TableStatistics("small_multi_shard", 100, 10000, 10));
+    CostEstimator withCbo = new CostEstimator(cs, 2, stats);
+    assertEquals(
+        "With CBO: row count overrides shard count",
+        "right",
+        withCbo.selectBuildSide("big_single_shard", "small_multi_shard"));
+  }
+
+  public void testCboFallsBackToShardCountWhenStatsEmpty() {
+    ClusterService cs = mockClusterService("left", 1, "right", 10);
+
+    // Empty stats map → falls back to shard count
+    CostEstimator estimator = new CostEstimator(cs, 2, Map.of());
+    assertEquals("left", estimator.selectBuildSide("left", "right"));
+  }
+
+  public void testCboFallsBackWhenOneStatMissing() {
+    ClusterService cs = mockClusterService("with_stats", 1, "no_stats", 10);
+
+    // Only one index has stats → one row count is 0 → falls back to shard count
+    Map<String, TableStatistics> stats =
+        Map.of("with_stats", new TableStatistics("with_stats", 500, 50000, 1));
+    CostEstimator estimator = new CostEstimator(cs, 2, stats);
+    assertEquals("left", estimator.selectBuildSide("with_stats", "no_stats"));
+  }
+
+  public void testCboGetRowCount() {
+    ClusterService cs = mockClusterService("test", 1, "test2", 1);
+    Map<String, TableStatistics> stats = Map.of("test", new TableStatistics("test", 42, 4200, 1));
+    CostEstimator estimator = new CostEstimator(cs, 2, stats);
+
+    assertEquals(42, estimator.getRowCount("test"));
+    assertEquals(0, estimator.getRowCount("unknown"));
   }
 
   public void testOneMissingOneSmallSelectsBroadcast() {
