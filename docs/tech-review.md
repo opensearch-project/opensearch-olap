@@ -443,6 +443,7 @@ Our design extends the SQL plugin rather than rewriting it, while adopting key R
 - Fault tolerance with task retry: per-task retry with error classification (node/shard/transient), bad resource tracking, and replica failover via `plugins.velox.task_max_retries` (default 2, dynamic)
 - Runtime Filter (TERMS): extracts build-side join key values and pushes as Lucene TermInSetQuery/PointInSetQuery to probe scan, skipping non-matching docs at the index level. Configurable via `plugins.velox.runtime_filter_enabled` and `runtime_filter_max_cardinality` (both dynamic).
 - Two-stage TopN: Sort+Limit queries split into partial sort+limit on data nodes (top-K per shard) + final sort+limit on coordinator, reducing data transfer from O(N) to O(K × shards)
+- Window functions: eventstats (COUNT, SUM, AVG, MIN, MAX with PARTITION BY) via Velox WindowNode. ProjectToWindowRule decomposes RexOver → LogicalWindow → PhysicalWindow → WindowNode.
 - Per-query session creation (prevents memory pool collisions)
 - Graceful degradation on unsupported platforms
 - Data types: boolean, integer, long, float, double, keyword, date, timestamp
@@ -482,7 +483,7 @@ Gaps identified by comparison with [RFC #4812](https://github.com/opensearch-pro
 
 | Priority | Item | Gap vs RFC | Current State |
 |----------|------|-----------|---------------|
-| **Medium** | Window functions | ROW_NUMBER, RANK, LAG, LEAD, etc. | Not implemented |
+| ~~**Medium**~~ | ~~Window functions~~ | ~~ROW_NUMBER, RANK, LAG, LEAD, etc.~~ | **Done** — eventstats (COUNT, SUM, AVG, MIN, MAX) via PhysicalWindow → Velox WindowNode. LAG/LEAD/ROW_NUMBER deferred. |
 | **Medium** | UNION / INTERSECT / EXCEPT | Set operations | Not implemented |
 | **Low** | Recursive CTE (WITH RECURSIVE) | Fixpoint iteration | Not implemented |
 | **Low** | Cross-cluster query | Analytics across multiple OpenSearch clusters | Not implemented |

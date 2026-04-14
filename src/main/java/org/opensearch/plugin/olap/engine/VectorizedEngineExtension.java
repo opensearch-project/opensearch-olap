@@ -13,8 +13,10 @@ import org.apache.calcite.rel.logical.LogicalJoin;
 import org.apache.calcite.rel.logical.LogicalProject;
 import org.apache.calcite.rel.logical.LogicalSort;
 import org.apache.calcite.rel.logical.LogicalTableScan;
+import org.apache.calcite.rel.logical.LogicalWindow;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.opensearch.sql.ast.statement.ExplainMode;
 import org.opensearch.sql.calcite.CalcitePlanContext;
 import org.opensearch.sql.calcite.plan.rel.LogicalSystemLimit;
 import org.opensearch.sql.calcite.plan.rel.OpenSearchTableScan;
@@ -50,6 +52,7 @@ public class VectorizedEngineExtension implements ExecutionEngine {
     SUPPORTED_REL_NODES.add(LogicalJoin.class);
     SUPPORTED_REL_NODES.add(LogicalSort.class);
     SUPPORTED_REL_NODES.add(LogicalSystemLimit.class);
+    SUPPORTED_REL_NODES.add(LogicalWindow.class);
   }
 
   // Set by OlapPlugin during initialization
@@ -103,6 +106,25 @@ public class VectorizedEngineExtension implements ExecutionEngine {
     listener.onFailure(
         new UnsupportedOperationException(
             "Vectorized engine extension does not support PhysicalPlan execution"));
+  }
+
+  @Override
+  public void explain(
+      RelNode plan,
+      ExplainMode mode,
+      CalcitePlanContext context,
+      ResponseListener<ExplainResponse> listener) {
+    if (veloxEngine == null) {
+      listener.onFailure(new IllegalStateException("VeloxExecutionEngine not initialized"));
+      return;
+    }
+    try {
+      ExplainResponse response = veloxEngine.explain(plan);
+      listener.onResponse(response);
+    } catch (Exception e) {
+      logger.error("Velox explain failed", e);
+      listener.onFailure(e);
+    }
   }
 
   @Override

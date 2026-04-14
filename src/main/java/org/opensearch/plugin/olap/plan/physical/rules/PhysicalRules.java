@@ -20,7 +20,8 @@ public final class PhysicalRules {
           PhysicalProjectRule.DEFAULT_CONFIG.toRule(),
           PhysicalSortRule.DEFAULT_CONFIG.toRule(),
           PhysicalAggregateRule.DEFAULT_CONFIG.toRule(),
-          PhysicalJoinRule.DEFAULT_CONFIG.toRule());
+          PhysicalJoinRule.DEFAULT_CONFIG.toRule(),
+          PhysicalWindowRule.DEFAULT_CONFIG.toRule());
 
   /** MPP rules: HASH distribution alternatives. Registered when mpp_enabled=true. */
   public static final List<RelOptRule> MPP_RULES =

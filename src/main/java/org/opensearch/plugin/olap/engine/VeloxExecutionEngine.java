@@ -130,6 +130,35 @@ public class VeloxExecutionEngine {
     this.transportService = transportService;
   }
 
+  /**
+   * Explain the Velox physical plan for a query. Runs PhysicalOptimizer + VeloxPlanGenerator and
+   * returns the Velox native plan tree for each fragment via {@code PlanNode.toFormatString()}.
+   * Used by the SQL plugin's {@code explain} command.
+   */
+  public ExecutionEngine.ExplainResponse explain(RelNode relNode) {
+    PhysicalOptimizer optimizer = new PhysicalOptimizer(veloxLifecycle.isMppEnabled());
+    RelNode physicalPlan = optimizer.optimize(relNode);
+
+    VeloxPlanGenerator generator = new VeloxPlanGenerator();
+    List<PlanFragment> fragments = generator.generate(physicalPlan);
+
+    StringBuilder veloxPlan = new StringBuilder();
+    for (PlanFragment f : fragments) {
+      veloxPlan
+          .append("Fragment ")
+          .append(f.getFragmentId())
+          .append(" [")
+          .append(f.getProperties().getDistribution())
+          .append("]\n");
+      veloxPlan.append(f.getPlanRoot().toFormatString(true, true));
+      veloxPlan.append("\n");
+    }
+
+    return new ExecutionEngine.ExplainResponse(
+        new ExecutionEngine.ExplainResponseNodeV2(
+            physicalPlan.explain(), veloxPlan.toString(), null));
+  }
+
   public ExecutionEngine.QueryResponse execute(RelNode relNode) {
     QueryId queryId = QueryId.generate();
     logger.info("Executing query {} via Velox engine", queryId);
@@ -142,6 +171,18 @@ public class VeloxExecutionEngine {
       // Generate Velox PlanNodes + PlanFragments from the physical plan
       VeloxPlanGenerator generator = new VeloxPlanGenerator();
       List<PlanFragment> fragments = generator.generate(physicalPlan);
+
+      // Log plan explain for each fragment (DEBUG level)
+      if (logger.isDebugEnabled()) {
+        for (PlanFragment f : fragments) {
+          logger.debug(
+              "Plan explain: query={} fragment={} dist={}\n{}",
+              queryId,
+              f.getFragmentId(),
+              f.getProperties().getDistribution(),
+              f.getPlanRoot().toFormatString(true, true));
+        }
+      }
 
       return executeFragments(relNode, fragments, queryId);
 

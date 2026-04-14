@@ -379,6 +379,21 @@ public class MppJoinIT extends OlapRestTestCase {
     }
   }
 
+  // ---- Plan structure verification ----
+
+  public void testMppJoinPlanContainsHashJoinNode() throws IOException {
+    String plan =
+        explainVeloxPlan(
+            "source = "
+                + EMPLOYEES_INDEX
+                + " | inner join left=e right=d ON e.dept_id = d.dept_id "
+                + DEPARTMENTS_INDEX
+                + " | fields e.name, d.dept_name");
+    assertTrue("MPP plan should contain HashJoin node", plan.contains("HashJoin"));
+    assertTrue("MPP plan should have SOURCE fragment", plan.contains("[SOURCE]"));
+    assertTrue("MPP plan should have COORDINATOR fragment", plan.contains("[COORDINATOR]"));
+  }
+
   // ---- Verify MPP is enabled via logs ----
 
   public void testMppEnabledInLogs() throws IOException {

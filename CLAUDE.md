@@ -208,6 +208,7 @@ All repositories are siblings under the same parent directory (`../`):
 - SQL plugin: `../search-plugins-sql`
   - `ExecutionEngine` interface: `core/src/main/java/org/opensearch/sql/executor/ExecutionEngine.java`
   - `DelegatingExecutionEngine`: `core/src/main/java/org/opensearch/sql/executor/DelegatingExecutionEngine.java`
+  - `PPL command documentation`: `docs/user/ppl/index.md`
 - OpenSearch core: `../OpenSearch`
 - Calcite: `../calcite`
 - Presto: `../presto` — scheduler design reference

@@ -140,4 +140,18 @@ public class AggregationIT extends OlapRestTestCase {
     assertEquals("Expected 1 row", 1, rows.length());
     assertEquals("count()", 5, rows.getJSONArray(0).getLong(0));
   }
+
+  // ---- Plan structure verification ----
+
+  public void testAggregationPlanContainsAggregationNode() throws IOException {
+    String plan = explainVeloxPlan("source=test_olap | stats count() by city");
+    assertTrue("Plan should contain Aggregation node", plan.contains("Aggregation"));
+    assertTrue("Plan should have SOURCE fragment", plan.contains("[SOURCE]"));
+  }
+
+  public void testAvgAggregationPlanContainsAvgFunction() throws IOException {
+    String plan = explainVeloxPlan("source=test_olap | stats avg(salary) by city");
+    assertTrue("Plan should contain Aggregation node", plan.contains("Aggregation"));
+    assertTrue("Plan should reference avg function", plan.contains("avg"));
+  }
 }
