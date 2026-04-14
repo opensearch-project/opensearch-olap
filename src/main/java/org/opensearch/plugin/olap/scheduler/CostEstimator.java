@@ -4,6 +4,7 @@
 
 package org.opensearch.plugin.olap.scheduler;
 
+import java.util.Map;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.cluster.metadata.IndexMetadata;
@@ -12,9 +13,12 @@ import org.opensearch.cluster.service.ClusterService;
 /**
  * Estimates index sizes and selects the optimal join strategy for MPP execution.
  *
- * <p>Uses OpenSearch cluster metadata (shard count) as a proxy for table size. The heuristic: if
- * the smaller side has few shards relative to the broadcast threshold, use broadcast join;
- * otherwise use hash shuffle.
+ * <p>When CBO statistics are available (row counts from IndicesStatsResponse), uses real row
+ * counts. Falls back to shard count heuristic when statistics are unavailable.
+ *
+ * <p>The broadcast threshold ({@code broadcast_max_shards}) is compared against shard count for
+ * strategy selection (BROADCAST vs HASH_SHUFFLE). Build side selection uses row count when
+ * available.
  */
 public class CostEstimator {
 
@@ -22,14 +26,27 @@ public class CostEstimator {
 
   private final ClusterService clusterService;
   private final int broadcastMaxShards;
+  private final Map<String, TableStatistics> statsMap;
 
   /**
-   * @param clusterService cluster metadata for index statistics
-   * @param broadcastMaxShards max primary shard count for the build side to qualify for broadcast
+   * Create a CostEstimator with CBO statistics.
+   *
+   * @param clusterService cluster metadata for shard count fallback
+   * @param broadcastMaxShards max primary shard count for broadcast eligibility
+   * @param statsMap table statistics from StatisticsCollector (may be empty)
    */
-  public CostEstimator(ClusterService clusterService, int broadcastMaxShards) {
+  public CostEstimator(
+      ClusterService clusterService,
+      int broadcastMaxShards,
+      Map<String, TableStatistics> statsMap) {
     this.clusterService = clusterService;
     this.broadcastMaxShards = broadcastMaxShards;
+    this.statsMap = statsMap != null ? statsMap : Map.of();
+  }
+
+  /** Backward-compatible constructor without CBO statistics. */
+  public CostEstimator(ClusterService clusterService, int broadcastMaxShards) {
+    this(clusterService, broadcastMaxShards, Map.of());
   }
 
   /**
@@ -42,11 +59,17 @@ public class CostEstimator {
     int rightShards = getShardCount(rightIndex);
     int smallerShards = Math.min(leftShards, rightShards);
 
+    long leftRows = getRowCount(leftIndex);
+    long rightRows = getRowCount(rightIndex);
+
     logger.info(
-        "Cost estimation: left={} ({} shards), right={} ({} shards), broadcastThreshold={}",
+        "Cost estimation: left={} ({} rows, {} shards), right={} ({} rows, {} shards),"
+            + " broadcastThreshold={}",
         leftIndex,
+        leftRows,
         leftShards,
         rightIndex,
+        rightRows,
         rightShards,
         broadcastMaxShards);
 
@@ -57,17 +80,40 @@ public class CostEstimator {
   }
 
   /**
-   * Determine which side to broadcast (the smaller one).
+   * Determine which side to broadcast (the smaller one). Uses row count when CBO statistics are
+   * available, falls back to shard count.
    *
    * @return "left" or "right"
    */
   public String selectBuildSide(String leftIndex, String rightIndex) {
+    long leftRows = getRowCount(leftIndex);
+    long rightRows = getRowCount(rightIndex);
+
+    // Use row counts when both are available (non-zero)
+    if (leftRows > 0 && rightRows > 0) {
+      return leftRows <= rightRows ? "left" : "right";
+    }
+
+    // Fallback to shard count
     int leftShards = getShardCount(leftIndex);
     int rightShards = getShardCount(rightIndex);
     return leftShards <= rightShards ? "left" : "right";
   }
 
-  private int getShardCount(String indexName) {
+  /** Get row count from CBO statistics, or 0 if unavailable. */
+  public long getRowCount(String indexName) {
+    TableStatistics stats = statsMap.get(indexName);
+    return stats != null ? stats.getRowCount() : 0;
+  }
+
+  /** Get shard count from cluster metadata. */
+  public int getShardCount(String indexName) {
+    // First check CBO stats (may have cached shard count)
+    TableStatistics stats = statsMap.get(indexName);
+    if (stats != null && stats.getShardCount() > 0) {
+      return stats.getShardCount();
+    }
+    // Fallback to cluster metadata
     IndexMetadata meta = clusterService.state().metadata().index(indexName);
     if (meta == null) {
       logger.warn("Index {} not found in cluster metadata, assuming large", indexName);

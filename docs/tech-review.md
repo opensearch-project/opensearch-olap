@@ -27,7 +27,11 @@ The OpenSearch OLAP plugin adds a vectorized, columnar execution engine to OpenS
 - 6 minimal changes to the SQL plugin; zero changes to OpenSearch core
 - Calcite Convention-based physical planning (VolcanoPlanner + PhysicalConvention + ConverterRules)
 - Supports MPP execution: two-phase distributed aggregation, coordinator-centric/broadcast/shuffle joins
-- Predicate pushdown to Lucene, per-query session isolation
+- Runtime Filter pushdown (build-side join keys → Lucene TermInSetQuery on probe scan)
+- CBO statistics for row-count-based join build side selection
+- Two-stage TopN, window functions (eventstats), fault tolerance with task retry
+- Segment-level parallel reads, predicate pushdown to Lucene, per-query session isolation
+- Plan explain via PPL `explain` command (Velox plan tree output)
 - Graceful degradation — if Velox is unavailable, queries fall back to the default engine transparently
 
 ---
@@ -412,8 +416,8 @@ The RFC describes a mature system. Our implementation is a focused subset target
 | **Exchange insertion** | Trait-driven via Convention.enforce() with RelDistributionTraitDef | Explicit in ConverterRules: base rules insert PhysicalExchange(SINGLETON), MPP rules insert PhysicalExchange(HASH). VolcanoPlanner explores both. |
 | **Engine abstraction** | EngineOptimizer + EngineBridge interfaces | `canVectorize()` + `execute(RelNode)` on `ExecutionEngine` |
 | **Execution model** | Push-based pipeline with Operators and Consumers | Pull-based (Velox SerialTask.next()) |
-| **Data reading** | Concurrent reads at segment granularity | Sequential per shard |
-| **Fault tolerance** | Task retries, node health monitoring | No retries; single failure fails query |
+| **Data reading** | Concurrent reads at segment granularity | Segment-level parallel reads with configurable parallelism (`segment_parallelism`) |
+| **Fault tolerance** | Task retries, node health monitoring | Task retry with error classification (node/shard/transient), bad resource tracking, replica failover (`task_max_retries`) |
 | **Maturity** | Production on thousands of nodes | End-to-end working: scan, filter, project, aggregate, join, sort |
 
 ### Our approach as stepping stone
@@ -423,7 +427,7 @@ Our design extends the SQL plugin rather than rewriting it, while adopting key R
 - **ClusterCopyShuttle** — decouples from the SQL plugin's planner, stripping pushdown context to prevent rule leaks (solves a real integration challenge the RFC doesn't address)
 - **Distributed execution** — Presto-inspired Stage/Task model with shard routing, same as RFC
 - **Pluggable engine** — `canVectorize()` extension point validated with Velox; other engines can follow the same pattern
-- The scheduling/transport infrastructure supports future improvements (parallel reads, retries, runtime filters) incrementally
+- Parallel reads, task retries, and runtime filters are already implemented, with the infrastructure supporting further incremental improvements (BLOOM RF, adaptive execution, join reorder)
 
 ---
 
@@ -438,12 +442,14 @@ Our design extends the SQL plugin rather than rewriting it, while adopting key R
 - MPP join support: coordinator-centric, broadcast, and hash shuffle strategies (all wired through PhysicalOptimizer → VeloxPlanGenerator → executeFragments)
 - Calcite physical planning: PhysicalOptimizer (VolcanoPlanner + ClusterCopyShuttle) → VeloxPlanGenerator
 - Dynamic MPP settings: `mpp_enabled`, `broadcast_max_shards`, `shuffle_partitions` togglable at runtime via cluster settings API
-- Cost-based MPP strategy selection: CostEstimator selects BROADCAST vs HASH_SHUFFLE based on shard count heuristic
+- Cost-based MPP strategy selection: CostEstimator selects BROADCAST vs HASH_SHUFFLE (shard count for strategy, row count for build side when CBO enabled)
 - Segment-level parallel reads: each Lucene segment read by a separate thread, configurable via `plugins.velox.segment_parallelism` (default 4, dynamic)
 - Fault tolerance with task retry: per-task retry with error classification (node/shard/transient), bad resource tracking, and replica failover via `plugins.velox.task_max_retries` (default 2, dynamic)
 - Runtime Filter (TERMS): extracts build-side join key values and pushes as Lucene TermInSetQuery/PointInSetQuery to probe scan, skipping non-matching docs at the index level. Configurable via `plugins.velox.runtime_filter_enabled` and `runtime_filter_max_cardinality` (both dynamic).
 - Two-stage TopN: Sort+Limit queries split into partial sort+limit on data nodes (top-K per shard) + final sort+limit on coordinator, reducing data transfer from O(N) to O(K × shards)
 - Window functions: eventstats (COUNT, SUM, AVG, MIN, MAX with PARTITION BY) via Velox WindowNode. ProjectToWindowRule decomposes RexOver → LogicalWindow → PhysicalWindow → WindowNode.
+- CBO statistics: query-time row count + data size collection from IndicesStatsResponse. Feeds into CostEstimator for row-count-based build side selection. Configurable via `plugins.velox.cbo_statistics_mode` (RUNTIME/NONE, default RUNTIME, dynamic).
+- Plan explain: PPL `explain` command outputs Velox plan tree via `PlanNode.toFormatString()`, showing operator pipeline, column projections, and filter expressions.
 - Per-query session creation (prevents memory pool collisions)
 - Graceful degradation on unsupported platforms
 - Data types: boolean, integer, long, float, double, keyword, date, timestamp
@@ -465,8 +471,9 @@ Gaps identified by comparison with [RFC #4812](https://github.com/opensearch-pro
 
 | Priority | Item | Gap vs RFC | Current State |
 |----------|------|-----------|---------------|
-| **High** | CBO statistics + join reorder | RFC uses runtime statistics + DP algorithm for bushy join reordering | Fixed join order, shard-count heuristic for strategy selection |
-| **High** | Cost-based join strategy (real stats) | RFC uses table cardinality + selectivity estimation | Shard count proxy only (`CostEstimator.getShardCount()`) |
+| ~~**High**~~ | ~~CBO statistics~~ | ~~RFC uses runtime statistics~~ | **Done** — table-level row count + size from IndicesStatsResponse; feeds CostEstimator for row-count-based build side selection; `cbo_statistics_mode` setting |
+| **High** | Join reorder | RFC uses DP algorithm for bushy join reordering with statistics | Not started; depends on CBO statistics (now done) |
+| **Medium** | Cost-based join strategy (real stats) | RFC uses table cardinality + selectivity estimation | Row count available via CBO; column cardinality deferred (Lucene segment stats, Option B) |
 | **Medium** | Runtime Filter (BLOOM) | RFC supports probabilistic BLOOM variant for high-cardinality keys | Not implemented (depends on TERMS RF) |
 | ~~**Medium**~~ | ~~TopN optimization~~ | ~~RFC pushes ORDER BY + LIMIT as ranking subquery to data nodes~~ | **Done** — two-stage TopN splits Sort+Limit into partial (data nodes) + final (coordinator); subquery push deferred |
 
@@ -487,4 +494,4 @@ Gaps identified by comparison with [RFC #4812](https://github.com/opensearch-pro
 | **Medium** | UNION / INTERSECT / EXCEPT | Set operations | Not implemented |
 | **Low** | Recursive CTE (WITH RECURSIVE) | Fixpoint iteration | Not implemented |
 | **Low** | Cross-cluster query | Analytics across multiple OpenSearch clusters | Not implemented |
-| **Low** | EXPLAIN visualization | RFC has multi-stage plan visualization + DOT format | Basic logging only |
+| ~~**Low**~~ | ~~EXPLAIN visualization~~ | ~~RFC has multi-stage plan visualization + DOT format~~ | **Done** — PPL `explain` command outputs Velox plan tree via `PlanNode.toFormatString()`; shows operator pipeline, column projections, and filter expressions |

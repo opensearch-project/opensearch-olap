@@ -55,6 +55,9 @@ public class ExecuteFragmentRequest extends ActionRequest {
   /** Distinct join key values from the build side, serialized as strings. */
   private List<String> rfValues;
 
+  /** Probe-side leaf fragment plan JSON for extracting pushdown query in broadcast join. */
+  private String probePlanJson;
+
   // --- Shuffle scan fields ---
   /** Target node IDs for each shuffle partition. Null if not a shuffle scan. */
   private List<String> shuffleTargetNodeIds;
@@ -119,6 +122,9 @@ public class ExecuteFragmentRequest extends ActionRequest {
         this.rfValues.add(in.readString());
       }
     }
+
+    // Probe plan JSON for broadcast pushdown
+    this.probePlanJson = in.readOptionalString();
 
     // Shuffle scan config
     int targetNodeCount = in.readVInt();
@@ -195,6 +201,9 @@ public class ExecuteFragmentRequest extends ActionRequest {
         out.writeString(v);
       }
     }
+
+    // Probe plan JSON for broadcast pushdown
+    out.writeOptionalString(probePlanJson);
 
     // Shuffle scan config
     if (shuffleTargetNodeIds != null && !shuffleTargetNodeIds.isEmpty()) {
@@ -284,6 +293,14 @@ public class ExecuteFragmentRequest extends ActionRequest {
 
   public boolean hasRuntimeFilter() {
     return rfFieldName != null && rfValues != null && !rfValues.isEmpty();
+  }
+
+  public String getProbePlanJson() {
+    return probePlanJson;
+  }
+
+  public void setProbePlanJson(String probePlanJson) {
+    this.probePlanJson = probePlanJson;
   }
 
   public void setRuntimeFilter(String fieldName, String fieldType, List<String> values) {

@@ -96,7 +96,7 @@ public class NodeResultCollector {
       List<byte[]> broadcastData,
       int buildScanIndex) {
     return dispatchAndCollectBroadcast(
-        execution, stages, broadcastData, buildScanIndex, null, null, null);
+        execution, stages, broadcastData, buildScanIndex, null, null, null, null);
   }
 
   /**
@@ -113,7 +113,8 @@ public class NodeResultCollector {
       int buildScanIndex,
       String rfFieldName,
       String rfFieldType,
-      List<String> rfValues) {
+      List<String> rfValues,
+      String probePlanJson) {
     QueryId queryId = execution.getQueryId();
     List<TaskDescriptor> allTasks = new ArrayList<>();
     for (var stage : stages) {
@@ -128,6 +129,9 @@ public class NodeResultCollector {
           request.setBroadcastData(broadcastData, buildScanIndex);
           if (rfFieldName != null && rfValues != null && !rfValues.isEmpty()) {
             request.setRuntimeFilter(rfFieldName, rfFieldType, rfValues);
+          }
+          if (probePlanJson != null) {
+            request.setProbePlanJson(probePlanJson);
           }
           return request;
         });

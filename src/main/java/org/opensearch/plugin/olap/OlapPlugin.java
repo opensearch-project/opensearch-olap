@@ -22,6 +22,7 @@ import org.opensearch.plugin.olap.engine.VectorizedEngineExtension;
 import org.opensearch.plugin.olap.engine.VeloxExecutionEngine;
 import org.opensearch.plugin.olap.execution.VeloxLifecycleService;
 import org.opensearch.plugin.olap.scheduler.QueryScheduler;
+import org.opensearch.plugin.olap.scheduler.StatisticsCollector;
 import org.opensearch.plugin.olap.transport.ExecuteFragmentAction;
 import org.opensearch.plugin.olap.transport.ShuffleDataAction;
 import org.opensearch.plugin.olap.transport.ShuffleManager;
@@ -65,8 +66,9 @@ public class OlapPlugin extends Plugin implements ActionPlugin {
     this.queryScheduler = new QueryScheduler(clusterService, threadPool);
     this.shuffleManager = new ShuffleManager();
 
+    StatisticsCollector statisticsCollector = new StatisticsCollector(client, clusterService);
     this.veloxExecutionEngine =
-        new VeloxExecutionEngine(veloxLifecycleService, queryScheduler, null);
+        new VeloxExecutionEngine(veloxLifecycleService, queryScheduler, null, statisticsCollector);
 
     VectorizedEngineExtension.setEngine(veloxExecutionEngine);
 
@@ -103,6 +105,10 @@ public class OlapPlugin extends Plugin implements ActionPlugin {
         .addSettingsUpdateConsumer(
             VeloxLifecycleService.RUNTIME_FILTER_MAX_CARDINALITY,
             veloxLifecycleService::setRuntimeFilterMaxCardinality);
+    clusterService
+        .getClusterSettings()
+        .addSettingsUpdateConsumer(
+            VeloxLifecycleService.CBO_STATISTICS_MODE, veloxLifecycleService::setCboStatisticsMode);
 
     return Arrays.asList(
         veloxLifecycleService, queryScheduler, veloxExecutionEngine, shuffleManager);

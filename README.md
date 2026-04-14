@@ -178,12 +178,13 @@ src/main/java/org/opensearch/plugin/olap/
 │       ├── PhysicalAggregate.java     #   Physical aggregate (SINGLE/PARTIAL/FINAL)
 │       ├── PhysicalJoin.java          #   Physical hash join
 │       ├── PhysicalSort.java          #   Physical sort/limit (dist=SINGLETON)
+│       ├── PhysicalWindow.java        #   Physical window (eventstats)
 │       ├── PhysicalExchange.java      #   Redistribution boundary
 │       ├── PhysicalOptimizer.java     #   ClusterCopyShuttle + HepPlanner + VolcanoPlanner
 │       ├── VeloxPlanGenerator.java    #   Physical plan → Velox PlanNodes + PlanFragments
 │       └── rules/                     #   Conversion + optimization rules
 │           ├── PhysicalRules.java     #     All rule lists
-│           ├── Physical*Rule.java     #     ConverterRules (NONE → PHYSICAL)
+│           ├── Physical*Rule.java     #     ConverterRules (NONE → PHYSICAL, incl. PhysicalWindowRule)
 │           ├── Mpp*Rule.java          #     MPP rules (HASH distribution)
 │           └── TwoStageAggRule.java   #     SINGLE → PARTIAL + Exchange + FINAL
 ├── scheduler/                         # Query scheduling
@@ -191,8 +192,12 @@ src/main/java/org/opensearch/plugin/olap/
 │   ├── QueryExecution.java            #   Single query lifecycle
 │   ├── Stage.java                     #   Execution stage (1 fragment → N tasks)
 │   ├── ShardRouter.java               #   Routes to nodes by shard assignment
-│   ├── CostEstimator.java             #   Shard-count-based join strategy selection
+│   ├── CostEstimator.java             #   Join strategy selection (shard count + CBO row count)
 │   ├── JoinStrategy.java              #   COORDINATOR_CENTRIC / BROADCAST / HASH_SHUFFLE
+│   ├── StatisticsCollector.java       #   Collects row count + size from IndicesStatsResponse
+│   ├── TableStatistics.java           #   Row count, size, shard count per index
+│   ├── ErrorClassifier.java           #   Classifies errors: RETRYABLE_NODE/SHARD/TRANSIENT, FATAL
+│   ├── BadResourceTracker.java        #   Thread-safe tracker for failed nodes/shards
 │   ├── TaskDescriptor.java            #   Task metadata for a node
 │   ├── TaskTracker.java               #   Tracks task states
 │   ├── StageId.java / TaskId.java     #   Identifiers
@@ -214,8 +219,9 @@ src/main/java/org/opensearch/plugin/olap/
 │   ├── DocValueColumnReader.java      #   Single column from DocValues
 │   ├── ArrowBatchBuilder.java         #   Builds VectorSchemaRoot
 │   ├── ExternalStreamBridge.java      #   Arrow → velox4j BlockingQueue
+│   ├── RuntimeFilterBuilder.java      #   Builds Lucene TermInSetQuery/PointInSetQuery from RF values
 │   ├── VeloxExecutor.java             #   Executes plan via velox4j (single/dual input)
-│   └── VeloxLifecycleService.java     #   Velox engine init/shutdown + MPP settings
+│   └── VeloxLifecycleService.java     #   Velox engine init/shutdown + dynamic settings
 └── result/                            # Result handling (interfaces)
     ├── QueryResult.java               #   Query result interface
     └── ResultCollector.java           #   Merge partial results
@@ -232,7 +238,8 @@ src/main/java/org/opensearch/plugin/olap/
 | `LogicalProject` | `ProjectNode` |
 | `LogicalAggregate` | `AggregationNode` (SINGLE / PARTIAL+FINAL) |
 | `LogicalJoin` | `HashJoinNode` (equi-join key extraction) |
-| `Sort` (`LogicalSort`, `LogicalSystemLimit`) | `OrderByNode` + `LimitNode` |
+| `Sort` (`LogicalSort`, `LogicalSystemLimit`) | `OrderByNode` + `LimitNode` (two-stage TopN: PARTIAL + FINAL when distributed) |
+| `LogicalWindow` | `WindowNode` (eventstats: COUNT, SUM, AVG, MIN, MAX with PARTITION BY) |
 
 ### Expression Conversion (RexNode → TypedExpr)
 
@@ -264,6 +271,7 @@ COUNT, SUM, AVG, MIN, MAX (with DISTINCT support)
 | `plugins.velox.task_max_retries` | `2` | Max retry attempts per failed task. Retries use replica shards on different nodes when available. Set to 0 to disable. **Dynamic.** |
 | `plugins.velox.runtime_filter_enabled` | `true` | Enable runtime filter pushdown for broadcast joins. Extracts build-side join key values and pushes as Lucene TermsQuery to probe scan. **Dynamic.** |
 | `plugins.velox.runtime_filter_max_cardinality` | `10000` | Max distinct values for runtime filter. If build-side cardinality exceeds this, RF is skipped. **Dynamic.** |
+| `plugins.velox.cbo_statistics_mode` | `RUNTIME` | CBO statistics mode. `RUNTIME` collects row counts from IndicesStatsResponse before optimization for accurate build side selection. `NONE` skips (uses shard-count heuristic). **Dynamic.** |
 
 ## Dependencies
 
@@ -324,11 +332,18 @@ Integration tests run against a real single-node OpenSearch cluster with the job
 
 Test sources live in `src/integTest/java/`. The base class `OlapRestTestCase` provides helpers for creating test indices, executing PPL queries, and asserting results via the OpenSearch REST API.
 
-Test suites:
-- **AggregationIT** (7 tests) — distributed aggregation (count, sum, avg, min/max by group)
-- **JoinIT** (8 tests) — coordinator-centric joins (inner, left, with filter/agg/limit)
+Test suites (107 integration tests total):
+- **AggregationIT** (9 tests) — distributed aggregation (count, sum, avg, min/max by group) + plan explain
+- **JoinIT** (10 tests) — coordinator-centric joins (inner, left, with filter/agg/limit) + plan explain
 - **PredicatePushdownIT** (19 tests) — Lucene predicate pushdown (equality, range, compound)
-- **MppJoinIT** (9 tests) — joins and aggregations with `mpp_enabled=true` (toggled via dynamic cluster setting)
+- **MppJoinIT** (14 tests) — broadcast + hash shuffle joins with `mpp_enabled=true`
+- **RuntimeFilterIT** (10 tests) — RF enabled/disabled, join types, cardinality threshold
+- **TopNIT** (9 tests) — two-stage sort+limit correctness + plan explain
+- **WindowFunctionIT** (6 tests) — eventstats count/max/sum + plan explain
+- **FaultToleranceIT** (11 tests) — retries enabled/disabled, fault injection
+- **ParallelReadIT** (6 tests) — segment-level parallel vs sequential consistency
+- **PlanExplainIT** (7 tests) — plan structure verification via explain command
+- **CboStatisticsIT** (4 tests) — CBO join, comparison, aggregation, logging
 
 **Note:** Integration tests require the Velox native libraries (`libvelox.so`) to be compatible with the host OS. The Maven-published `velox4j` jar bundles libraries built on CentOS 7. If the host is incompatible, Velox will fail to initialize and the OLAP plugin will disable itself — queries will fall back to the default SQL engine and the tests will fail. See [Multi-Node Testing (Docker)](#multi-node-testing-docker) for an alternative.
 

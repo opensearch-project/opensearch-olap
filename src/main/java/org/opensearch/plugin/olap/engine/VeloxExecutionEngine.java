@@ -34,6 +34,8 @@ import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.apache.arrow.vector.util.Text;
 import org.apache.calcite.rel.RelNode;
+import org.apache.calcite.rel.core.Join;
+import org.apache.calcite.rel.core.TableScan;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rel.type.RelDataTypeField;
 import org.apache.calcite.sql.type.SqlTypeName;
@@ -64,6 +66,7 @@ import org.boostscale.velox4j.plan.ProjectNode;
 import org.boostscale.velox4j.plan.TableScanNode;
 import org.boostscale.velox4j.query.Query;
 import org.boostscale.velox4j.query.SerialTask;
+import org.boostscale.velox4j.serde.Serde;
 import org.boostscale.velox4j.session.Session;
 import org.boostscale.velox4j.type.BigIntType;
 import org.boostscale.velox4j.type.BooleanType;
@@ -88,6 +91,8 @@ import org.opensearch.plugin.olap.scheduler.JoinStrategy;
 import org.opensearch.plugin.olap.scheduler.QueryExecution;
 import org.opensearch.plugin.olap.scheduler.QueryScheduler;
 import org.opensearch.plugin.olap.scheduler.Stage;
+import org.opensearch.plugin.olap.scheduler.StatisticsCollector;
+import org.opensearch.plugin.olap.scheduler.TableStatistics;
 import org.opensearch.plugin.olap.scheduler.TaskDescriptor;
 import org.opensearch.plugin.olap.transport.ExecuteFragmentResponse;
 import org.opensearch.plugin.olap.transport.NodeResultCollector;
@@ -119,15 +124,18 @@ public class VeloxExecutionEngine {
 
   private final QueryScheduler queryScheduler;
   private final VeloxLifecycleService veloxLifecycle;
+  private final StatisticsCollector statisticsCollector;
   private volatile TransportService transportService;
 
   public VeloxExecutionEngine(
       VeloxLifecycleService veloxLifecycle,
       QueryScheduler queryScheduler,
-      TransportService transportService) {
+      TransportService transportService,
+      StatisticsCollector statisticsCollector) {
     this.veloxLifecycle = veloxLifecycle;
     this.queryScheduler = queryScheduler;
     this.transportService = transportService;
+    this.statisticsCollector = statisticsCollector;
   }
 
   /**
@@ -164,6 +172,16 @@ public class VeloxExecutionEngine {
     logger.info("Executing query {} via Velox engine", queryId);
 
     try {
+      // Step 0: Collect CBO statistics (row counts) if enabled
+      // Only collect when the plan contains a join and MPP is enabled, to avoid
+      // unnecessary IndicesStats RPC for single-table scans/aggregations.
+      // TODO: Relax the mpp_enabled guard when join reorder or other non-MPP
+      //  optimizations need statistics at planning time.
+      Map<String, TableStatistics> statsMap =
+          veloxLifecycle.isMppEnabled() && planContainsJoin(relNode)
+              ? collectStatistics(relNode)
+              : Map.of();
+
       // Physical optimization: VolcanoPlanner with PhysicalConvention
       PhysicalOptimizer optimizer = new PhysicalOptimizer(veloxLifecycle.isMppEnabled());
       RelNode physicalPlan = optimizer.optimize(relNode);
@@ -184,7 +202,7 @@ public class VeloxExecutionEngine {
         }
       }
 
-      return executeFragments(relNode, fragments, queryId);
+      return executeFragments(relNode, fragments, queryId, statsMap);
 
     } catch (Exception e) {
       logger.error("Velox execution failed for query {}", queryId, e);
@@ -201,7 +219,10 @@ public class VeloxExecutionEngine {
    * scan → shuffle → worker join).
    */
   private ExecutionEngine.QueryResponse executeFragments(
-      RelNode relNode, List<PlanFragment> fragments, QueryId queryId) {
+      RelNode relNode,
+      List<PlanFragment> fragments,
+      QueryId queryId,
+      Map<String, TableStatistics> statsMap) {
 
     PlanFragment coordinatorFragment = findCoordinatorFragment(fragments);
 
@@ -212,11 +233,12 @@ public class VeloxExecutionEngine {
     // MPP join strategy selection: when mpp_enabled=true and this is a multi-table join,
     // CostEstimator decides between BROADCAST and HASH_SHUFFLE.
     if (veloxLifecycle.isMppEnabled() && leafFragments.size() >= 2 && coordinatorFragment != null) {
-      JoinStrategy strategy = selectJoinStrategy(leafFragments);
+      JoinStrategy strategy = selectJoinStrategy(leafFragments, statsMap);
       logger.info("MPP join strategy for query {}: {}", queryId, strategy);
       switch (strategy) {
         case BROADCAST:
-          return executeBroadcastFragments(relNode, leafFragments, coordinatorFragment, queryId);
+          return executeBroadcastFragments(
+              relNode, leafFragments, coordinatorFragment, queryId, statsMap);
         case HASH_SHUFFLE:
           return executeShuffleFragments(relNode, fragments, queryId);
         default:
@@ -269,12 +291,13 @@ public class VeloxExecutionEngine {
   }
 
   /** Select join strategy using CostEstimator based on leaf fragment source indices. */
-  private JoinStrategy selectJoinStrategy(List<PlanFragment> leafFragments) {
+  private JoinStrategy selectJoinStrategy(
+      List<PlanFragment> leafFragments, Map<String, TableStatistics> statsMap) {
     String leftIndex = leafFragments.get(0).getProperties().getSourceIndex();
     String rightIndex = leafFragments.get(1).getProperties().getSourceIndex();
     CostEstimator estimator =
         new CostEstimator(
-            queryScheduler.getClusterService(), veloxLifecycle.getBroadcastMaxShards());
+            queryScheduler.getClusterService(), veloxLifecycle.getBroadcastMaxShards(), statsMap);
     return estimator.selectJoinStrategy(leftIndex, rightIndex);
   }
 
@@ -290,7 +313,8 @@ public class VeloxExecutionEngine {
       RelNode relNode,
       List<PlanFragment> leafFragments,
       PlanFragment coordinatorFragment,
-      QueryId queryId) {
+      QueryId queryId,
+      Map<String, TableStatistics> statsMap) {
 
     // Determine build side. For outer joins, the build side is constrained by join semantics:
     // - LEFT JOIN: build must be right (left rows are preserved, must be the probe)
@@ -298,17 +322,21 @@ public class VeloxExecutionEngine {
     // - INNER JOIN: build is the smaller side (CostEstimator decides)
     String leftIndex = leafFragments.get(0).getProperties().getSourceIndex();
     String rightIndex = leafFragments.get(1).getProperties().getSourceIndex();
-    String buildSide = selectBroadcastBuildSide(coordinatorFragment, leftIndex, rightIndex);
+    String buildSide =
+        selectBroadcastBuildSide(coordinatorFragment, leftIndex, rightIndex, statsMap);
 
     PlanFragment buildFragment;
+    PlanFragment probeLeafFragment;
     String probeIndex;
     int buildScanIndex; // which exchange scan in the coordinator plan is the build side
     if ("left".equals(buildSide)) {
       buildFragment = leafFragments.get(0);
+      probeLeafFragment = leafFragments.get(1);
       probeIndex = rightIndex;
       buildScanIndex = 0; // left exchange scan = build
     } else {
       buildFragment = leafFragments.get(1);
+      probeLeafFragment = leafFragments.get(0);
       probeIndex = leftIndex;
       buildScanIndex = 1; // right exchange scan = build
     }
@@ -377,6 +405,16 @@ public class VeloxExecutionEngine {
       }
     }
 
+    // Extract probe-side pushdown from the probe leaf fragment's plan.
+    // The probe leaf may have a FilterNode that needs to be applied at the Lucene level
+    // since the coordinator join plan only has exchange scans (no FilterNode).
+    String probePlanJson = null;
+    if (probeLeafFragment.getPlanRoot() != null) {
+      Query probeQuery =
+          new Query(probeLeafFragment.getPlanRoot(), Config.empty(), ConnectorConfig.empty());
+      probePlanJson = Serde.toJson(probeQuery);
+    }
+
     // Phase 2: Dispatch broadcast join to probe-side nodes
     List<Stage> broadcastStages = new ArrayList<>();
     for (Stage stage : execution.getStages()) {
@@ -397,7 +435,8 @@ public class VeloxExecutionEngine {
             buildScanIndex,
             finalRfFieldName,
             finalRfFieldType,
-            finalRfValues);
+            finalRfValues,
+            probePlanJson);
 
     return buildQueryResponse(relNode.getRowType(), joinResponses);
   }
@@ -933,6 +972,54 @@ public class VeloxExecutionEngine {
     return node;
   }
 
+  // ---- CBO Statistics Helpers ----
+
+  /** Check if the plan tree contains a Join node. */
+  private boolean planContainsJoin(RelNode node) {
+    if (node instanceof Join) {
+      return true;
+    }
+    for (RelNode input : node.getInputs()) {
+      if (planContainsJoin(input)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** Collect table statistics for all indices referenced in the plan. */
+  private Map<String, TableStatistics> collectStatistics(RelNode relNode) {
+    if (!veloxLifecycle.isCboEnabled() || statisticsCollector == null) {
+      return Map.of();
+    }
+    Set<String> indexNames = extractIndexNames(relNode);
+    if (indexNames.isEmpty()) {
+      return Map.of();
+    }
+    Map<String, TableStatistics> stats = statisticsCollector.collect(indexNames);
+    if (logger.isDebugEnabled()) {
+      stats.forEach((name, s) -> logger.debug("CBO stats: {}", s));
+    }
+    return stats;
+  }
+
+  /** Extract all index names from TableScan nodes in the RelNode tree. */
+  private Set<String> extractIndexNames(RelNode node) {
+    Set<String> names = new LinkedHashSet<>();
+    extractIndexNamesRecursive(node, names);
+    return names;
+  }
+
+  private void extractIndexNamesRecursive(RelNode node, Set<String> names) {
+    if (node instanceof TableScan) {
+      List<String> qualifiedName = ((TableScan) node).getTable().getQualifiedName();
+      names.add(qualifiedName.get(qualifiedName.size() - 1));
+    }
+    for (RelNode input : node.getInputs()) {
+      extractIndexNamesRecursive(input, names);
+    }
+  }
+
   // ---- Runtime Filter Helpers ----
 
   /**
@@ -1061,23 +1148,24 @@ public class VeloxExecutionEngine {
    * smaller side is broadcast (CostEstimator decides).
    */
   private String selectBroadcastBuildSide(
-      PlanFragment coordinatorFragment, String leftIndex, String rightIndex) {
+      PlanFragment coordinatorFragment,
+      String leftIndex,
+      String rightIndex,
+      Map<String, TableStatistics> statsMap) {
     HashJoinNode joinNode = findHashJoinNode(coordinatorFragment.getPlanRoot());
     if (joinNode != null) {
       JoinType joinType = joinNode.getJoinType();
       if (joinType == JoinType.LEFT || joinType == JoinType.LEFT_SEMI_FILTER) {
-        // LEFT JOIN preserves left rows → left must be probe → build is right
         return "right";
       }
       if (joinType == JoinType.RIGHT) {
-        // RIGHT JOIN preserves right rows → right must be probe → build is left
         return "left";
       }
     }
-    // INNER or FULL: use cost estimator to pick smaller side
+    // INNER or FULL: use cost estimator to pick smaller side (by row count when available)
     CostEstimator estimator =
         new CostEstimator(
-            queryScheduler.getClusterService(), veloxLifecycle.getBroadcastMaxShards());
+            queryScheduler.getClusterService(), veloxLifecycle.getBroadcastMaxShards(), statsMap);
     return estimator.selectBuildSide(leftIndex, rightIndex);
   }
 
