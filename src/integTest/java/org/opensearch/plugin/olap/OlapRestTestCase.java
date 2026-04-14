@@ -145,4 +145,22 @@ public abstract class OlapRestTestCase extends OpenSearchTestCase {
   protected long countLogLines(String substring) throws IOException {
     return getLogLines(substring).size();
   }
+
+  /**
+   * Execute explain on a PPL query and return the Velox physical plan string. Uses the OLAP
+   * plugin's explain endpoint which calls PlanNode.toFormatString(true, true).
+   *
+   * @return the Velox plan tree (from calcite.physical field), or the full response if not
+   *     available
+   */
+  protected String explainVeloxPlan(String pplQuery) throws IOException {
+    JSONObject response = executePPLQuery("explain " + pplQuery);
+    if (response.has("calcite")) {
+      JSONObject calcite = response.getJSONObject("calcite");
+      if (calcite.has("physical")) {
+        return calcite.getString("physical");
+      }
+    }
+    return response.toString();
+  }
 }

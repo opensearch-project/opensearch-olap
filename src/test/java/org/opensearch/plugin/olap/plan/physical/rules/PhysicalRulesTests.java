@@ -13,9 +13,9 @@ public class PhysicalRulesTests extends OpenSearchTestCase {
     assertFalse(PhysicalRules.BASE_RULES.isEmpty());
   }
 
-  public void testBaseRulesHasSixRules() {
-    // TableScan, Filter, Project, Sort, Aggregate, Join
-    assertEquals(6, PhysicalRules.BASE_RULES.size());
+  public void testBaseRulesHasSevenRules() {
+    // TableScan, Filter, Project, Sort, Aggregate, Join, Window
+    assertEquals(7, PhysicalRules.BASE_RULES.size());
   }
 
   public void testMppRulesNotEmpty() {

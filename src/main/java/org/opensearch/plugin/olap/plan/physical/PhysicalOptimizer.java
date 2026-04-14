@@ -27,6 +27,7 @@ import org.apache.calcite.rel.logical.LogicalJoin;
 import org.apache.calcite.rel.logical.LogicalProject;
 import org.apache.calcite.rel.logical.LogicalSort;
 import org.apache.calcite.rel.logical.LogicalTableScan;
+import org.apache.calcite.rel.rules.CoreRules;
 import org.apache.calcite.rel.rules.FilterMergeRule;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -78,7 +79,11 @@ public class PhysicalOptimizer {
     // adjacent filters; this runs before the VolcanoPlanner so the cost-based
     // optimizer sees a cleaner plan.
     HepProgram hepProgram =
-        HepProgram.builder().addRuleInstance(FilterMergeRule.Config.DEFAULT.toRule()).build();
+        HepProgram.builder()
+            .addRuleInstance(FilterMergeRule.Config.DEFAULT.toRule())
+            // Decompose LogicalProject(RexOver) → LogicalWindow + LogicalProject
+            .addRuleInstance(CoreRules.PROJECT_TO_LOGICAL_PROJECT_AND_WINDOW)
+            .build();
     HepPlanner hepPlanner = new HepPlanner(hepProgram);
     hepPlanner.setRoot(copiedPlan);
     copiedPlan = hepPlanner.findBestExp();

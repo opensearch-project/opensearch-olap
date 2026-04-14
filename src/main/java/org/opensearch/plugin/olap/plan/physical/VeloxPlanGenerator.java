@@ -8,6 +8,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -18,12 +19,15 @@ import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.core.AggregateCall;
 import org.apache.calcite.rel.core.JoinRelType;
 import org.apache.calcite.rel.core.TableScan;
+import org.apache.calcite.rel.core.Window.Group;
+import org.apache.calcite.rel.core.Window.RexWinAggCall;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rel.type.RelDataTypeField;
 import org.apache.calcite.rex.RexCall;
 import org.apache.calcite.rex.RexInputRef;
 import org.apache.calcite.rex.RexLiteral;
 import org.apache.calcite.rex.RexNode;
+import org.apache.calcite.rex.RexWindowBound;
 import org.apache.calcite.sql.SqlKind;
 import org.apache.calcite.util.ImmutableBitSet;
 import org.apache.logging.log4j.LogManager;
@@ -43,12 +47,17 @@ import org.boostscale.velox4j.plan.OrderByNode;
 import org.boostscale.velox4j.plan.PlanNode;
 import org.boostscale.velox4j.plan.ProjectNode;
 import org.boostscale.velox4j.plan.TableScanNode;
+import org.boostscale.velox4j.plan.WindowNode;
 import org.boostscale.velox4j.sort.SortOrder;
 import org.boostscale.velox4j.type.BigIntType;
 import org.boostscale.velox4j.type.DoubleType;
 import org.boostscale.velox4j.type.RealType;
 import org.boostscale.velox4j.type.RowType;
 import org.boostscale.velox4j.type.Type;
+import org.boostscale.velox4j.window.BoundType;
+import org.boostscale.velox4j.window.WindowFrame;
+import org.boostscale.velox4j.window.WindowFunction;
+import org.boostscale.velox4j.window.WindowType;
 import org.opensearch.plugin.olap.plan.convert.PlanIdGenerator;
 import org.opensearch.plugin.olap.plan.convert.VeloxAggConverter;
 import org.opensearch.plugin.olap.plan.convert.VeloxExprConverter;
@@ -162,6 +171,9 @@ public class VeloxPlanGenerator {
     }
     if (node instanceof PhysicalSort) {
       return convertSort((PhysicalSort) node);
+    }
+    if (node instanceof PhysicalWindow) {
+      return convertWindow((PhysicalWindow) node);
     }
     throw new UnsupportedOperationException(
         "Unsupported physical node: " + node.getClass().getSimpleName());
@@ -618,6 +630,98 @@ public class VeloxPlanGenerator {
     }
 
     return source;
+  }
+
+  private PlanNode convertWindow(PhysicalWindow window) {
+    PlanNode source = toVeloxPlan(window.getInput());
+    if (source == null) {
+      source = createExchangeScan(window.getInput().getRowType());
+    }
+
+    RelDataType inputRowType = window.getInput().getRowType();
+    String nodeId = idGen.next();
+
+    // A Window can have multiple Groups (each with different partition/order specs).
+    // Velox WindowNode supports one partition+sort spec, so we handle the first group.
+    // Multiple groups would need chained WindowNodes (future enhancement).
+    if (window.groups.isEmpty()) {
+      return source;
+    }
+
+    Group group = window.groups.get(0);
+
+    // Partition keys
+    List<FieldAccessTypedExpr> partitionKeys = new ArrayList<>();
+    for (int fieldIndex : group.keys) {
+      RelDataTypeField field = inputRowType.getFieldList().get(fieldIndex);
+      Type veloxType = VeloxTypeConverter.toVeloxType(field.getType());
+      partitionKeys.add(FieldAccessTypedExpr.create(veloxType, field.getName()));
+    }
+
+    // Sort keys and orders
+    List<FieldAccessTypedExpr> sortingKeys = new ArrayList<>();
+    List<SortOrder> sortingOrders = new ArrayList<>();
+    for (RelFieldCollation fieldCollation : group.orderKeys.getFieldCollations()) {
+      int fieldIndex = fieldCollation.getFieldIndex();
+      RelDataTypeField field = inputRowType.getFieldList().get(fieldIndex);
+      Type veloxType = VeloxTypeConverter.toVeloxType(field.getType());
+      sortingKeys.add(FieldAccessTypedExpr.create(veloxType, field.getName()));
+      boolean ascending = !fieldCollation.getDirection().isDescending();
+      boolean nullsFirst = fieldCollation.nullDirection == RelFieldCollation.NullDirection.FIRST;
+      sortingOrders.add(new SortOrder(ascending, nullsFirst));
+    }
+
+    // Window frame
+    WindowType windowType = group.isRows ? WindowType.ROWS : WindowType.RANGE;
+    BoundType startBound = convertBoundType(group.lowerBound, true);
+    BoundType endBound = convertBoundType(group.upperBound, false);
+    WindowFrame frame = new WindowFrame(windowType, startBound, null, endBound, null);
+
+    // Window functions (RexWinAggCall → WindowFunction)
+    List<String> windowColumnNames = new ArrayList<>();
+    List<WindowFunction> windowFunctions = new ArrayList<>();
+    VeloxExprConverter exprConverter = new VeloxExprConverter(inputRowType);
+
+    int outputFieldOffset = inputRowType.getFieldCount();
+    for (int i = 0; i < group.aggCalls.size(); i++) {
+      RexWinAggCall aggCall = group.aggCalls.get(i);
+
+      // Output column name from the window's row type
+      String colName = window.getRowType().getFieldList().get(outputFieldOffset + i).getName();
+      windowColumnNames.add(colName);
+
+      // Convert function call
+      String funcName = aggCall.getOperator().getName().toLowerCase(Locale.ROOT);
+      Type returnType = VeloxTypeConverter.toVeloxType(aggCall.getType());
+
+      List<TypedExpr> args = new ArrayList<>();
+      for (RexNode operand : aggCall.getOperands()) {
+        args.add(exprConverter.convert(operand));
+      }
+
+      CallTypedExpr callExpr = new CallTypedExpr(returnType, args, funcName);
+      windowFunctions.add(new WindowFunction(callExpr, frame, false));
+    }
+
+    return new WindowNode(
+        nodeId,
+        partitionKeys,
+        sortingKeys,
+        sortingOrders,
+        windowColumnNames,
+        windowFunctions,
+        false,
+        Collections.singletonList(source));
+  }
+
+  private BoundType convertBoundType(RexWindowBound bound, boolean isLower) {
+    if (bound.isUnbounded()) {
+      return isLower ? BoundType.UNBOUNDED_PRECEDING : BoundType.UNBOUNDED_FOLLOWING;
+    }
+    if (bound.isCurrentRow()) {
+      return BoundType.CURRENT_ROW;
+    }
+    return isLower ? BoundType.PRECEDING : BoundType.FOLLOWING;
   }
 
   // ---- Helpers ----

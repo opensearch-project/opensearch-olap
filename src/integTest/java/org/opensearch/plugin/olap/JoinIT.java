@@ -283,6 +283,32 @@ public class JoinIT extends OlapRestTestCase {
     }
   }
 
+  // ---- Plan structure verification ----
+
+  public void testInnerJoinPlanContainsHashJoinNode() throws IOException {
+    String plan =
+        explainVeloxPlan(
+            "source = "
+                + EMPLOYEES_INDEX
+                + " | inner join left=e right=d ON e.dept_id = d.dept_id "
+                + DEPARTMENTS_INDEX
+                + " | fields e.name, d.dept_name");
+    assertTrue("Plan should contain HashJoin node", plan.contains("HashJoin"));
+    assertTrue("Plan should indicate INNER join", plan.contains("INNER"));
+  }
+
+  public void testLeftJoinPlanContainsLeftJoinType() throws IOException {
+    String plan =
+        explainVeloxPlan(
+            "source = "
+                + EMPLOYEES_INDEX
+                + " | left join left=e right=d ON e.dept_id = d.dept_id "
+                + DEPARTMENTS_INDEX
+                + " | fields e.name, d.dept_name");
+    assertTrue("Plan should contain HashJoin node", plan.contains("HashJoin"));
+    assertTrue("Plan should indicate LEFT join", plan.contains("LEFT"));
+  }
+
   private Set<String> extractStringColumn(JSONArray rows, int colIndex) {
     Set<String> values = new HashSet<>();
     for (int i = 0; i < rows.length(); i++) {

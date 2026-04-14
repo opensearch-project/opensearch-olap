@@ -362,6 +362,21 @@ public class RuntimeFilterIT extends OlapRestTestCase {
     assertTrue(names.contains("Charlie"));
   }
 
+  // ---- Plan structure verification ----
+
+  public void testInnerJoinPlanContainsHashJoinWithRf() throws IOException {
+    setRuntimeFilter(true);
+    String plan =
+        explainVeloxPlan(
+            "source = "
+                + EMPLOYEES_INDEX
+                + " | inner join left=e right=d ON e.dept_id = d.dept_id "
+                + DEPARTMENTS_INDEX
+                + " | fields e.name, d.dept_name");
+    assertTrue("Plan should contain HashJoin node", plan.contains("HashJoin"));
+    assertTrue("Plan should indicate INNER join", plan.contains("INNER"));
+  }
+
   // ---- RF appears in logs ----
 
   public void testRfAppearsInLogs() throws IOException {

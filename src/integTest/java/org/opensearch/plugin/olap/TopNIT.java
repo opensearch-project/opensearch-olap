@@ -113,6 +113,24 @@ public class TopNIT extends OlapRestTestCase {
     assertEquals(88000.0, rows.getJSONArray(0).getDouble(2), 0.01);
   }
 
+  // ---- Plan structure verification ----
+
+  public void testSortLimitPlanContainsOrderByAndLimit() throws IOException {
+    String plan = explainVeloxPlan("source=test_olap | sort salary | head 3");
+
+    assertTrue("Plan should contain OrderBy node", plan.contains("OrderBy"));
+    assertTrue("Plan should contain Limit node", plan.contains("Limit"));
+    assertTrue("Plan should have SOURCE fragment", plan.contains("[SOURCE]"));
+  }
+
+  public void testSortWithoutExplicitLimitPlanHasOrderBy() throws IOException {
+    String plan = explainVeloxPlan("source=test_olap | sort salary | fields name, salary");
+
+    assertTrue("Plan should contain OrderBy node", plan.contains("OrderBy"));
+    // Note: SQL plugin adds a SystemLimit (default 10000 rows) to all queries,
+    // so a LimitNode may still appear even without explicit `head N`.
+  }
+
   // ---- TopN correctness: same results with and without TopN path ----
 
   public void testTopNProducesSameResultsAsFullSort() throws IOException {
