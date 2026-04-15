@@ -4,7 +4,38 @@ This document lists which PPL built-in functions are supported by the Velox vect
 
 ## How it works
 
-When a PPL query arrives, `canVectorize()` scans all expressions in the plan. If every function is in the supported set, the entire query runs through Velox. If any function is unsupported, the entire query falls back to the default engine (no partial vectorization).
+When a PPL query arrives, `canVectorize()` checks:
+1. **RelNode types** — all operators (scan, filter, project, join, sort, aggregate, window) must be supported
+2. **Field types** — all columns in the scan must have Velox-compatible types (no `ANY`, no `MAP<VARCHAR, ANY>`)
+3. **Functions** — all RexCall expressions must use supported functions (see tables below)
+
+If any check fails, the entire query falls back to the default engine (no partial vectorization).
+
+### `force_vectorize` setting
+
+The dynamic setting `plugins.velox.force_vectorize` (default `false`) bypasses all `canVectorize()` checks. When enabled, all queries go through Velox — unsupported types or functions cause explicit errors instead of silent fallback. Used in integration tests to verify Velox coverage.
+
+## Known Limitations
+
+### Nested object fields (MAP type)
+
+OpenSearch `object` fields (e.g., `cloud`, `aws.cloudwatch`, `agent`) are mapped by the SQL plugin's Calcite schema as `MAP<VARCHAR, ANY>`. Velox cannot handle the `ANY` value type, so **any query scanning a table with nested object fields falls back to the default engine**.
+
+This is the primary reason the Big5 benchmark queries fall back — all 58 queries scan the `big5` table which has nested objects like `cloud.region`, `aws.cloudwatch.log_stream`, etc.
+
+**Workaround:** Use flat index mappings with only top-level keyword/numeric/date fields (no nested objects).
+
+**Fix plan:**
+- Short-term: Flatten the Calcite schema for object fields in `ClusterCopyShuttle` — convert `MAP<VARCHAR, ANY>` to individual typed columns using the index mapping
+- Long-term: Support MAP type in VeloxTypeConverter + LuceneArrowReader by reading nested doc values with dot-path field names
+
+### Fields without doc values
+
+The Velox engine reads data from Lucene doc values only. Field types without doc values (`text`, `match_only_text`) cannot be read by `LuceneArrowReader`. Queries scanning these columns will get null/empty values or crash.
+
+**Affected types:** `text` (no doc values by default), `match_only_text` (never has doc values)
+
+**Workaround:** Use `keyword` type instead of `text` for fields that need vectorized execution. Or add `| fields` to PPL queries to project only supported columns.
 
 ## Mathematical Functions
 

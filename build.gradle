@@ -206,7 +206,6 @@ dependencies {
 sourceSets {
     integTest {
         java.srcDir 'src/integTest/java'
-        resources.srcDir 'src/integTest/resources'
         compileClasspath += sourceSets.main.output
         runtimeClasspath += output + compileClasspath
     }
@@ -281,6 +280,8 @@ tasks.register('integTest', StandaloneRestIntegTestTask) {
     nonInputProperties.systemProperty('tests.cluster.logfile',
         "${-> testClusters.integTest.nodes.first().getServerLog()}")
     systemProperty 'tests.security.manager', 'false'
+    // Pass project root so tests can read resource files from src/integTest/resources/
+    systemProperty 'tests.project.root', project.projectDir.absolutePath
 
     testLogging {
         events "passed", "failed", "skipped"

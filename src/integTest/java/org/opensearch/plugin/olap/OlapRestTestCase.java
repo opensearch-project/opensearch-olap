@@ -5,8 +5,6 @@
 package org.opensearch.plugin.olap;
 
 import java.io.IOException;
-import java.io.InputStream;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Arrays;
@@ -40,7 +38,8 @@ public abstract class OlapRestTestCase extends OpenSearchTestCase {
     TEST_OLAP("test_olap", "test_olap_mapping.json", "test_olap_data.json"),
     EMPLOYEES("employees", "employees_mapping.json", "employees_data.json"),
     DEPARTMENTS("departments", "departments_mapping.json", "departments_data.json"),
-    PROJECTS("projects", "projects_mapping.json", "projects_data.json");
+    PROJECTS("projects", "projects_mapping.json", "projects_data.json"),
+    BIG5("big5", "big5_mapping.json", "big5_data.json");
 
     private final String indexName;
     private final String mappingFile;
@@ -94,6 +93,20 @@ public abstract class OlapRestTestCase extends OpenSearchTestCase {
     return restClient;
   }
 
+  private static volatile boolean forceVectorizeSet = false;
+
+  @Override
+  public void setUp() throws Exception {
+    super.setUp();
+    // Enable force_vectorize once per test run so all queries go through Velox.
+    // If a query uses unsupported types/functions, it fails explicitly instead of
+    // silently falling back to the default engine.
+    if (!forceVectorizeSet) {
+      setClusterSetting("plugins.velox.force_vectorize", true);
+      forceVectorizeSet = true;
+    }
+  }
+
   @Override
   public void tearDown() throws Exception {
     super.tearDown();
@@ -107,7 +120,7 @@ public abstract class OlapRestTestCase extends OpenSearchTestCase {
    */
   protected void loadIndex(Index index) throws IOException {
     createIndex(index.getName(), readResource(index.getMappingFile()));
-    bulkInsert(readResource(index.getDataFile()));
+    bulkInsert(index.getName(), readResource(index.getDataFile()));
   }
 
   /**
@@ -122,7 +135,7 @@ public abstract class OlapRestTestCase extends OpenSearchTestCase {
     settings.put("number_of_replicas", 0);
     json.put("settings", settings);
     createIndex(index.getName(), json.toString());
-    bulkInsert(readResource(index.getDataFile()));
+    bulkInsert(index.getName(), readResource(index.getDataFile()));
   }
 
   /** Safely delete an index (ignores 404 if index doesn't exist). */
@@ -161,27 +174,22 @@ public abstract class OlapRestTestCase extends OpenSearchTestCase {
     client().performRequest(request);
   }
 
-  private void bulkInsert(String bulkData) throws IOException {
-    Request request = new Request("POST", "/_bulk?refresh=true");
+  private void bulkInsert(String indexName, String bulkData) throws IOException {
+    Request request = new Request("POST", "/" + indexName + "/_bulk?refresh=true");
     request.setJsonEntity(bulkData);
     client().performRequest(request);
   }
 
-  private String readResource(String fileName) throws IOException {
-    // Try multiple classloader strategies — OpenSearch's SecurityManager may restrict access
-    InputStream is = getClass().getResourceAsStream("/" + fileName);
-    if (is == null) {
-      is = Thread.currentThread().getContextClassLoader().getResourceAsStream(fileName);
-    }
-    if (is == null) {
-      is = getClass().getClassLoader().getResourceAsStream(fileName);
-    }
-    if (is == null) {
-      throw new IOException("Resource not found: " + fileName);
-    }
-    try (InputStream stream = is) {
-      return new String(stream.readAllBytes(), StandardCharsets.UTF_8);
-    }
+  private static final String RESOURCE_DIR;
+
+  static {
+    String root = System.getProperty("tests.project.root", ".");
+    RESOURCE_DIR = root + "/src/integTest/resources/";
+  }
+
+  /** Read a resource file directly from the filesystem. */
+  protected String readResource(String fileName) throws IOException {
+    return Files.readString(Path.of(RESOURCE_DIR + fileName));
   }
 
   // ---- Query execution ----
@@ -189,7 +197,10 @@ public abstract class OlapRestTestCase extends OpenSearchTestCase {
   /** Execute a PPL query and return the JSON response. */
   protected JSONObject executePPLQuery(String query) throws IOException {
     Request request = new Request("POST", PPL_ENDPOINT);
-    request.setJsonEntity("{\"query\": \"" + query + "\"}");
+    // Use JSONObject to properly escape the query string (handles newlines, quotes, etc.)
+    JSONObject payload = new JSONObject();
+    payload.put("query", query);
+    request.setJsonEntity(payload.toString());
     Response response = client().performRequest(request);
     assertEquals(200, response.getStatusLine().getStatusCode());
     String body = new String(response.getEntity().getContent().readAllBytes());
