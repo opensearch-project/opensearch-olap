@@ -1,0 +1,10 @@
+{
+  "mappings": {
+    "properties": {
+      "emp_id": { "type": "integer" },
+      "name": { "type": "keyword" },
+      "dept_id": { "type": "integer" },
+      "salary": { "type": "double" }
+    }
+  }
+}

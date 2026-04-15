@@ -62,6 +62,17 @@ public class CalciteTestHelper {
             .build();
     rootSchema.add("departments", new SimpleTable(deptType));
 
+    // projects table (for multi-way join tests)
+    RelDataType projType =
+        TYPE_FACTORY
+            .builder()
+            .add("project_id", SqlTypeName.INTEGER)
+            .add("project_name", SqlTypeName.VARCHAR)
+            .add("dept_id", SqlTypeName.INTEGER)
+            .add("budget", SqlTypeName.DOUBLE)
+            .build();
+    rootSchema.add("projects", new SimpleTable(projType));
+
     return RelBuilder.create(Frameworks.newConfigBuilder().defaultSchema(rootSchema).build());
   }
 }

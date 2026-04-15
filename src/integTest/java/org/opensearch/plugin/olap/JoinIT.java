@@ -11,8 +11,6 @@ import java.util.Map;
 import java.util.Set;
 import org.json.JSONArray;
 import org.json.JSONObject;
-import org.opensearch.client.Request;
-import org.opensearch.client.ResponseException;
 
 /**
  * Integration tests for distributed join queries executed through the Velox engine. Uses PPL join
@@ -41,19 +39,17 @@ import org.opensearch.client.ResponseException;
  */
 public class JoinIT extends OlapRestTestCase {
 
-  private static final String EMPLOYEES_INDEX = "employees";
-  private static final String DEPARTMENTS_INDEX = "departments";
-
   @Override
   public void setUp() throws Exception {
     super.setUp();
-    createJoinTestIndices();
+    loadIndex(Index.EMPLOYEES);
+    loadIndex(Index.DEPARTMENTS);
   }
 
   @Override
   public void tearDown() throws Exception {
-    deleteIndex(EMPLOYEES_INDEX);
-    deleteIndex(DEPARTMENTS_INDEX);
+    deleteIndex(Index.EMPLOYEES.getName());
+    deleteIndex(Index.DEPARTMENTS.getName());
     super.tearDown();
   }
 
@@ -64,9 +60,9 @@ public class JoinIT extends OlapRestTestCase {
     JSONObject response =
         executePPLQuery(
             "source = "
-                + EMPLOYEES_INDEX
+                + Index.EMPLOYEES.getName()
                 + " | inner join left=e right=d ON e.dept_id = d.dept_id "
-                + DEPARTMENTS_INDEX
+                + Index.DEPARTMENTS.getName()
                 + " | fields e.name, d.dept_name");
     JSONArray rows = getDataRows(response);
 
@@ -91,10 +87,10 @@ public class JoinIT extends OlapRestTestCase {
     JSONObject response =
         executePPLQuery(
             "source = "
-                + EMPLOYEES_INDEX
+                + Index.EMPLOYEES.getName()
                 + " | where dept_id = 10"
                 + " | inner join left=e right=d ON e.dept_id = d.dept_id "
-                + DEPARTMENTS_INDEX
+                + Index.DEPARTMENTS.getName()
                 + " | fields e.name, d.dept_name");
     JSONArray rows = getDataRows(response);
 
@@ -109,9 +105,9 @@ public class JoinIT extends OlapRestTestCase {
     JSONObject response =
         executePPLQuery(
             "source = "
-                + EMPLOYEES_INDEX
+                + Index.EMPLOYEES.getName()
                 + " | inner join left=e right=d ON e.dept_id = d.dept_id "
-                + DEPARTMENTS_INDEX
+                + Index.DEPARTMENTS.getName()
                 + " | stats count() by d.dept_name");
     JSONArray rows = getDataRows(response);
 
@@ -132,9 +128,9 @@ public class JoinIT extends OlapRestTestCase {
     JSONObject response =
         executePPLQuery(
             "source = "
-                + EMPLOYEES_INDEX
+                + Index.EMPLOYEES.getName()
                 + " | inner join left=e right=d ON e.dept_id = d.dept_id "
-                + DEPARTMENTS_INDEX
+                + Index.DEPARTMENTS.getName()
                 + " | stats avg(e.salary) by d.dept_name");
     JSONArray rows = getDataRows(response);
 
@@ -156,9 +152,9 @@ public class JoinIT extends OlapRestTestCase {
     JSONObject response =
         executePPLQuery(
             "source = "
-                + EMPLOYEES_INDEX
+                + Index.EMPLOYEES.getName()
                 + " | left join left=e right=d ON e.dept_id = d.dept_id "
-                + DEPARTMENTS_INDEX
+                + Index.DEPARTMENTS.getName()
                 + " | fields e.name, d.dept_name");
     JSONArray rows = getDataRows(response);
 
@@ -173,9 +169,9 @@ public class JoinIT extends OlapRestTestCase {
     JSONObject response =
         executePPLQuery(
             "source = "
-                + EMPLOYEES_INDEX
+                + Index.EMPLOYEES.getName()
                 + " | inner join left=e right=d ON e.dept_id = d.dept_id "
-                + DEPARTMENTS_INDEX
+                + Index.DEPARTMENTS.getName()
                 + " | fields e.name, e.salary, d.dept_name");
     JSONArray rows = getDataRows(response);
 
@@ -191,9 +187,9 @@ public class JoinIT extends OlapRestTestCase {
     JSONObject response =
         executePPLQuery(
             "source = "
-                + EMPLOYEES_INDEX
+                + Index.EMPLOYEES.getName()
                 + " | inner join left=e right=d ON e.dept_id = d.dept_id "
-                + DEPARTMENTS_INDEX
+                + Index.DEPARTMENTS.getName()
                 + " | head 3"
                 + " | fields e.name, d.dept_name");
     JSONArray rows = getDataRows(response);
@@ -208,79 +204,13 @@ public class JoinIT extends OlapRestTestCase {
 
     executePPLQuery(
         "source = "
-            + EMPLOYEES_INDEX
+            + Index.EMPLOYEES.getName()
             + " | inner join left=e right=d ON e.dept_id = d.dept_id "
-            + DEPARTMENTS_INDEX
+            + Index.DEPARTMENTS.getName()
             + " | fields e.name, d.dept_name");
 
     long afterCount = countLogLines("join");
     assertTrue("Expected join-related log entries", afterCount > beforeCount);
-  }
-
-  // ---- Helpers ----
-
-  private void createJoinTestIndices() throws IOException {
-    // Create employees index
-    Request createEmployees = new Request("PUT", "/" + EMPLOYEES_INDEX);
-    createEmployees.setJsonEntity(
-        "{"
-            + "\"settings\": {\"number_of_shards\": 1, \"number_of_replicas\": 0},"
-            + "\"mappings\": {\"properties\": {"
-            + "\"emp_id\": {\"type\": \"integer\"},"
-            + "\"name\": {\"type\": \"keyword\"},"
-            + "\"dept_id\": {\"type\": \"integer\"},"
-            + "\"salary\": {\"type\": \"double\"}"
-            + "}}"
-            + "}");
-    client().performRequest(createEmployees);
-
-    // Create departments index
-    Request createDepts = new Request("PUT", "/" + DEPARTMENTS_INDEX);
-    createDepts.setJsonEntity(
-        "{"
-            + "\"settings\": {\"number_of_shards\": 1, \"number_of_replicas\": 0},"
-            + "\"mappings\": {\"properties\": {"
-            + "\"dept_id\": {\"type\": \"integer\"},"
-            + "\"dept_name\": {\"type\": \"keyword\"}"
-            + "}}"
-            + "}");
-    client().performRequest(createDepts);
-
-    // Bulk insert employees
-    Request bulkEmp = new Request("POST", "/_bulk?refresh=true");
-    bulkEmp.setJsonEntity(
-        "{\"index\": {\"_index\": \"employees\"}}\n"
-            + "{\"emp_id\": 1, \"name\": \"Alice\", \"dept_id\": 10, \"salary\": 120000}\n"
-            + "{\"index\": {\"_index\": \"employees\"}}\n"
-            + "{\"emp_id\": 2, \"name\": \"Bob\", \"dept_id\": 20, \"salary\": 95000}\n"
-            + "{\"index\": {\"_index\": \"employees\"}}\n"
-            + "{\"emp_id\": 3, \"name\": \"Charlie\", \"dept_id\": 10, \"salary\": 150000}\n"
-            + "{\"index\": {\"_index\": \"employees\"}}\n"
-            + "{\"emp_id\": 4, \"name\": \"Diana\", \"dept_id\": 30, \"salary\": 110000}\n"
-            + "{\"index\": {\"_index\": \"employees\"}}\n"
-            + "{\"emp_id\": 5, \"name\": \"Eve\", \"dept_id\": 20, \"salary\": 88000}\n");
-    client().performRequest(bulkEmp);
-
-    // Bulk insert departments
-    Request bulkDept = new Request("POST", "/_bulk?refresh=true");
-    bulkDept.setJsonEntity(
-        "{\"index\": {\"_index\": \"departments\"}}\n"
-            + "{\"dept_id\": 10, \"dept_name\": \"Engineering\"}\n"
-            + "{\"index\": {\"_index\": \"departments\"}}\n"
-            + "{\"dept_id\": 20, \"dept_name\": \"Marketing\"}\n"
-            + "{\"index\": {\"_index\": \"departments\"}}\n"
-            + "{\"dept_id\": 30, \"dept_name\": \"Sales\"}\n");
-    client().performRequest(bulkDept);
-  }
-
-  private void deleteIndex(String indexName) throws IOException {
-    try {
-      client().performRequest(new Request("DELETE", "/" + indexName));
-    } catch (ResponseException e) {
-      if (e.getResponse().getStatusLine().getStatusCode() != 404) {
-        throw e;
-      }
-    }
   }
 
   // ---- Plan structure verification ----
@@ -289,9 +219,9 @@ public class JoinIT extends OlapRestTestCase {
     String plan =
         explainVeloxPlan(
             "source = "
-                + EMPLOYEES_INDEX
+                + Index.EMPLOYEES.getName()
                 + " | inner join left=e right=d ON e.dept_id = d.dept_id "
-                + DEPARTMENTS_INDEX
+                + Index.DEPARTMENTS.getName()
                 + " | fields e.name, d.dept_name");
     assertTrue("Plan should contain HashJoin node", plan.contains("HashJoin"));
     assertTrue("Plan should indicate INNER join", plan.contains("INNER"));
@@ -301,9 +231,9 @@ public class JoinIT extends OlapRestTestCase {
     String plan =
         explainVeloxPlan(
             "source = "
-                + EMPLOYEES_INDEX
+                + Index.EMPLOYEES.getName()
                 + " | left join left=e right=d ON e.dept_id = d.dept_id "
-                + DEPARTMENTS_INDEX
+                + Index.DEPARTMENTS.getName()
                 + " | fields e.name, d.dept_name");
     assertTrue("Plan should contain HashJoin node", plan.contains("HashJoin"));
     assertTrue("Plan should indicate LEFT join", plan.contains("LEFT"));

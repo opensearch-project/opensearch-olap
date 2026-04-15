@@ -9,8 +9,6 @@ import java.util.HashMap;
 import java.util.Map;
 import org.json.JSONArray;
 import org.json.JSONObject;
-import org.opensearch.client.Request;
-import org.opensearch.client.Response;
 
 /**
  * Integration tests for segment-level parallel reads. Verifies that queries produce correct results
@@ -25,22 +23,18 @@ public class ParallelReadIT extends OlapRestTestCase {
   @Override
   public void setUp() throws Exception {
     super.setUp();
-    createTestIndex();
+    loadIndex(Index.TEST_OLAP);
   }
 
   @Override
   public void tearDown() throws Exception {
-    deleteTestIndex();
-    setSegmentParallelism(4); // restore default
+    deleteIndex(Index.TEST_OLAP.getName());
+    setClusterSetting("plugins.velox.segment_parallelism", "4"); // restore default
     super.tearDown();
   }
 
   private void setSegmentParallelism(int parallelism) throws IOException {
-    Request request = new Request("PUT", "/_cluster/settings");
-    request.setJsonEntity(
-        "{\"persistent\": {\"plugins.velox.segment_parallelism\": " + parallelism + "}}");
-    Response response = client().performRequest(request);
-    assertEquals(200, response.getStatusLine().getStatusCode());
+    setClusterSetting("plugins.velox.segment_parallelism", String.valueOf(parallelism));
   }
 
   // ---- Parallel reads (default) produce correct results ----

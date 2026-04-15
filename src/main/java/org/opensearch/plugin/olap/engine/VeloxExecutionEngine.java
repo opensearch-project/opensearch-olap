@@ -172,18 +172,15 @@ public class VeloxExecutionEngine {
     logger.info("Executing query {} via Velox engine", queryId);
 
     try {
-      // Step 0: Collect CBO statistics (row counts) if enabled
-      // Only collect when the plan contains a join and MPP is enabled, to avoid
-      // unnecessary IndicesStats RPC for single-table scans/aggregations.
-      // TODO: Relax the mpp_enabled guard when join reorder or other non-MPP
-      //  optimizations need statistics at planning time.
+      // Step 0: Collect CBO statistics (row counts) if enabled.
+      // Stats are used for join reorder (planning time) and MPP strategy selection (execution
+      // time).
       Map<String, TableStatistics> statsMap =
-          veloxLifecycle.isMppEnabled() && planContainsJoin(relNode)
-              ? collectStatistics(relNode)
-              : Map.of();
+          planContainsJoin(relNode) ? collectStatistics(relNode) : Map.of();
 
-      // Physical optimization: VolcanoPlanner with PhysicalConvention
-      PhysicalOptimizer optimizer = new PhysicalOptimizer(veloxLifecycle.isMppEnabled());
+      // Physical optimization: VolcanoPlanner with PhysicalConvention.
+      // Stats are passed to enable join reorder via MultiJoinOptimizeBushyRule.
+      PhysicalOptimizer optimizer = new PhysicalOptimizer(veloxLifecycle.isMppEnabled(), statsMap);
       RelNode physicalPlan = optimizer.optimize(relNode);
 
       // Generate Velox PlanNodes + PlanFragments from the physical plan
@@ -233,16 +230,26 @@ public class VeloxExecutionEngine {
     // MPP join strategy selection: when mpp_enabled=true and this is a multi-table join,
     // CostEstimator decides between BROADCAST and HASH_SHUFFLE.
     if (veloxLifecycle.isMppEnabled() && leafFragments.size() >= 2 && coordinatorFragment != null) {
-      JoinStrategy strategy = selectJoinStrategy(leafFragments, statsMap);
-      logger.info("MPP join strategy for query {}: {}", queryId, strategy);
-      switch (strategy) {
-        case BROADCAST:
-          return executeBroadcastFragments(
-              relNode, leafFragments, coordinatorFragment, queryId, statsMap);
-        case HASH_SHUFFLE:
-          return executeShuffleFragments(relNode, fragments, queryId);
-        default:
-          break; // fall through to coordinator-centric
+      if (leafFragments.size() > 2) {
+        // Multi-way join (3+ tables): fall back to coordinator-centric execution.
+        // TODO: Implement staged MPP execution — decompose nested joins into
+        //  sequential binary broadcast/shuffle operations for full MPP multi-way.
+        logger.info(
+            "Multi-way join ({} tables) for query {} — using coordinator-centric execution",
+            leafFragments.size(),
+            queryId);
+      } else {
+        JoinStrategy strategy = selectJoinStrategy(leafFragments, statsMap);
+        logger.info("MPP join strategy for query {}: {}", queryId, strategy);
+        switch (strategy) {
+          case BROADCAST:
+            return executeBroadcastFragments(
+                relNode, leafFragments, coordinatorFragment, queryId, statsMap);
+          case HASH_SHUFFLE:
+            return executeShuffleFragments(relNode, fragments, queryId);
+          default:
+            break; // fall through to coordinator-centric
+        }
       }
     }
 
@@ -271,7 +278,7 @@ public class VeloxExecutionEngine {
           leafResponses.size());
       finalResponses = executeCoordinatorFragment(coordinatorFragment, leafResponses);
     } else {
-      // Multi-input coordinator (join: left scan + right scan → HashJoinNode)
+      // Multi-input coordinator (join: N leaf scans → nested HashJoinNodes)
       logger.info(
           "Executing coordinator join for query {} with {} leaf stages",
           queryId,
@@ -280,11 +287,7 @@ public class VeloxExecutionEngine {
           groupResponsesByFragment(leafResponses, leafStages);
       List<List<ExecuteFragmentResponse>> inputGroups =
           new ArrayList<>(responsesByFragment.values());
-      finalResponses =
-          executeCoordinatorJoin(
-              coordinatorFragment,
-              inputGroups.size() > 0 ? inputGroups.get(0) : Collections.emptyList(),
-              inputGroups.size() > 1 ? inputGroups.get(1) : Collections.emptyList());
+      finalResponses = executeCoordinatorJoin(coordinatorFragment, inputGroups);
     }
 
     return buildQueryResponse(relNode.getRowType(), finalResponses);
@@ -571,13 +574,12 @@ public class VeloxExecutionEngine {
   }
 
   /**
-   * Execute a join on the coordinator node by deserializing both sides into BlockingQueues and
-   * running the HashJoinNode through Velox.
+   * Execute a join on the coordinator node with N input groups (2 for binary join, 3+ for
+   * multi-way). Each input group corresponds to a leaf stage's responses. The coordinator plan has
+   * N exchange scan placeholders that are wired to N BlockingQueues.
    */
   private List<ExecuteFragmentResponse> executeCoordinatorJoin(
-      PlanFragment coordinatorFragment,
-      List<ExecuteFragmentResponse> leftResponses,
-      List<ExecuteFragmentResponse> rightResponses) {
+      PlanFragment coordinatorFragment, List<List<ExecuteFragmentResponse>> inputGroups) {
     Session session = veloxLifecycle.getSession();
     String connectorId = "connector-external-stream";
 
@@ -588,45 +590,50 @@ public class VeloxExecutionEngine {
 
     if (scanIds.size() < 2) {
       logger.warn("Coordinator join plan has < 2 scan nodes, falling back to single-input");
-      return executeCoordinatorFragment(coordinatorFragment, leftResponses);
+      return executeCoordinatorFragment(
+          coordinatorFragment,
+          inputGroups.isEmpty() ? Collections.emptyList() : inputGroups.get(0));
     }
 
-    String leftScanId = scanIds.get(0);
-    String rightScanId = scanIds.get(1);
+    int numInputs = Math.min(scanIds.size(), inputGroups.size());
+    logger.info("Executing coordinator join plan with {} inputs, scan IDs: {}", numInputs, scanIds);
 
-    // Create BlockingQueues for both sides
-    BlockingQueue leftQueue = session.externalStreamOps().newBlockingQueue();
-    BlockingQueue rightQueue = session.externalStreamOps().newBlockingQueue();
+    // Create BlockingQueues for all inputs
+    List<BlockingQueue> queues = new ArrayList<>();
+    for (int i = 0; i < numInputs; i++) {
+      queues.add(session.externalStreamOps().newBlockingQueue());
+    }
 
     // Build and execute the coordinator plan as-is (exchange scans already in place)
     ConnectorConfig connectorConfig = ConnectorConfig.create(Map.of(connectorId, Config.empty()));
     Query query = new Query(coordinatorFragment.getPlanRoot(), Config.empty(), connectorConfig);
 
-    logger.info("Executing coordinator join plan with scan IDs: {}, {}", leftScanId, rightScanId);
-
     SerialTask serialTask = session.queryOps().execute(query);
 
-    // Wire splits to the actual exchange scan node IDs
-    serialTask.addSplit(leftScanId, new ExternalStreamConnectorSplit(connectorId, leftQueue.id()));
-    serialTask.addSplit(
-        rightScanId, new ExternalStreamConnectorSplit(connectorId, rightQueue.id()));
-    serialTask.noMoreSplits(leftScanId);
-    serialTask.noMoreSplits(rightScanId);
+    // Wire splits for all inputs
+    for (int i = 0; i < numInputs; i++) {
+      String scanId = scanIds.get(i);
+      serialTask.addSplit(
+          scanId, new ExternalStreamConnectorSplit(connectorId, queues.get(i).id()));
+      serialTask.noMoreSplits(scanId);
+    }
 
-    // Start feeder threads for both sides
-    Thread leftFeeder =
-        createFeederThread(session, leftResponses, leftQueue, "olap-join-left-feeder");
-    Thread rightFeeder =
-        createFeederThread(session, rightResponses, rightQueue, "olap-join-right-feeder");
-    leftFeeder.start();
-    rightFeeder.start();
+    // Start feeder threads for all inputs
+    List<Thread> feeders = new ArrayList<>();
+    for (int i = 0; i < numInputs; i++) {
+      Thread feeder =
+          createFeederThread(session, inputGroups.get(i), queues.get(i), "olap-join-feeder-" + i);
+      feeder.start();
+      feeders.add(feeder);
+    }
 
     // Collect results with timeout
     BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE);
     try {
       byte[] resultData = collectResultsWithTimeout(session, serialTask, allocator, 60);
-      leftFeeder.join(5_000);
-      rightFeeder.join(5_000);
+      for (Thread feeder : feeders) {
+        feeder.join(5_000);
+      }
       return List.of(ExecuteFragmentResponse.success(0, resultData));
     } catch (Exception e) {
       throw new RuntimeException("Coordinator join execution failed", e);

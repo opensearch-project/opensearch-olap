@@ -18,8 +18,10 @@ OLAP Plugin: VeloxExecutionEngine           OpenSearchExecutionEngine
   PhysicalOptimizer
     1. ClusterCopyShuttle: deep-copies plan into new VolcanoPlanner
        - Strips CalciteLogicalIndexScan → plain LogicalTableScan
+       - Injects CBO row counts via StatisticsTableScan (when available)
        - New cluster has RelDistributionTraitDef from start
-    2. HepPlanner: FilterMergeRule (lightweight logical cleanup)
+    2. HepPlanner: FilterMergeRule, ProjectToWindowRule, join reorder
+       (JoinToMultiJoinRule → MultiJoinOptimizeBushyRule / LoptOptimizeJoinRule)
     3. VolcanoPlanner with ConverterRules:
        - Convention.NONE → PhysicalConvention
        - PhysicalAggregateRule inserts PhysicalExchange(SINGLETON) before agg
@@ -168,7 +170,7 @@ Uses Calcite's Convention + VolcanoPlanner, wired into `VeloxExecutionEngine.exe
 - `PhysicalTableScan` overrides `deriveRowType()` to preserve the SQL plugin's scan row type
 - ConverterRules convert Convention.NONE → PhysicalConvention with explicit PhysicalExchange insertion
 - MPP rules (MppAggregateRule, MppJoinRule) registered only when mpp_enabled=true; use same explicit PhysicalExchange(HASH) insertion pattern as base rules
-- `PhysicalOptimizer` creates a **new VolcanoPlanner + RelOptCluster** with `RelDistributionTraitDef`. Deep-copies the incoming plan via `ClusterCopyShuttle` to decouple from the SQL plugin's planner. Runs `FilterMergeRule` via HepPlanner before VolcanoPlanner.
+- `PhysicalOptimizer` creates a **new VolcanoPlanner + RelOptCluster** with `RelDistributionTraitDef`. Deep-copies the incoming plan via `ClusterCopyShuttle` to decouple from the SQL plugin's planner. `ClusterCopyShuttle` injects CBO row counts via `StatisticsTableScan` when available. HepPlanner runs: `FilterMergeRule`, `ProjectToWindowRule`, then join reorder (`JoinToMultiJoinRule` → `MultiJoinOptimizeBushyRule` for all-inner joins, `LoptOptimizeJoinRule` fallback for outer joins). Then VolcanoPlanner with ConverterRules.
 - `VeloxPlanGenerator` walks the physical plan, splits at PhysicalExchange nodes, handles two-stage aggregation split (PARTIAL/FINAL with Velox-specific intermediate types). `handleExchange()` checks the exchange's own distribution to produce correct fragment properties (SINGLETON→SOURCE, HASH→shuffleScan)
 - Reuses Calcite's built-in `RelDistribution` (SINGLETON, HASH_DISTRIBUTED, RANDOM_DISTRIBUTED, ANY)
 - **Guava is compileOnly** in build.gradle — needed because Calcite base classes use `ImmutableList` in constructors
@@ -177,6 +179,16 @@ Uses Calcite's Convention + VolcanoPlanner, wired into `VeloxExecutionEngine.exe
 The SQL plugin's `CalciteLogicalIndexScan.register()` adds pushdown rules (`FilterIndexScanRule`, `AggregateIndexScanRule`, etc.) to whatever planner it's registered with. If the OLAP plugin reused the SQL plugin's planner, these rules would fire and fold operators into the scan — eliminating the LogicalAggregate/LogicalFilter that Velox needs.
 
 Solution: `PhysicalOptimizer` creates its own `VolcanoPlanner` + `RelOptCluster` and deep-copies the plan into it. `ClusterCopyShuttle` converts `CalciteLogicalIndexScan` → plain `LogicalTableScan` (stripping PushDownContext), so the pushdown rules are never registered. All logical operators remain in the plan tree.
+
+### Join reorder
+The SQL plugin produces left-deep join trees preserving the user's PPL pipe order (no reordering). The HepPlanner phase in `PhysicalOptimizer` now runs Calcite's join reorder pipeline:
+1. `JoinToMultiJoinRule` flattens the binary join tree into an N-ary `MultiJoin`
+2. `MultiJoinOptimizeBushyRule` reorders using a greedy heuristic (pairs with largest row count difference joined first). Uses `RelMetadataQuery.getRowCount()` which is fed by `StatisticsTableScan` (CBO) or Calcite defaults.
+3. `LoptOptimizeJoinRule` (fallback) handles cases the bushy rule refuses (outer joins present) — produces left-deep tree preserving outer join semantics.
+
+`StatisticsTableScan` extends `TableScan` (not `LogicalTableScan` which is final) and overrides `estimateRowCount()` with CBO row counts. Created in `ClusterCopyShuttle.visit(TableScan)` when stats are available for the index. `PhysicalTableScanRule` matches on `TableScan.class`, so `StatisticsTableScan` is handled correctly by all existing rules.
+
+For MPP: binary joins (2 tables) use BROADCAST/HASH_SHUFFLE as before. Multi-way joins (3+ tables) currently fall back to coordinator-centric execution. TODO: staged MPP execution for multi-way joins.
 
 ### Two-stage aggregation in VeloxPlanGenerator
 The PARTIAL/FINAL split requires Velox-specific intermediate accumulator types (e.g., avg → ROW(DOUBLE, BIGINT)) that don't map to Calcite's type system. The `TwoStageAggRule` Calcite rule can't produce these types. Instead, `VeloxPlanGenerator.convertTwoStageAggregate()` detects `Aggregate(SINGLE) → Exchange` and splits it with proper Velox accumulator types.

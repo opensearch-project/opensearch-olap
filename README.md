@@ -142,7 +142,7 @@ When `plugins.velox.mpp_enabled=true` (dynamic — can be toggled at runtime), t
 
 The execution pipeline uses a Calcite Convention-based physical planning framework under `plan/physical/`. When a query arrives:
 
-1. **`PhysicalOptimizer`** creates a fresh `VolcanoPlanner` and deep-copies the SQL plugin's plan into it (stripping `CalciteLogicalIndexScan`'s pushdown context). Runs `FilterMergeRule` via HepPlanner, then VolcanoPlanner with `PhysicalConvention` converter rules.
+1. **`PhysicalOptimizer`** creates a fresh `VolcanoPlanner` and deep-copies the SQL plugin's plan into it (stripping `CalciteLogicalIndexScan`'s pushdown context). When CBO statistics are available, `StatisticsTableScan` nodes inject row counts for join reorder. Runs HepPlanner (`FilterMergeRule` + `JoinToMultiJoinRule` + `MultiJoinOptimizeBushyRule` for join reorder), then VolcanoPlanner with `PhysicalConvention` converter rules.
 
 2. **ConverterRules** transform each logical operator to its physical equivalent (`PhysicalTableScan`, `PhysicalFilter`, `PhysicalProject`, `PhysicalAggregate`, `PhysicalJoin`, `PhysicalSort`), inserting `PhysicalExchange(SINGLETON)` nodes at distribution boundaries. When `mpp_enabled=true`, MPP rules (`MppJoinRule`, `MppAggregateRule`) are also registered, inserting `PhysicalExchange(HASH)` for hash-distributed alternatives. The VolcanoPlanner explores both and picks the lower-cost plan.
 
@@ -180,7 +180,8 @@ src/main/java/org/opensearch/plugin/olap/
 │       ├── PhysicalSort.java          #   Physical sort/limit (dist=SINGLETON)
 │       ├── PhysicalWindow.java        #   Physical window (eventstats)
 │       ├── PhysicalExchange.java      #   Redistribution boundary
-│       ├── PhysicalOptimizer.java     #   ClusterCopyShuttle + HepPlanner + VolcanoPlanner
+│       ├── PhysicalOptimizer.java     #   ClusterCopyShuttle + HepPlanner (join reorder) + VolcanoPlanner
+│       ├── StatisticsTableScan.java   #   TableScan with CBO row count for join reorder cost model
 │       ├── VeloxPlanGenerator.java    #   Physical plan → Velox PlanNodes + PlanFragments
 │       └── rules/                     #   Conversion + optimization rules
 │           ├── PhysicalRules.java     #     All rule lists

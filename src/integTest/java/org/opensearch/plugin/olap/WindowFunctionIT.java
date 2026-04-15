@@ -8,8 +8,6 @@ import java.io.IOException;
 import java.util.Map;
 import org.json.JSONArray;
 import org.json.JSONObject;
-import org.opensearch.client.Request;
-import org.opensearch.client.ResponseException;
 
 /**
  * Integration tests for window function execution through the Velox engine. PPL's {@code
@@ -20,17 +18,15 @@ import org.opensearch.client.ResponseException;
  */
 public class WindowFunctionIT extends OlapRestTestCase {
 
-  private static final String EMPLOYEES_INDEX = "employees";
-
   @Override
   public void setUp() throws Exception {
     super.setUp();
-    createWindowTestIndex();
+    loadIndex(Index.EMPLOYEES);
   }
 
   @Override
   public void tearDown() throws Exception {
-    deleteIndex(EMPLOYEES_INDEX);
+    deleteIndex(Index.EMPLOYEES.getName());
     super.tearDown();
   }
 
@@ -39,7 +35,9 @@ public class WindowFunctionIT extends OlapRestTestCase {
   public void testEventstatsCount() throws IOException {
     JSONObject response =
         executePPLQuery(
-            "source = " + EMPLOYEES_INDEX + " | eventstats count() as cnt | fields name, cnt");
+            "source = "
+                + Index.EMPLOYEES.getName()
+                + " | eventstats count() as cnt | fields name, cnt");
     JSONArray rows = getDataRows(response);
 
     assertEquals("All 5 rows should have count", 5, rows.length());
@@ -54,7 +52,7 @@ public class WindowFunctionIT extends OlapRestTestCase {
     JSONObject response =
         executePPLQuery(
             "source = "
-                + EMPLOYEES_INDEX
+                + Index.EMPLOYEES.getName()
                 + " | eventstats count() as cnt by dept_id | fields name, dept_id, cnt");
     JSONArray rows = getDataRows(response);
 
@@ -74,7 +72,7 @@ public class WindowFunctionIT extends OlapRestTestCase {
     JSONObject response =
         executePPLQuery(
             "source = "
-                + EMPLOYEES_INDEX
+                + Index.EMPLOYEES.getName()
                 + " | eventstats max(salary) as max_sal by dept_id"
                 + " | fields name, dept_id, max_sal");
     JSONArray rows = getDataRows(response);
@@ -98,7 +96,7 @@ public class WindowFunctionIT extends OlapRestTestCase {
     JSONObject response =
         executePPLQuery(
             "source = "
-                + EMPLOYEES_INDEX
+                + Index.EMPLOYEES.getName()
                 + " | eventstats sum(salary) as total_sal | fields name, total_sal");
     JSONArray rows = getDataRows(response);
 
@@ -112,57 +110,19 @@ public class WindowFunctionIT extends OlapRestTestCase {
   // ---- Plan structure verification ----
 
   public void testEventstatsPlanContainsWindowNode() throws IOException {
-    String plan = explainVeloxPlan("source = " + EMPLOYEES_INDEX + " | eventstats count() as cnt");
+    String plan =
+        explainVeloxPlan("source = " + Index.EMPLOYEES.getName() + " | eventstats count() as cnt");
     assertTrue("Plan should contain Window node", plan.contains("Window"));
   }
 
   public void testEventstatsWithPartitionPlanContainsPartitionKey() throws IOException {
     String plan =
         explainVeloxPlan(
-            "source = " + EMPLOYEES_INDEX + " | eventstats max(salary) as max_sal by dept_id");
+            "source = "
+                + Index.EMPLOYEES.getName()
+                + " | eventstats max(salary) as max_sal by dept_id");
     assertTrue("Plan should contain Window node", plan.contains("Window"));
     // The plan should reference the partition key (dept_id)
     assertTrue("Plan should reference partition key dept_id", plan.contains("dept_id"));
-  }
-
-  // ---- Helpers ----
-
-  private void createWindowTestIndex() throws IOException {
-    Request createEmployees = new Request("PUT", "/" + EMPLOYEES_INDEX);
-    createEmployees.setJsonEntity(
-        "{"
-            + "\"settings\": {\"number_of_shards\": 1, \"number_of_replicas\": 0},"
-            + "\"mappings\": {\"properties\": {"
-            + "\"emp_id\": {\"type\": \"integer\"},"
-            + "\"name\": {\"type\": \"keyword\"},"
-            + "\"dept_id\": {\"type\": \"integer\"},"
-            + "\"salary\": {\"type\": \"double\"}"
-            + "}}"
-            + "}");
-    client().performRequest(createEmployees);
-
-    Request bulkEmp = new Request("POST", "/_bulk?refresh=true");
-    bulkEmp.setJsonEntity(
-        "{\"index\": {\"_index\": \"employees\"}}\n"
-            + "{\"emp_id\": 1, \"name\": \"Alice\", \"dept_id\": 10, \"salary\": 120000}\n"
-            + "{\"index\": {\"_index\": \"employees\"}}\n"
-            + "{\"emp_id\": 2, \"name\": \"Bob\", \"dept_id\": 20, \"salary\": 95000}\n"
-            + "{\"index\": {\"_index\": \"employees\"}}\n"
-            + "{\"emp_id\": 3, \"name\": \"Charlie\", \"dept_id\": 10, \"salary\": 150000}\n"
-            + "{\"index\": {\"_index\": \"employees\"}}\n"
-            + "{\"emp_id\": 4, \"name\": \"Diana\", \"dept_id\": 30, \"salary\": 110000}\n"
-            + "{\"index\": {\"_index\": \"employees\"}}\n"
-            + "{\"emp_id\": 5, \"name\": \"Eve\", \"dept_id\": 20, \"salary\": 88000}\n");
-    client().performRequest(bulkEmp);
-  }
-
-  private void deleteIndex(String indexName) throws IOException {
-    try {
-      client().performRequest(new Request("DELETE", "/" + indexName));
-    } catch (ResponseException e) {
-      if (e.getResponse().getStatusLine().getStatusCode() != 404) {
-        throw e;
-      }
-    }
   }
 }

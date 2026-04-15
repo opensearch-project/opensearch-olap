@@ -1,0 +1,6 @@
+{"index": {"_index": "departments"}}
+{"dept_id": 10, "dept_name": "Engineering"}
+{"index": {"_index": "departments"}}
+{"dept_id": 20, "dept_name": "Marketing"}
+{"index": {"_index": "departments"}}
+{"dept_id": 30, "dept_name": "Sales"}

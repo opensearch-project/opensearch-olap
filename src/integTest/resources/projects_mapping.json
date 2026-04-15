@@ -1,0 +1,10 @@
+{
+  "mappings": {
+    "properties": {
+      "project_id": { "type": "integer" },
+      "project_name": { "type": "keyword" },
+      "dept_id": { "type": "integer" },
+      "budget": { "type": "double" }
+    }
+  }
+}
