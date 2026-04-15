@@ -183,7 +183,11 @@ public class VeloxLifecycleService implements Closeable {
     ClassLoader originalCL = Thread.currentThread().getContextClassLoader();
     Thread.currentThread().setContextClassLoader(Velox4j.class.getClassLoader());
     try {
-      // Configure before initialization
+      // Configure before initialization.
+      // Use FLINK preset to register both Presto AND Spark scalar functions.
+      // The default SPARK preset only registers Spark functions, missing Presto
+      // math/string/trig functions (sin, cos, minus, etc.) that PPL UDFs map to.
+      Velox4j.configure("velox4j.init.preset", "1"); // 1 = FLINK
       Velox4j.configure("max_memory", String.valueOf(memoryLimit));
       Velox4j.configure("num_threads", String.valueOf(numThreads));
 

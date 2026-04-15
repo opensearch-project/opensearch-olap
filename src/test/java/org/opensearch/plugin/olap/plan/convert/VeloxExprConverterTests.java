@@ -9,6 +9,7 @@ import org.apache.calcite.jdbc.JavaTypeFactoryImpl;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rel.type.RelDataTypeFactory;
 import org.apache.calcite.rex.RexBuilder;
+import org.apache.calcite.rex.RexCall;
 import org.apache.calcite.rex.RexInputRef;
 import org.apache.calcite.rex.RexLiteral;
 import org.apache.calcite.rex.RexNode;
@@ -331,5 +332,171 @@ public class VeloxExprConverterTests extends OpenSearchTestCase {
 
     // Null literals are not yet supported — ConstantTypedExpr requires a non-null variant
     expectThrows(IllegalArgumentException.class, () -> converter.convert(nullLit));
+  }
+
+  // ---- PPL UDF → Velox function name mapping (NAME_MAP) ----
+
+  /** Row type with 3 fields for UDF tests: name(VARCHAR,0), age(INTEGER,1), salary(DOUBLE,2). */
+  private RelDataType buildUdfRowType() {
+    return typeFactory
+        .builder()
+        .add("name", typeFactory.createSqlType(SqlTypeName.VARCHAR, 255))
+        .add("age", typeFactory.createSqlType(SqlTypeName.INTEGER))
+        .add("salary", typeFactory.createSqlType(SqlTypeName.DOUBLE))
+        .build();
+  }
+
+  /** Verify math functions map to correct Velox names. */
+  public void testMathFunctionNameMapping() {
+    RelDataType rowType = buildUdfRowType();
+    VeloxExprConverter converter = new VeloxExprConverter(rowType);
+    RexInputRef doubleRef =
+        rexBuilder.makeInputRef(typeFactory.createSqlType(SqlTypeName.DOUBLE), 2);
+
+    // ABS → abs
+    TypedExpr abs = converter.convert(rexBuilder.makeCall(SqlStdOperatorTable.ABS, doubleRef));
+    assertEquals("abs", ((CallTypedExpr) abs).getFunctionName());
+
+    // CEIL → ceil
+    TypedExpr ceil = converter.convert(rexBuilder.makeCall(SqlStdOperatorTable.CEIL, doubleRef));
+    assertEquals("ceil", ((CallTypedExpr) ceil).getFunctionName());
+
+    // FLOOR → floor
+    TypedExpr floor = converter.convert(rexBuilder.makeCall(SqlStdOperatorTable.FLOOR, doubleRef));
+    assertEquals("floor", ((CallTypedExpr) floor).getFunctionName());
+
+    // ROUND → round
+    TypedExpr round = converter.convert(rexBuilder.makeCall(SqlStdOperatorTable.ROUND, doubleRef));
+    assertEquals("round", ((CallTypedExpr) round).getFunctionName());
+
+    // POWER → power
+    RexLiteral two = rexBuilder.makeLiteral(2.0, typeFactory.createSqlType(SqlTypeName.DOUBLE));
+    TypedExpr power =
+        converter.convert(rexBuilder.makeCall(SqlStdOperatorTable.POWER, doubleRef, two));
+    assertEquals("power", ((CallTypedExpr) power).getFunctionName());
+
+    // EXP → exp
+    TypedExpr exp = converter.convert(rexBuilder.makeCall(SqlStdOperatorTable.EXP, doubleRef));
+    assertEquals("exp", ((CallTypedExpr) exp).getFunctionName());
+
+    // LN → ln
+    TypedExpr ln = converter.convert(rexBuilder.makeCall(SqlStdOperatorTable.LN, doubleRef));
+    assertEquals("ln", ((CallTypedExpr) ln).getFunctionName());
+
+    // LOG10 → log10
+    TypedExpr log10 = converter.convert(rexBuilder.makeCall(SqlStdOperatorTable.LOG10, doubleRef));
+    assertEquals("log10", ((CallTypedExpr) log10).getFunctionName());
+
+    // SIGN → sign
+    TypedExpr sign = converter.convert(rexBuilder.makeCall(SqlStdOperatorTable.SIGN, doubleRef));
+    assertEquals("sign", ((CallTypedExpr) sign).getFunctionName());
+  }
+
+  /** Verify trig functions map to correct Velox names. */
+  public void testTrigFunctionNameMapping() {
+    RelDataType rowType = buildUdfRowType();
+    VeloxExprConverter converter = new VeloxExprConverter(rowType);
+    RexInputRef doubleRef =
+        rexBuilder.makeInputRef(typeFactory.createSqlType(SqlTypeName.DOUBLE), 2);
+
+    String[][] funcs = {
+      {"COS", "cos"}, {"SIN", "sin"}, {"TAN", "tan"},
+      {"ACOS", "acos"}, {"ASIN", "asin"}, {"ATAN", "atan"},
+      {"RADIANS", "radians"}, {"DEGREES", "degrees"}
+    };
+
+    for (String[] pair : funcs) {
+      var op =
+          SqlStdOperatorTable.instance().getOperatorList().stream()
+              .filter(o -> o.getName().equals(pair[0]) && o.getOperandCountRange().isValidCount(1))
+              .findFirst()
+              .orElse(null);
+      assertNotNull("Operator " + pair[0] + " should exist", op);
+      TypedExpr result = converter.convert(rexBuilder.makeCall(op, doubleRef));
+      assertEquals(
+          pair[0] + " should map to " + pair[1],
+          pair[1],
+          ((CallTypedExpr) result).getFunctionName());
+    }
+  }
+
+  /** Verify string functions map to correct Velox names. */
+  public void testStringFunctionNameMapping() {
+    RelDataType rowType = buildUdfRowType();
+    VeloxExprConverter converter = new VeloxExprConverter(rowType);
+    RexInputRef varcharRef =
+        rexBuilder.makeInputRef(typeFactory.createSqlType(SqlTypeName.VARCHAR), 0);
+
+    // UPPER → upper
+    TypedExpr upper = converter.convert(rexBuilder.makeCall(SqlStdOperatorTable.UPPER, varcharRef));
+    assertEquals("upper", ((CallTypedExpr) upper).getFunctionName());
+
+    // LOWER → lower
+    TypedExpr lower = converter.convert(rexBuilder.makeCall(SqlStdOperatorTable.LOWER, varcharRef));
+    assertEquals("lower", ((CallTypedExpr) lower).getFunctionName());
+
+    // CHAR_LENGTH → length (PPL LENGTH maps to Calcite CHAR_LENGTH)
+    TypedExpr length =
+        converter.convert(rexBuilder.makeCall(SqlStdOperatorTable.CHAR_LENGTH, varcharRef));
+    assertEquals("length", ((CallTypedExpr) length).getFunctionName());
+
+    // SUBSTRING → substr
+    RexLiteral one = rexBuilder.makeLiteral(1, typeFactory.createSqlType(SqlTypeName.INTEGER));
+    RexLiteral three = rexBuilder.makeLiteral(3, typeFactory.createSqlType(SqlTypeName.INTEGER));
+    TypedExpr substr =
+        converter.convert(
+            rexBuilder.makeCall(SqlStdOperatorTable.SUBSTRING, varcharRef, one, three));
+    assertEquals("substring", ((CallTypedExpr) substr).getFunctionName());
+  }
+
+  /** Verify CASE → switch mapping. */
+  public void testCaseConvertsToSwitch() {
+    RelDataType rowType = buildUdfRowType();
+    VeloxExprConverter converter = new VeloxExprConverter(rowType);
+
+    // CASE WHEN age > 30 THEN 'old' ELSE 'young' END
+    RexInputRef ageRef = rexBuilder.makeInputRef(typeFactory.createSqlType(SqlTypeName.INTEGER), 1);
+    RexNode cond =
+        rexBuilder.makeCall(
+            SqlStdOperatorTable.GREATER_THAN,
+            ageRef,
+            rexBuilder.makeLiteral(30, typeFactory.createSqlType(SqlTypeName.INTEGER)));
+    RexNode thenVal = rexBuilder.makeLiteral("old", typeFactory.createSqlType(SqlTypeName.VARCHAR));
+    RexNode elseVal =
+        rexBuilder.makeLiteral("young", typeFactory.createSqlType(SqlTypeName.VARCHAR));
+    RexNode caseExpr = rexBuilder.makeCall(SqlStdOperatorTable.CASE, cond, thenVal, elseVal);
+
+    TypedExpr result = converter.convert(caseExpr);
+    assertTrue(result instanceof CallTypedExpr);
+    assertEquals("switch", ((CallTypedExpr) result).getFunctionName());
+    // switch has 3 args: condition, then-value, else-value
+    assertEquals(3, ((CallTypedExpr) result).getInputs().size());
+  }
+
+  /** Verify isSupported returns true for mapped functions and false for unknown. */
+  public void testIsSupportedForMappedFunctions() {
+    RexInputRef doubleRef =
+        rexBuilder.makeInputRef(typeFactory.createSqlType(SqlTypeName.DOUBLE), 0);
+    RexInputRef varcharRef =
+        rexBuilder.makeInputRef(typeFactory.createSqlType(SqlTypeName.VARCHAR), 0);
+    RexInputRef intRef = rexBuilder.makeInputRef(typeFactory.createSqlType(SqlTypeName.INTEGER), 0);
+
+    // Supported: math, string, comparison
+    assertTrue(
+        VeloxExprConverter.isSupported(
+            (RexCall) rexBuilder.makeCall(SqlStdOperatorTable.ABS, doubleRef)));
+    assertTrue(
+        VeloxExprConverter.isSupported(
+            (RexCall) rexBuilder.makeCall(SqlStdOperatorTable.UPPER, varcharRef)));
+    assertTrue(
+        VeloxExprConverter.isSupported(
+            (RexCall) rexBuilder.makeCall(SqlStdOperatorTable.COS, doubleRef)));
+    assertTrue(
+        VeloxExprConverter.isSupported(
+            (RexCall)
+                rexBuilder.makeCall(
+                    SqlStdOperatorTable.EQUALS,
+                    intRef,
+                    rexBuilder.makeLiteral(30, typeFactory.createSqlType(SqlTypeName.INTEGER)))));
   }
 }
