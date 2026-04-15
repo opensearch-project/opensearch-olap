@@ -5,6 +5,8 @@
 package org.opensearch.plugin.olap;
 
 import java.io.IOException;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Arrays;
@@ -23,15 +25,45 @@ import org.opensearch.test.OpenSearchTestCase;
  * Base class for OLAP plugin integration tests. Runs against a real OpenSearch cluster with the SQL
  * and OLAP plugins installed. The cluster is managed by Gradle's {@code testClusters}.
  *
- * <p>Creates a plain REST client from the {@code tests.rest.cluster} system property instead of
- * using {@code OpenSearchRestTestCase} to avoid TLS/slf4j classpath issues.
+ * <p>Provides shared test index definitions via the {@link Index} enum. Each test loads indices by
+ * calling {@link #loadIndex(Index)}, which creates the index from a mapping file and bulk-loads
+ * data from a data file (both under {@code src/integTest/resources/}).
  */
 public abstract class OlapRestTestCase extends OpenSearchTestCase {
 
   protected static final String PPL_ENDPOINT = "/_plugins/_ppl";
-  protected static final String TEST_INDEX = "test_olap";
 
   private static volatile RestClient restClient;
+
+  /** Shared test index definitions. Mapping and data files live under integTest/resources/. */
+  public enum Index {
+    TEST_OLAP("test_olap", "test_olap_mapping.json", "test_olap_data.json"),
+    EMPLOYEES("employees", "employees_mapping.json", "employees_data.json"),
+    DEPARTMENTS("departments", "departments_mapping.json", "departments_data.json"),
+    PROJECTS("projects", "projects_mapping.json", "projects_data.json");
+
+    private final String indexName;
+    private final String mappingFile;
+    private final String dataFile;
+
+    Index(String indexName, String mappingFile, String dataFile) {
+      this.indexName = indexName;
+      this.mappingFile = mappingFile;
+      this.dataFile = dataFile;
+    }
+
+    public String getName() {
+      return indexName;
+    }
+
+    public String getMappingFile() {
+      return mappingFile;
+    }
+
+    public String getDataFile() {
+      return dataFile;
+    }
+  }
 
   @org.junit.AfterClass
   public static void cleanUpClient() throws IOException {
@@ -67,46 +99,92 @@ public abstract class OlapRestTestCase extends OpenSearchTestCase {
     super.tearDown();
   }
 
-  /** Create the test index with sample data. */
-  protected void createTestIndex() throws IOException {
-    Request createIndex = new Request("PUT", "/" + TEST_INDEX);
-    createIndex.setJsonEntity(
-        "{"
-            + "\"settings\": {\"number_of_shards\": 1, \"number_of_replicas\": 0},"
-            + "\"mappings\": {\"properties\": {"
-            + "\"name\": {\"type\": \"keyword\"},"
-            + "\"age\": {\"type\": \"integer\"},"
-            + "\"city\": {\"type\": \"keyword\"},"
-            + "\"salary\": {\"type\": \"double\"}"
-            + "}}"
-            + "}");
-    client().performRequest(createIndex);
+  // ---- Index loading ----
 
-    Request bulk = new Request("POST", "/_bulk?refresh=true");
-    bulk.setJsonEntity(
-        "{\"index\": {\"_index\": \"test_olap\"}}\n"
-            + "{\"name\": \"Alice\", \"age\": 35, \"city\": \"Seattle\", \"salary\": 120000}\n"
-            + "{\"index\": {\"_index\": \"test_olap\"}}\n"
-            + "{\"name\": \"Bob\", \"age\": 28, \"city\": \"Portland\", \"salary\": 95000}\n"
-            + "{\"index\": {\"_index\": \"test_olap\"}}\n"
-            + "{\"name\": \"Charlie\", \"age\": 42, \"city\": \"Seattle\", \"salary\": 150000}\n"
-            + "{\"index\": {\"_index\": \"test_olap\"}}\n"
-            + "{\"name\": \"Diana\", \"age\": 31, \"city\": \"Denver\", \"salary\": 110000}\n"
-            + "{\"index\": {\"_index\": \"test_olap\"}}\n"
-            + "{\"name\": \"Eve\", \"age\": 26, \"city\": \"Portland\", \"salary\": 88000}\n");
-    client().performRequest(bulk);
+  /**
+   * Load a test index: create it from the mapping file and bulk-insert data. Idempotent — if the
+   * index already exists, this is a no-op.
+   */
+  protected void loadIndex(Index index) throws IOException {
+    createIndex(index.getName(), readResource(index.getMappingFile()));
+    bulkInsert(readResource(index.getDataFile()));
   }
 
-  /** Delete the test index if it exists. */
-  protected void deleteTestIndex() throws IOException {
+  /**
+   * Load a test index with a custom number of primary shards. The mapping file's settings are
+   * overridden with the specified shard count.
+   */
+  protected void loadIndex(Index index, int numShards) throws IOException {
+    String mapping = readResource(index.getMappingFile());
+    JSONObject json = new JSONObject(mapping);
+    JSONObject settings = new JSONObject();
+    settings.put("number_of_shards", numShards);
+    settings.put("number_of_replicas", 0);
+    json.put("settings", settings);
+    createIndex(index.getName(), json.toString());
+    bulkInsert(readResource(index.getDataFile()));
+  }
+
+  /** Safely delete an index (ignores 404 if index doesn't exist). */
+  protected void deleteIndex(String indexName) throws IOException {
     try {
-      client().performRequest(new Request("DELETE", "/" + TEST_INDEX));
+      client().performRequest(new Request("DELETE", "/" + indexName));
     } catch (ResponseException e) {
       if (e.getResponse().getStatusLine().getStatusCode() != 404) {
         throw e;
       }
     }
   }
+
+  private boolean indexExists(String indexName) {
+    try {
+      Response response = client().performRequest(new Request("HEAD", "/" + indexName));
+      return response.getStatusLine().getStatusCode() == 200;
+    } catch (ResponseException e) {
+      return false;
+    } catch (IOException e) {
+      return false;
+    }
+  }
+
+  private void createIndex(String indexName, String mapping) throws IOException {
+    Request request = new Request("PUT", "/" + indexName);
+    // Ensure settings include shards=1, replicas=0 if not already specified
+    JSONObject json = new JSONObject(mapping);
+    if (!json.has("settings")) {
+      JSONObject settings = new JSONObject();
+      settings.put("number_of_shards", 1);
+      settings.put("number_of_replicas", 0);
+      json.put("settings", settings);
+    }
+    request.setJsonEntity(json.toString());
+    client().performRequest(request);
+  }
+
+  private void bulkInsert(String bulkData) throws IOException {
+    Request request = new Request("POST", "/_bulk?refresh=true");
+    request.setJsonEntity(bulkData);
+    client().performRequest(request);
+  }
+
+  private String readResource(String fileName) throws IOException {
+    // Try multiple classloader strategies — OpenSearch's SecurityManager may restrict access
+    InputStream is = getClass().getResourceAsStream("/" + fileName);
+    if (is == null) {
+      is = Thread.currentThread().getContextClassLoader().getResourceAsStream(fileName);
+    }
+    if (is == null) {
+      is = getClass().getClassLoader().getResourceAsStream(fileName);
+    }
+    if (is == null) {
+      throw new IOException("Resource not found: " + fileName);
+    }
+    try (InputStream stream = is) {
+      return new String(stream.readAllBytes(), StandardCharsets.UTF_8);
+    }
+  }
+
+  // ---- Query execution ----
 
   /** Execute a PPL query and return the JSON response. */
   protected JSONObject executePPLQuery(String query) throws IOException {
@@ -162,5 +240,23 @@ public abstract class OlapRestTestCase extends OpenSearchTestCase {
       }
     }
     return response.toString();
+  }
+
+  // ---- Cluster settings ----
+
+  /** Update a persistent cluster setting. */
+  protected void setClusterSetting(String key, String value) throws IOException {
+    Request request = new Request("PUT", "/_cluster/settings");
+    request.setJsonEntity("{\"persistent\": {\"" + key + "\": \"" + value + "\"}}");
+    Response response = client().performRequest(request);
+    assertEquals(200, response.getStatusLine().getStatusCode());
+  }
+
+  /** Update a persistent cluster setting (boolean). */
+  protected void setClusterSetting(String key, boolean value) throws IOException {
+    Request request = new Request("PUT", "/_cluster/settings");
+    request.setJsonEntity("{\"persistent\": {\"" + key + "\": " + value + "}}");
+    Response response = client().performRequest(request);
+    assertEquals(200, response.getStatusLine().getStatusCode());
   }
 }

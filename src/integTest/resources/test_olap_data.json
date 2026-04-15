@@ -1,0 +1,10 @@
+{"index": {"_index": "test_olap"}}
+{"name": "Alice", "age": 35, "city": "Seattle", "salary": 120000}
+{"index": {"_index": "test_olap"}}
+{"name": "Bob", "age": 28, "city": "Portland", "salary": 95000}
+{"index": {"_index": "test_olap"}}
+{"name": "Charlie", "age": 42, "city": "Seattle", "salary": 150000}
+{"index": {"_index": "test_olap"}}
+{"name": "Diana", "age": 31, "city": "Denver", "salary": 110000}
+{"index": {"_index": "test_olap"}}
+{"name": "Eve", "age": 26, "city": "Portland", "salary": 88000}

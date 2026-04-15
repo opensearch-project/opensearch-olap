@@ -11,9 +11,6 @@ import java.util.Map;
 import java.util.Set;
 import org.json.JSONArray;
 import org.json.JSONObject;
-import org.opensearch.client.Request;
-import org.opensearch.client.Response;
-import org.opensearch.client.ResponseException;
 
 /**
  * Integration tests for join and aggregation queries with mpp_enabled=true. Toggles the dynamic
@@ -31,38 +28,21 @@ import org.opensearch.client.ResponseException;
  */
 public class MppJoinIT extends OlapRestTestCase {
 
-  private static final String EMPLOYEES_INDEX = "employees";
-  private static final String DEPARTMENTS_INDEX = "departments";
-
   @Override
   public void setUp() throws Exception {
     super.setUp();
-    enableMpp(true);
-    createJoinTestIndices();
+    setClusterSetting("plugins.velox.mpp_enabled", true);
+    loadIndex(Index.EMPLOYEES);
+    loadIndex(Index.DEPARTMENTS);
   }
 
   @Override
   public void tearDown() throws Exception {
-    deleteIndex(EMPLOYEES_INDEX);
-    deleteIndex(DEPARTMENTS_INDEX);
-    setBroadcastMaxShards(2);
-    enableMpp(false);
+    deleteIndex(Index.EMPLOYEES.getName());
+    deleteIndex(Index.DEPARTMENTS.getName());
+    setClusterSetting("plugins.velox.broadcast_max_shards", "2");
+    setClusterSetting("plugins.velox.mpp_enabled", false);
     super.tearDown();
-  }
-
-  private void enableMpp(boolean enabled) throws IOException {
-    Request request = new Request("PUT", "/_cluster/settings");
-    request.setJsonEntity("{\"persistent\": {\"plugins.velox.mpp_enabled\": " + enabled + "}}");
-    Response response = client().performRequest(request);
-    assertEquals(200, response.getStatusLine().getStatusCode());
-  }
-
-  private void setBroadcastMaxShards(int maxShards) throws IOException {
-    Request request = new Request("PUT", "/_cluster/settings");
-    request.setJsonEntity(
-        "{\"persistent\": {\"plugins.velox.broadcast_max_shards\": " + maxShards + "}}");
-    Response response = client().performRequest(request);
-    assertEquals(200, response.getStatusLine().getStatusCode());
   }
 
   // ---- Inner Join ----
@@ -71,9 +51,9 @@ public class MppJoinIT extends OlapRestTestCase {
     JSONObject response =
         executePPLQuery(
             "source = "
-                + EMPLOYEES_INDEX
+                + Index.EMPLOYEES.getName()
                 + " | inner join left=e right=d ON e.dept_id = d.dept_id "
-                + DEPARTMENTS_INDEX
+                + Index.DEPARTMENTS.getName()
                 + " | fields e.name, d.dept_name");
     JSONArray rows = getDataRows(response);
 
@@ -98,9 +78,9 @@ public class MppJoinIT extends OlapRestTestCase {
     JSONObject response =
         executePPLQuery(
             "source = "
-                + EMPLOYEES_INDEX
+                + Index.EMPLOYEES.getName()
                 + " | left join left=e right=d ON e.dept_id = d.dept_id "
-                + DEPARTMENTS_INDEX
+                + Index.DEPARTMENTS.getName()
                 + " | fields e.name, d.dept_name");
     JSONArray rows = getDataRows(response);
 
@@ -113,10 +93,10 @@ public class MppJoinIT extends OlapRestTestCase {
     JSONObject response =
         executePPLQuery(
             "source = "
-                + EMPLOYEES_INDEX
+                + Index.EMPLOYEES.getName()
                 + " | where dept_id = 10"
                 + " | inner join left=e right=d ON e.dept_id = d.dept_id "
-                + DEPARTMENTS_INDEX
+                + Index.DEPARTMENTS.getName()
                 + " | fields e.name, d.dept_name");
     JSONArray rows = getDataRows(response);
 
@@ -132,9 +112,9 @@ public class MppJoinIT extends OlapRestTestCase {
     JSONObject response =
         executePPLQuery(
             "source = "
-                + EMPLOYEES_INDEX
+                + Index.EMPLOYEES.getName()
                 + " | inner join left=e right=d ON e.dept_id = d.dept_id "
-                + DEPARTMENTS_INDEX
+                + Index.DEPARTMENTS.getName()
                 + " | stats count() by d.dept_name");
     JSONArray rows = getDataRows(response);
 
@@ -154,9 +134,9 @@ public class MppJoinIT extends OlapRestTestCase {
     JSONObject response =
         executePPLQuery(
             "source = "
-                + EMPLOYEES_INDEX
+                + Index.EMPLOYEES.getName()
                 + " | inner join left=e right=d ON e.dept_id = d.dept_id "
-                + DEPARTMENTS_INDEX
+                + Index.DEPARTMENTS.getName()
                 + " | stats avg(e.salary) by d.dept_name");
     JSONArray rows = getDataRows(response);
 
@@ -175,7 +155,7 @@ public class MppJoinIT extends OlapRestTestCase {
 
   public void testMppAggregateCountByGroup() throws IOException {
     JSONObject response =
-        executePPLQuery("source = " + EMPLOYEES_INDEX + " | stats count() by dept_id");
+        executePPLQuery("source = " + Index.EMPLOYEES.getName() + " | stats count() by dept_id");
     JSONArray rows = getDataRows(response);
 
     Map<Long, Long> countByDept = new HashMap<>();
@@ -191,7 +171,8 @@ public class MppJoinIT extends OlapRestTestCase {
 
   public void testMppAggregateSumByGroup() throws IOException {
     JSONObject response =
-        executePPLQuery("source = " + EMPLOYEES_INDEX + " | stats sum(salary) by dept_id");
+        executePPLQuery(
+            "source = " + Index.EMPLOYEES.getName() + " | stats sum(salary) by dept_id");
     JSONArray rows = getDataRows(response);
 
     Map<Long, Double> sumByDept = new HashMap<>();
@@ -211,9 +192,9 @@ public class MppJoinIT extends OlapRestTestCase {
     JSONObject response =
         executePPLQuery(
             "source = "
-                + EMPLOYEES_INDEX
+                + Index.EMPLOYEES.getName()
                 + " | inner join left=e right=d ON e.dept_id = d.dept_id "
-                + DEPARTMENTS_INDEX
+                + Index.DEPARTMENTS.getName()
                 + " | head 3"
                 + " | fields e.name, d.dept_name");
     JSONArray rows = getDataRows(response);
@@ -229,17 +210,18 @@ public class MppJoinIT extends OlapRestTestCase {
    * cost when mpp_enabled=true), and executeShuffleFragments() handles the shuffle dispatch.
    */
   public void testShuffleJoinWithAggregation() throws IOException {
-    deleteIndex(EMPLOYEES_INDEX);
-    deleteIndex(DEPARTMENTS_INDEX);
-    createJoinTestIndicesWithShards(3);
-    setBroadcastMaxShards(1);
+    deleteIndex(Index.EMPLOYEES.getName());
+    deleteIndex(Index.DEPARTMENTS.getName());
+    loadIndex(Index.EMPLOYEES, 3);
+    loadIndex(Index.DEPARTMENTS, 3);
+    setClusterSetting("plugins.velox.broadcast_max_shards", "1");
     try {
       JSONObject response =
           executePPLQuery(
               "source = "
-                  + EMPLOYEES_INDEX
+                  + Index.EMPLOYEES.getName()
                   + " | inner join left=e right=d ON e.dept_id = d.dept_id "
-                  + DEPARTMENTS_INDEX
+                  + Index.DEPARTMENTS.getName()
                   + " | stats count() by d.dept_name");
       JSONArray rows = getDataRows(response);
 
@@ -254,25 +236,27 @@ public class MppJoinIT extends OlapRestTestCase {
       assertEquals(Long.valueOf(2), countByDept.get("Marketing"));
       assertEquals(Long.valueOf(1), countByDept.get("Sales"));
     } finally {
-      setBroadcastMaxShards(2);
-      deleteIndex(EMPLOYEES_INDEX);
-      deleteIndex(DEPARTMENTS_INDEX);
-      createJoinTestIndices();
+      setClusterSetting("plugins.velox.broadcast_max_shards", "2");
+      deleteIndex(Index.EMPLOYEES.getName());
+      deleteIndex(Index.DEPARTMENTS.getName());
+      loadIndex(Index.EMPLOYEES);
+      loadIndex(Index.DEPARTMENTS);
     }
   }
 
   public void testShuffleJoinWithAvgAggregation() throws IOException {
-    deleteIndex(EMPLOYEES_INDEX);
-    deleteIndex(DEPARTMENTS_INDEX);
-    createJoinTestIndicesWithShards(3);
-    setBroadcastMaxShards(1);
+    deleteIndex(Index.EMPLOYEES.getName());
+    deleteIndex(Index.DEPARTMENTS.getName());
+    loadIndex(Index.EMPLOYEES, 3);
+    loadIndex(Index.DEPARTMENTS, 3);
+    setClusterSetting("plugins.velox.broadcast_max_shards", "1");
     try {
       JSONObject response =
           executePPLQuery(
               "source = "
-                  + EMPLOYEES_INDEX
+                  + Index.EMPLOYEES.getName()
                   + " | inner join left=e right=d ON e.dept_id = d.dept_id "
-                  + DEPARTMENTS_INDEX
+                  + Index.DEPARTMENTS.getName()
                   + " | stats avg(e.salary) by d.dept_name");
       JSONArray rows = getDataRows(response);
 
@@ -286,26 +270,28 @@ public class MppJoinIT extends OlapRestTestCase {
       assertEquals(91500.0, avgByDept.get("Marketing"), 0.01);
       assertEquals(110000.0, avgByDept.get("Sales"), 0.01);
     } finally {
-      setBroadcastMaxShards(2);
-      deleteIndex(EMPLOYEES_INDEX);
-      deleteIndex(DEPARTMENTS_INDEX);
-      createJoinTestIndices();
+      setClusterSetting("plugins.velox.broadcast_max_shards", "2");
+      deleteIndex(Index.EMPLOYEES.getName());
+      deleteIndex(Index.DEPARTMENTS.getName());
+      loadIndex(Index.EMPLOYEES);
+      loadIndex(Index.DEPARTMENTS);
     }
   }
 
   public void testShuffleJoinWithFilter() throws IOException {
-    deleteIndex(EMPLOYEES_INDEX);
-    deleteIndex(DEPARTMENTS_INDEX);
-    createJoinTestIndicesWithShards(3);
-    setBroadcastMaxShards(1);
+    deleteIndex(Index.EMPLOYEES.getName());
+    deleteIndex(Index.DEPARTMENTS.getName());
+    loadIndex(Index.EMPLOYEES, 3);
+    loadIndex(Index.DEPARTMENTS, 3);
+    setClusterSetting("plugins.velox.broadcast_max_shards", "1");
     try {
       JSONObject response =
           executePPLQuery(
               "source = "
-                  + EMPLOYEES_INDEX
+                  + Index.EMPLOYEES.getName()
                   + " | where dept_id = 10"
                   + " | inner join left=e right=d ON e.dept_id = d.dept_id "
-                  + DEPARTMENTS_INDEX
+                  + Index.DEPARTMENTS.getName()
                   + " | stats count() by d.dept_name");
       JSONArray rows = getDataRows(response);
 
@@ -313,21 +299,23 @@ public class MppJoinIT extends OlapRestTestCase {
       assertEquals("Engineering", rows.getJSONArray(0).getString(1));
       assertEquals(2, rows.getJSONArray(0).getLong(0));
     } finally {
-      setBroadcastMaxShards(2);
-      deleteIndex(EMPLOYEES_INDEX);
-      deleteIndex(DEPARTMENTS_INDEX);
-      createJoinTestIndices();
+      setClusterSetting("plugins.velox.broadcast_max_shards", "2");
+      deleteIndex(Index.EMPLOYEES.getName());
+      deleteIndex(Index.DEPARTMENTS.getName());
+      loadIndex(Index.EMPLOYEES);
+      loadIndex(Index.DEPARTMENTS);
     }
   }
 
   public void testShuffleAggregateCountByGroup() throws IOException {
-    deleteIndex(EMPLOYEES_INDEX);
-    deleteIndex(DEPARTMENTS_INDEX);
-    createJoinTestIndicesWithShards(3);
-    setBroadcastMaxShards(1);
+    deleteIndex(Index.EMPLOYEES.getName());
+    deleteIndex(Index.DEPARTMENTS.getName());
+    loadIndex(Index.EMPLOYEES, 3);
+    loadIndex(Index.DEPARTMENTS, 3);
+    setClusterSetting("plugins.velox.broadcast_max_shards", "1");
     try {
       JSONObject response =
-          executePPLQuery("source = " + EMPLOYEES_INDEX + " | stats count() by dept_id");
+          executePPLQuery("source = " + Index.EMPLOYEES.getName() + " | stats count() by dept_id");
       JSONArray rows = getDataRows(response);
 
       Map<Long, Long> countByDept = new HashMap<>();
@@ -340,25 +328,27 @@ public class MppJoinIT extends OlapRestTestCase {
       assertEquals(Long.valueOf(2), countByDept.get(20L));
       assertEquals(Long.valueOf(1), countByDept.get(30L));
     } finally {
-      setBroadcastMaxShards(2);
-      deleteIndex(EMPLOYEES_INDEX);
-      deleteIndex(DEPARTMENTS_INDEX);
-      createJoinTestIndices();
+      setClusterSetting("plugins.velox.broadcast_max_shards", "2");
+      deleteIndex(Index.EMPLOYEES.getName());
+      deleteIndex(Index.DEPARTMENTS.getName());
+      loadIndex(Index.EMPLOYEES);
+      loadIndex(Index.DEPARTMENTS);
     }
   }
 
   public void testShuffleJoinWithSumAggregation() throws IOException {
-    deleteIndex(EMPLOYEES_INDEX);
-    deleteIndex(DEPARTMENTS_INDEX);
-    createJoinTestIndicesWithShards(3);
-    setBroadcastMaxShards(1);
+    deleteIndex(Index.EMPLOYEES.getName());
+    deleteIndex(Index.DEPARTMENTS.getName());
+    loadIndex(Index.EMPLOYEES, 3);
+    loadIndex(Index.DEPARTMENTS, 3);
+    setClusterSetting("plugins.velox.broadcast_max_shards", "1");
     try {
       JSONObject response =
           executePPLQuery(
               "source = "
-                  + EMPLOYEES_INDEX
+                  + Index.EMPLOYEES.getName()
                   + " | inner join left=e right=d ON e.dept_id = d.dept_id "
-                  + DEPARTMENTS_INDEX
+                  + Index.DEPARTMENTS.getName()
                   + " | stats sum(e.salary) by d.dept_name");
       JSONArray rows = getDataRows(response);
 
@@ -372,10 +362,11 @@ public class MppJoinIT extends OlapRestTestCase {
       assertEquals(183000.0, sumByDept.get("Marketing"), 0.01);
       assertEquals(110000.0, sumByDept.get("Sales"), 0.01);
     } finally {
-      setBroadcastMaxShards(2);
-      deleteIndex(EMPLOYEES_INDEX);
-      deleteIndex(DEPARTMENTS_INDEX);
-      createJoinTestIndices();
+      setClusterSetting("plugins.velox.broadcast_max_shards", "2");
+      deleteIndex(Index.EMPLOYEES.getName());
+      deleteIndex(Index.DEPARTMENTS.getName());
+      loadIndex(Index.EMPLOYEES);
+      loadIndex(Index.DEPARTMENTS);
     }
   }
 
@@ -385,9 +376,9 @@ public class MppJoinIT extends OlapRestTestCase {
     String plan =
         explainVeloxPlan(
             "source = "
-                + EMPLOYEES_INDEX
+                + Index.EMPLOYEES.getName()
                 + " | inner join left=e right=d ON e.dept_id = d.dept_id "
-                + DEPARTMENTS_INDEX
+                + Index.DEPARTMENTS.getName()
                 + " | fields e.name, d.dept_name");
     assertTrue("MPP plan should contain HashJoin node", plan.contains("HashJoin"));
     assertTrue("MPP plan should have SOURCE fragment", plan.contains("[SOURCE]"));
@@ -399,9 +390,9 @@ public class MppJoinIT extends OlapRestTestCase {
   public void testMppEnabledInLogs() throws IOException {
     executePPLQuery(
         "source = "
-            + EMPLOYEES_INDEX
+            + Index.EMPLOYEES.getName()
             + " | inner join left=e right=d ON e.dept_id = d.dept_id "
-            + DEPARTMENTS_INDEX
+            + Index.DEPARTMENTS.getName()
             + " | fields e.name, d.dept_name");
 
     long mppLogCount = countLogLines("mpp_enabled=true");
@@ -409,78 +400,6 @@ public class MppJoinIT extends OlapRestTestCase {
   }
 
   // ---- Helpers ----
-
-  private void createJoinTestIndicesWithShards(int numShards) throws IOException {
-    Request createEmployees = new Request("PUT", "/" + EMPLOYEES_INDEX);
-    createEmployees.setJsonEntity(
-        "{"
-            + "\"settings\": {\"number_of_shards\": "
-            + numShards
-            + ", \"number_of_replicas\": 0},"
-            + "\"mappings\": {\"properties\": {"
-            + "\"emp_id\": {\"type\": \"integer\"},"
-            + "\"name\": {\"type\": \"keyword\"},"
-            + "\"dept_id\": {\"type\": \"integer\"},"
-            + "\"salary\": {\"type\": \"double\"}"
-            + "}}"
-            + "}");
-    client().performRequest(createEmployees);
-
-    Request createDepts = new Request("PUT", "/" + DEPARTMENTS_INDEX);
-    createDepts.setJsonEntity(
-        "{"
-            + "\"settings\": {\"number_of_shards\": "
-            + numShards
-            + ", \"number_of_replicas\": 0},"
-            + "\"mappings\": {\"properties\": {"
-            + "\"dept_id\": {\"type\": \"integer\"},"
-            + "\"dept_name\": {\"type\": \"keyword\"}"
-            + "}}"
-            + "}");
-    client().performRequest(createDepts);
-
-    insertJoinTestData();
-  }
-
-  private void createJoinTestIndices() throws IOException {
-    createJoinTestIndicesWithShards(1);
-  }
-
-  private void insertJoinTestData() throws IOException {
-    Request bulkEmp = new Request("POST", "/_bulk?refresh=true");
-    bulkEmp.setJsonEntity(
-        "{\"index\": {\"_index\": \"employees\"}}\n"
-            + "{\"emp_id\": 1, \"name\": \"Alice\", \"dept_id\": 10, \"salary\": 120000}\n"
-            + "{\"index\": {\"_index\": \"employees\"}}\n"
-            + "{\"emp_id\": 2, \"name\": \"Bob\", \"dept_id\": 20, \"salary\": 95000}\n"
-            + "{\"index\": {\"_index\": \"employees\"}}\n"
-            + "{\"emp_id\": 3, \"name\": \"Charlie\", \"dept_id\": 10, \"salary\": 150000}\n"
-            + "{\"index\": {\"_index\": \"employees\"}}\n"
-            + "{\"emp_id\": 4, \"name\": \"Diana\", \"dept_id\": 30, \"salary\": 110000}\n"
-            + "{\"index\": {\"_index\": \"employees\"}}\n"
-            + "{\"emp_id\": 5, \"name\": \"Eve\", \"dept_id\": 20, \"salary\": 88000}\n");
-    client().performRequest(bulkEmp);
-
-    Request bulkDept = new Request("POST", "/_bulk?refresh=true");
-    bulkDept.setJsonEntity(
-        "{\"index\": {\"_index\": \"departments\"}}\n"
-            + "{\"dept_id\": 10, \"dept_name\": \"Engineering\"}\n"
-            + "{\"index\": {\"_index\": \"departments\"}}\n"
-            + "{\"dept_id\": 20, \"dept_name\": \"Marketing\"}\n"
-            + "{\"index\": {\"_index\": \"departments\"}}\n"
-            + "{\"dept_id\": 30, \"dept_name\": \"Sales\"}\n");
-    client().performRequest(bulkDept);
-  }
-
-  private void deleteIndex(String indexName) throws IOException {
-    try {
-      client().performRequest(new Request("DELETE", "/" + indexName));
-    } catch (ResponseException e) {
-      if (e.getResponse().getStatusLine().getStatusCode() != 404) {
-        throw e;
-      }
-    }
-  }
 
   private Set<String> extractStringColumn(JSONArray rows, int colIndex) {
     Set<String> values = new HashSet<>();

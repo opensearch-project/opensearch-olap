@@ -1,0 +1,8 @@
+{"index": {"_index": "projects"}}
+{"project_id": 1, "project_name": "Alpha", "dept_id": 10, "budget": 500000}
+{"index": {"_index": "projects"}}
+{"project_id": 2, "project_name": "Beta", "dept_id": 10, "budget": 300000}
+{"index": {"_index": "projects"}}
+{"project_id": 3, "project_name": "Gamma", "dept_id": 20, "budget": 200000}
+{"index": {"_index": "projects"}}
+{"project_id": 4, "project_name": "Delta", "dept_id": 30, "budget": 100000}

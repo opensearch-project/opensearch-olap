@@ -1,0 +1,10 @@
+{
+  "mappings": {
+    "properties": {
+      "name": { "type": "keyword" },
+      "age": { "type": "integer" },
+      "city": { "type": "keyword" },
+      "salary": { "type": "double" }
+    }
+  }
+}

@@ -6,6 +6,7 @@ package org.opensearch.plugin.olap.plan.physical;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.stream.Collectors;
 import org.apache.calcite.plan.ConventionTraitDef;
 import org.apache.calcite.plan.RelOptCluster;
@@ -32,6 +33,7 @@ import org.apache.calcite.rel.rules.FilterMergeRule;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.plugin.olap.plan.physical.rules.PhysicalRules;
+import org.opensearch.plugin.olap.scheduler.TableStatistics;
 
 /**
  * Runs Calcite VolcanoPlanner to convert a logical plan (Convention.NONE) into a physical plan
@@ -55,9 +57,15 @@ public class PhysicalOptimizer {
   private static final Logger logger = LogManager.getLogger(PhysicalOptimizer.class);
 
   private final boolean mppEnabled;
+  private final Map<String, TableStatistics> statsMap;
 
   public PhysicalOptimizer(boolean mppEnabled) {
+    this(mppEnabled, Map.of());
+  }
+
+  public PhysicalOptimizer(boolean mppEnabled, Map<String, TableStatistics> statsMap) {
     this.mppEnabled = mppEnabled;
+    this.statsMap = statsMap;
   }
 
   public RelNode optimize(RelNode logicalPlan) {
@@ -71,8 +79,10 @@ public class PhysicalOptimizer {
     RelOptCluster newCluster =
         RelOptCluster.create(planner, logicalPlan.getCluster().getRexBuilder());
 
-    // Step 3: Deep-copy the logical plan into the new cluster
-    RelNode copiedPlan = logicalPlan.accept(new ClusterCopyShuttle(newCluster));
+    // Step 3: Deep-copy the logical plan into the new cluster.
+    // When CBO stats are available, inject row counts into TableScan nodes
+    // so Calcite's join reorder rules can make cost-based decisions.
+    RelNode copiedPlan = logicalPlan.accept(new ClusterCopyShuttle(newCluster, statsMap));
 
     // Step 3.5: Run HepPlanner for lightweight logical optimization (same as
     // CalciteToolsHelper.optimize() in the SQL plugin). FilterMergeRule merges
@@ -83,6 +93,15 @@ public class PhysicalOptimizer {
             .addRuleInstance(FilterMergeRule.Config.DEFAULT.toRule())
             // Decompose LogicalProject(RexOver) → LogicalWindow + LogicalProject
             .addRuleInstance(CoreRules.PROJECT_TO_LOGICAL_PROJECT_AND_WINDOW)
+            // Join reorder: flatten binary join tree → N-ary MultiJoin → optimal bushy tree.
+            // MultiJoinOptimizeBushyRule uses RelMetadataQuery.getRowCount() which is fed by
+            // StatisticsTableScan (CBO) or Calcite's default heuristics (no CBO).
+            // LoptOptimizeJoinRule is registered as fallback: the bushy rule refuses to
+            // optimize when outer joins are present, so the left-deep rule handles those
+            // cases (preserves outer join order while still converting MultiJoin back to joins).
+            .addRuleInstance(CoreRules.JOIN_TO_MULTI_JOIN)
+            .addRuleInstance(CoreRules.MULTI_JOIN_OPTIMIZE_BUSHY)
+            .addRuleInstance(CoreRules.MULTI_JOIN_OPTIMIZE)
             .build();
     HepPlanner hepPlanner = new HepPlanner(hepProgram);
     hepPlanner.setRoot(copiedPlan);
@@ -127,9 +146,11 @@ public class PhysicalOptimizer {
    */
   private static class ClusterCopyShuttle extends RelShuttleImpl {
     private final RelOptCluster targetCluster;
+    private final Map<String, TableStatistics> statsMap;
 
-    ClusterCopyShuttle(RelOptCluster targetCluster) {
+    ClusterCopyShuttle(RelOptCluster targetCluster, Map<String, TableStatistics> statsMap) {
       this.targetCluster = targetCluster;
+      this.statsMap = statsMap;
     }
 
     private RelTraitSet mapTraits(RelTraitSet original) {
@@ -143,8 +164,17 @@ public class PhysicalOptimizer {
       // Create a plain LogicalTableScan in the new cluster.
       // This strips CalciteLogicalIndexScan's PushDownContext and prevents
       // its register() from adding pushdown rules to our planner.
-      return new LogicalTableScan(
-          targetCluster, mapTraits(scan.getTraitSet()), scan.getHints(), scan.getTable());
+      // When CBO stats are available, use StatisticsTableScan to inject row counts
+      // into Calcite's cost model for join reorder decisions.
+      RelTraitSet traits = mapTraits(scan.getTraitSet());
+      List<String> qualifiedName = scan.getTable().getQualifiedName();
+      String indexName = qualifiedName.get(qualifiedName.size() - 1);
+      TableStatistics stats = statsMap.get(indexName);
+      if (stats != null && stats.getRowCount() > 0) {
+        return new StatisticsTableScan(
+            targetCluster, traits, scan.getHints(), scan.getTable(), stats.getRowCount());
+      }
+      return new LogicalTableScan(targetCluster, traits, scan.getHints(), scan.getTable());
     }
 
     @Override

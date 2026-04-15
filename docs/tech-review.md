@@ -418,7 +418,8 @@ The RFC describes a mature system. Our implementation is a focused subset target
 | **Execution model** | Push-based pipeline with Operators and Consumers | Pull-based (Velox SerialTask.next()) |
 | **Data reading** | Concurrent reads at segment granularity | Segment-level parallel reads with configurable parallelism (`segment_parallelism`) |
 | **Fault tolerance** | Task retries, node health monitoring | Task retry with error classification (node/shard/transient), bad resource tracking, replica failover (`task_max_retries`) |
-| **Maturity** | Production on thousands of nodes | End-to-end working: scan, filter, project, aggregate, join, sort |
+| **Join reorder** | DP algorithm for bushy join reordering with statistics | Calcite `MultiJoinOptimizeBushyRule` (greedy heuristic) + CBO row counts via `StatisticsTableScan` |
+| **Maturity** | Production on thousands of nodes | End-to-end working: scan, filter, project, aggregate, join, sort, window, TopN |
 
 ### Our approach as stepping stone
 
@@ -449,6 +450,7 @@ Our design extends the SQL plugin rather than rewriting it, while adopting key R
 - Two-stage TopN: Sort+Limit queries split into partial sort+limit on data nodes (top-K per shard) + final sort+limit on coordinator, reducing data transfer from O(N) to O(K × shards)
 - Window functions: eventstats (COUNT, SUM, AVG, MIN, MAX with PARTITION BY) via Velox WindowNode. ProjectToWindowRule decomposes RexOver → LogicalWindow → PhysicalWindow → WindowNode.
 - CBO statistics: query-time row count + data size collection from IndicesStatsResponse. Feeds into CostEstimator for row-count-based build side selection. Configurable via `plugins.velox.cbo_statistics_mode` (RUNTIME/NONE, default RUNTIME, dynamic).
+- Join reorder: Calcite-based bushy join reordering using CBO row counts. `JoinToMultiJoinRule` flattens binary join trees into N-ary `MultiJoin`, `MultiJoinOptimizeBushyRule` produces optimal bushy tree using greedy heuristic. `LoptOptimizeJoinRule` handles outer join cases. CBO row counts injected via `StatisticsTableScan` into Calcite's cost model. Coordinator-centric execution supports N-way joins (3+ tables). MPP multi-way falls back to coordinator-centric with TODO for staged execution.
 - Plan explain: PPL `explain` command outputs Velox plan tree via `PlanNode.toFormatString()`, showing operator pipeline, column projections, and filter expressions.
 - Per-query session creation (prevents memory pool collisions)
 - Graceful degradation on unsupported platforms
@@ -472,7 +474,7 @@ Gaps identified by comparison with [RFC #4812](https://github.com/opensearch-pro
 | Priority | Item | Gap vs RFC | Current State |
 |----------|------|-----------|---------------|
 | ~~**High**~~ | ~~CBO statistics~~ | ~~RFC uses runtime statistics~~ | **Done** — table-level row count + size from IndicesStatsResponse; feeds CostEstimator for row-count-based build side selection; `cbo_statistics_mode` setting |
-| **High** | Join reorder | RFC uses DP algorithm for bushy join reordering with statistics | Not started; depends on CBO statistics (now done) |
+| ~~**High**~~ | ~~Join reorder~~ | ~~RFC uses DP algorithm for bushy join reordering with statistics~~ | **Done** — Calcite `JoinToMultiJoinRule` + `MultiJoinOptimizeBushyRule` in HepPlanner; CBO row counts injected via `StatisticsTableScan`; `LoptOptimizeJoinRule` fallback for outer joins; coordinator-centric N-way join execution |
 | **Medium** | Cost-based join strategy (real stats) | RFC uses table cardinality + selectivity estimation | Row count available via CBO; column cardinality deferred (Lucene segment stats, Option B) |
 | **Medium** | Runtime Filter (BLOOM) | RFC supports probabilistic BLOOM variant for high-cardinality keys | Not implemented (depends on TERMS RF) |
 | ~~**Medium**~~ | ~~TopN optimization~~ | ~~RFC pushes ORDER BY + LIMIT as ranking subquery to data nodes~~ | **Done** — two-stage TopN splits Sort+Limit into partial (data nodes) + final (coordinator); subquery push deferred |

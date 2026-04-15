@@ -1,0 +1,8 @@
+{
+  "mappings": {
+    "properties": {
+      "dept_id": { "type": "integer" },
+      "dept_name": { "type": "keyword" }
+    }
+  }
+}

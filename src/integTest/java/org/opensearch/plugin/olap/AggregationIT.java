@@ -30,12 +30,12 @@ public class AggregationIT extends OlapRestTestCase {
   @Override
   public void setUp() throws Exception {
     super.setUp();
-    createTestIndex();
+    loadIndex(Index.TEST_OLAP);
   }
 
   @Override
   public void tearDown() throws Exception {
-    deleteTestIndex();
+    deleteIndex(Index.TEST_OLAP.getName());
     super.tearDown();
   }
 

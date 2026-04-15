@@ -1,0 +1,10 @@
+{"index": {"_index": "employees"}}
+{"emp_id": 1, "name": "Alice", "dept_id": 10, "salary": 120000}
+{"index": {"_index": "employees"}}
+{"emp_id": 2, "name": "Bob", "dept_id": 20, "salary": 95000}
+{"index": {"_index": "employees"}}
+{"emp_id": 3, "name": "Charlie", "dept_id": 10, "salary": 150000}
+{"index": {"_index": "employees"}}
+{"emp_id": 4, "name": "Diana", "dept_id": 30, "salary": 110000}
+{"index": {"_index": "employees"}}
+{"emp_id": 5, "name": "Eve", "dept_id": 20, "salary": 88000}

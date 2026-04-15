@@ -182,6 +182,11 @@ public class VeloxPlanGenerator {
   /**
    * Handle a PhysicalExchange: the child subtree becomes a separate fragment. Returns null as a
    * placeholder — the parent fragment will wire an ExternalStream scan.
+   *
+   * <p>Exception: if the exchange's input is an intermediate join (no direct source index), the
+   * child plan is inlined into the parent fragment instead of creating a separate fragment. This
+   * ensures that for multi-way joins, all join operators stay in the COORDINATOR fragment while
+   * only leaf table scans are dispatched to data nodes.
    */
   private PlanNode handleExchange(PhysicalExchange exchange) {
     // Recursively convert the child (the leaf/intermediate fragment)
@@ -191,6 +196,15 @@ public class VeloxPlanGenerator {
     // not the input's distribution. SINGLETON → gather to coordinator, HASH → shuffle scan.
     String sourceIndex = extractSourceIndex(exchange.getInput());
     RelDistribution exchangeDist = exchange.getDistribution();
+
+    // If the exchange's input contains a join, it's an intermediate join fragment
+    // (e.g., the inner join of a 3-way join). Inline it into the parent fragment so all
+    // joins stay in the coordinator. Only leaf scans get their own fragments.
+    if (containsJoin(exchange.getInput())
+        && (exchangeDist == null
+            || exchangeDist.getType() != RelDistribution.Type.HASH_DISTRIBUTED)) {
+      return childPlan;
+    }
 
     FragmentProperties props;
     if (exchangeDist != null && exchangeDist.getType() == RelDistribution.Type.HASH_DISTRIBUTED) {
@@ -816,6 +830,19 @@ public class VeloxPlanGenerator {
       default:
         throw new UnsupportedOperationException("Unsupported join type: " + calciteType);
     }
+  }
+
+  /** Check if a RelNode subtree contains a PhysicalJoin (walking through single-input nodes). */
+  private boolean containsJoin(RelNode node) {
+    if (node instanceof PhysicalJoin) {
+      return true;
+    }
+    for (RelNode input : node.getInputs()) {
+      if (containsJoin(input)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   private String extractSourceIndex(RelNode node) {
