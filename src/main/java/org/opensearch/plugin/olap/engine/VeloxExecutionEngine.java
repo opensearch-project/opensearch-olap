@@ -974,6 +974,7 @@ public class VeloxExecutionEngine {
           newSources.size() > 1 ? newSources.get(1) : newSources.get(0),
           j.getOutputType(),
           false,
+          false,
           false);
     }
     return node;

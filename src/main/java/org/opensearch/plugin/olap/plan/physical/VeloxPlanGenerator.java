@@ -536,7 +536,17 @@ public class VeloxPlanGenerator {
     JoinType veloxJoinType = convertJoinType(join.getJoinType());
 
     return new HashJoinNode(
-        nodeId, veloxJoinType, leftKeys, rightKeys, null, left, right, outputType, false, false);
+        nodeId,
+        veloxJoinType,
+        leftKeys,
+        rightKeys,
+        null,
+        left,
+        right,
+        outputType,
+        false,
+        false,
+        false);
   }
 
   private PlanNode convertSort(PhysicalSort sort) {
