@@ -71,6 +71,41 @@ public final class VeloxTypeConverter {
     }
   }
 
+  /** Check if a Calcite type can be converted to a Velox type. */
+  public static boolean isSupported(RelDataType calciteType) {
+    SqlTypeName typeName = calciteType.getSqlTypeName();
+    switch (typeName) {
+      case BOOLEAN:
+      case TINYINT:
+      case SMALLINT:
+      case INTEGER:
+      case BIGINT:
+      case FLOAT:
+      case REAL:
+      case DOUBLE:
+      case DECIMAL:
+      case CHAR:
+      case VARCHAR:
+      case DATE:
+      case TIMESTAMP:
+      case TIMESTAMP_WITH_LOCAL_TIME_ZONE:
+        return true;
+      case ARRAY:
+      case MULTISET:
+        return calciteType.getComponentType() != null
+            && isSupported(calciteType.getComponentType());
+      case MAP:
+        return calciteType.getKeyType() != null
+            && calciteType.getValueType() != null
+            && isSupported(calciteType.getKeyType())
+            && isSupported(calciteType.getValueType());
+      case ROW:
+        return calciteType.getFieldList().stream().allMatch(f -> isSupported(f.getType()));
+      default:
+        return false;
+    }
+  }
+
   public static RowType toVeloxRowType(RelDataType calciteType) {
     List<RelDataTypeField> fields = calciteType.getFieldList();
     List<String> names = new ArrayList<>(fields.size());

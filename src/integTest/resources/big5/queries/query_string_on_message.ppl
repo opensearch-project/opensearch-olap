@@ -1,0 +1,16 @@
+/*
+{
+  "name": "query-string-on-message",
+  "operation-type": "search",
+  "index": "{{index_name | default('big5')}}",
+  "body": {
+    "query": {
+      "query_string": {
+        "query": "message: monkey jackal bear"
+      }
+    }
+  }
+}
+*/
+source = big5 message=monkey OR message=jackal OR message=bear
+| head 10

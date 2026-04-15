@@ -109,6 +109,10 @@ public class OlapPlugin extends Plugin implements ActionPlugin {
         .getClusterSettings()
         .addSettingsUpdateConsumer(
             VeloxLifecycleService.CBO_STATISTICS_MODE, veloxLifecycleService::setCboStatisticsMode);
+    clusterService
+        .getClusterSettings()
+        .addSettingsUpdateConsumer(
+            VeloxLifecycleService.FORCE_VECTORIZE, veloxLifecycleService::setForceVectorize);
 
     return Arrays.asList(
         veloxLifecycleService, queryScheduler, veloxExecutionEngine, shuffleManager);

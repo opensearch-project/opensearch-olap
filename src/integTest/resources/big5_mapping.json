@@ -1,0 +1,73 @@
+{
+  "mappings": {
+    "date_detection": false,
+    "dynamic": "strict",
+    "properties": {
+      "@timestamp": { "type": "date" },
+      "message": { "type": "keyword", "ignore_above": 4096 },
+      "process": {
+        "properties": {
+          "name": { "type": "keyword" }
+        }
+      },
+      "aws": {
+        "properties": {
+          "cloudwatch": {
+            "properties": {
+              "ingestion_time": { "type": "keyword" },
+              "log_group": { "type": "keyword" },
+              "log_stream": { "type": "keyword" }
+            }
+          }
+        }
+      },
+      "tags": { "type": "keyword" },
+      "meta": {
+        "properties": {
+          "file": { "type": "keyword" }
+        }
+      },
+      "cloud": {
+        "properties": {
+          "region": { "type": "keyword" }
+        }
+      },
+      "input": {
+        "properties": {
+          "type": { "type": "keyword" }
+        }
+      },
+      "metrics": {
+        "properties": {
+          "size": { "type": "long" },
+          "tmin": { "type": "long" }
+        }
+      },
+      "log": {
+        "properties": {
+          "file": {
+            "properties": {
+              "path": { "type": "keyword" }
+            }
+          }
+        }
+      },
+      "event": {
+        "properties": {
+          "id": { "type": "keyword" },
+          "dataset": { "type": "keyword" },
+          "ingested": { "type": "date" }
+        }
+      },
+      "agent": {
+        "properties": {
+          "id": { "type": "keyword" },
+          "name": { "type": "keyword" },
+          "ephemeral_id": { "type": "keyword" },
+          "type": { "type": "keyword" },
+          "version": { "type": "keyword" }
+        }
+      }
+    }
+  }
+}

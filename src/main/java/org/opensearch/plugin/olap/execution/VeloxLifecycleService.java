@@ -131,7 +131,20 @@ public class VeloxLifecycleService implements Closeable {
           Setting.Property.NodeScope,
           Setting.Property.Dynamic);
 
+  /**
+   * Force all queries through the vectorized engine, bypassing canVectorize() checks. When enabled,
+   * queries that use unsupported types or functions will fail explicitly instead of falling back to
+   * the default engine. Intended for integration testing to verify Velox coverage.
+   */
+  public static final Setting<Boolean> FORCE_VECTORIZE =
+      Setting.boolSetting(
+          "plugins.velox.force_vectorize",
+          false,
+          Setting.Property.NodeScope,
+          Setting.Property.Dynamic);
+
   private volatile boolean enabled;
+  private volatile boolean forceVectorize;
   private volatile boolean mppEnabled;
   private volatile int broadcastMaxShards;
   private volatile int shufflePartitions;
@@ -146,6 +159,7 @@ public class VeloxLifecycleService implements Closeable {
 
   public VeloxLifecycleService(Settings settings) {
     this.enabled = OLAP_ENABLED.get(settings);
+    this.forceVectorize = FORCE_VECTORIZE.get(settings);
     this.mppEnabled = MPP_ENABLED.get(settings);
     this.broadcastMaxShards = BROADCAST_MAX_SHARDS.get(settings);
     this.shufflePartitions = SHUFFLE_PARTITIONS.get(settings);
@@ -225,6 +239,14 @@ public class VeloxLifecycleService implements Closeable {
 
   public boolean isEnabled() {
     return enabled;
+  }
+
+  public boolean isForceVectorize() {
+    return forceVectorize;
+  }
+
+  public void setForceVectorize(boolean forceVectorize) {
+    this.forceVectorize = forceVectorize;
   }
 
   public boolean isMppEnabled() {
@@ -307,7 +329,8 @@ public class VeloxLifecycleService implements Closeable {
         TASK_MAX_RETRIES,
         RUNTIME_FILTER_ENABLED,
         RUNTIME_FILTER_MAX_CARDINALITY,
-        CBO_STATISTICS_MODE);
+        CBO_STATISTICS_MODE,
+        FORCE_VECTORIZE);
   }
 
   @Override

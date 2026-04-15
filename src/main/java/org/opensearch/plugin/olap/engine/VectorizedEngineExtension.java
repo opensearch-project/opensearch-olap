@@ -15,11 +15,13 @@ import org.apache.calcite.rel.logical.LogicalProject;
 import org.apache.calcite.rel.logical.LogicalSort;
 import org.apache.calcite.rel.logical.LogicalTableScan;
 import org.apache.calcite.rel.logical.LogicalWindow;
+import org.apache.calcite.rel.type.RelDataTypeField;
 import org.apache.calcite.rex.RexCall;
 import org.apache.calcite.rex.RexNode;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.plugin.olap.plan.convert.VeloxExprConverter;
+import org.opensearch.plugin.olap.plan.convert.VeloxTypeConverter;
 import org.opensearch.sql.ast.statement.ExplainMode;
 import org.opensearch.sql.calcite.CalcitePlanContext;
 import org.opensearch.sql.calcite.plan.rel.LogicalSystemLimit;
@@ -71,6 +73,11 @@ public class VectorizedEngineExtension implements ExecutionEngine {
   public boolean canVectorize(RelNode plan) {
     if (veloxEngine == null || !veloxEngine.isAvailable()) {
       return false;
+    }
+    // force_vectorize=true bypasses all checks — for integration testing to verify Velox coverage.
+    // Queries with unsupported types/functions will fail explicitly instead of falling back.
+    if (veloxEngine.isForceVectorize()) {
+      return true;
     }
     String unsupportedNode = findUnsupportedNode(plan);
     if (unsupportedNode != null) {
@@ -145,6 +152,17 @@ public class VectorizedEngineExtension implements ExecutionEngine {
   private String findUnsupportedNode(RelNode node) {
     if (!SUPPORTED_REL_NODES.contains(node.getClass())) {
       return node.getClass().getName();
+    }
+
+    // Check field types in scan nodes for unsupported types (e.g. ANY from match_only_text)
+    if (node instanceof LogicalTableScan
+        || node.getClass().getSimpleName().contains("TableScan")
+        || node.getClass().getSimpleName().contains("IndexScan")) {
+      for (RelDataTypeField field : node.getRowType().getFieldList()) {
+        if (!VeloxTypeConverter.isSupported(field.getType())) {
+          return "type:" + field.getType().getSqlTypeName() + " in field " + field.getName();
+        }
+      }
     }
 
     // Check expressions in Filter, Project, and Join for unsupported functions

@@ -1329,4 +1329,8 @@ public class VeloxExecutionEngine {
   public boolean isAvailable() {
     return veloxLifecycle.isEnabled();
   }
+
+  public boolean isForceVectorize() {
+    return veloxLifecycle.isForceVectorize();
+  }
 }
