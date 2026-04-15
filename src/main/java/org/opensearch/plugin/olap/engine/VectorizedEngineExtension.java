@@ -5,6 +5,7 @@
 package org.opensearch.plugin.olap.engine;
 
 import java.util.HashSet;
+import java.util.List;
 import java.util.Set;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.logical.LogicalAggregate;
@@ -14,8 +15,11 @@ import org.apache.calcite.rel.logical.LogicalProject;
 import org.apache.calcite.rel.logical.LogicalSort;
 import org.apache.calcite.rel.logical.LogicalTableScan;
 import org.apache.calcite.rel.logical.LogicalWindow;
+import org.apache.calcite.rex.RexCall;
+import org.apache.calcite.rex.RexNode;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.opensearch.plugin.olap.plan.convert.VeloxExprConverter;
 import org.opensearch.sql.ast.statement.ExplainMode;
 import org.opensearch.sql.calcite.CalcitePlanContext;
 import org.opensearch.sql.calcite.plan.rel.LogicalSystemLimit;
@@ -135,17 +139,69 @@ public class VectorizedEngineExtension implements ExecutionEngine {
   }
 
   /**
-   * Recursively finds the first unsupported RelNode in the plan tree. Returns the class name of the
-   * unsupported node, or null if all nodes are supported.
+   * Recursively finds the first unsupported RelNode or RexCall function in the plan tree. Returns a
+   * description of the unsupported element, or null if all elements are supported.
    */
   private String findUnsupportedNode(RelNode node) {
     if (!SUPPORTED_REL_NODES.contains(node.getClass())) {
       return node.getClass().getName();
     }
+
+    // Check expressions in Filter, Project, and Join for unsupported functions
+    String unsupportedFunc = findUnsupportedFunction(node);
+    if (unsupportedFunc != null) {
+      return unsupportedFunc;
+    }
+
     for (RelNode input : node.getInputs()) {
       String unsupported = findUnsupportedNode(input);
       if (unsupported != null) {
         return unsupported;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Check expressions in a RelNode for unsupported functions. Returns the function name if
+   * unsupported, null if all functions are supported.
+   */
+  private String findUnsupportedFunction(RelNode node) {
+    List<RexNode> expressions = null;
+    if (node instanceof LogicalFilter) {
+      expressions = List.of(((LogicalFilter) node).getCondition());
+    } else if (node instanceof LogicalProject) {
+      expressions = ((LogicalProject) node).getProjects();
+    } else if (node instanceof LogicalJoin) {
+      RexNode cond = ((LogicalJoin) node).getCondition();
+      if (cond != null) {
+        expressions = List.of(cond);
+      }
+    }
+    if (expressions == null) {
+      return null;
+    }
+    for (RexNode expr : expressions) {
+      String unsupported = findUnsupportedRexCall(expr);
+      if (unsupported != null) {
+        return unsupported;
+      }
+    }
+    return null;
+  }
+
+  /** Recursively check a RexNode tree for unsupported function calls. */
+  private String findUnsupportedRexCall(RexNode node) {
+    if (node instanceof RexCall) {
+      RexCall call = (RexCall) node;
+      if (!VeloxExprConverter.isSupported(call)) {
+        return "function:" + call.getOperator().getName();
+      }
+      for (RexNode operand : call.getOperands()) {
+        String unsupported = findUnsupportedRexCall(operand);
+        if (unsupported != null) {
+          return unsupported;
+        }
       }
     }
     return null;
