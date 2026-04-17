@@ -558,4 +558,97 @@ public class PhysicalOptimizerTests extends OpenSearchTestCase {
     assertTrue(plan1 instanceof PhysicalRel);
     assertTrue(plan2 instanceof PhysicalRel);
   }
+
+  // ---- Nested object fields (MAP → ROW) ----
+
+  /** Scan on a table with MAP columns + dot-path siblings produces a valid physical plan. */
+  public void testScanWithNestedObjectFieldsProducesValidPlan() {
+    RelNode logical = b().scan("logs").build();
+
+    PhysicalOptimizer optimizer = new PhysicalOptimizer(false);
+    RelNode physical = optimizer.optimize(logical);
+
+    String plan = explainPlan(physical);
+    logger.info("Logs scan plan:\n{}", plan);
+
+    assertAllPhysicalRel(physical);
+    assertTrue("Plan should contain PhysicalTableScan", plan.contains("PhysicalTableScan"));
+    // The logs table has MAP columns — plan should still be valid
+    assertTrue("Plan should reference logs table", plan.contains("logs"));
+  }
+
+  /** Filter on a nested dot-path field should produce a valid plan. */
+  public void testFilterOnNestedFieldProducesValidPlan() {
+    RelBuilder rb = b();
+    RelNode logical =
+        rb.scan("logs")
+            .filter(rb.equals(rb.field("cloud.region"), rb.literal("eu-central-1")))
+            .build();
+
+    PhysicalOptimizer optimizer = new PhysicalOptimizer(false);
+    RelNode physical = optimizer.optimize(logical);
+
+    assertAllPhysicalRel(physical);
+  }
+
+  /** Sort on a dot-path field (metrics.size) — check the Calcite schema has it as a flat field. */
+  public void testSortOnDotPathFieldCalciteSchema() {
+    RelBuilder rb = b();
+    RelNode scan = rb.scan("logs").build();
+
+    // Verify metrics.size is a flat top-level column in the Calcite scan schema
+    logger.info("Logs scan row type: {}", scan.getRowType());
+    boolean hasFlatMetricsSize = scan.getRowType().getFieldNames().contains("metrics.size");
+    assertTrue("metrics.size should be a flat column in LogicalTableScan", hasFlatMetricsSize);
+
+    // Check the index of metrics.size
+    int index = scan.getRowType().getFieldNames().indexOf("metrics.size");
+    logger.info("metrics.size is at Calcite index {}", index);
+    assertEquals("metrics.size should be at index 5", 5, index);
+  }
+
+  /** Sort on dot-path field should produce a valid plan — verify plan structure via explain. */
+  public void testSortOnDotPathFieldPlanExplain() {
+    RelBuilder rb = b();
+    RelNode logical = rb.scan("logs").sort(rb.field("metrics.size")).limit(0, 10).build();
+
+    PhysicalOptimizer optimizer = new PhysicalOptimizer(false);
+    RelNode physical = optimizer.optimize(logical);
+
+    String plan = explainPlan(physical);
+    logger.info("Sort on metrics.size plan:\n{}", plan);
+
+    assertAllPhysicalRel(physical);
+    // The sort key should reference metrics.size (as a flat field or remapped nested field)
+    assertTrue("Plan should contain PhysicalSort", plan.contains("PhysicalSort"));
+  }
+
+  /** SELECT * on logs table with MAP fields — check plan handles struct columns. */
+  public void testSelectAllOnLogsTablePlan() {
+    RelBuilder rb = b();
+    RelNode logical = rb.scan("logs").build();
+
+    PhysicalOptimizer optimizer = new PhysicalOptimizer(false);
+    RelNode physical = optimizer.optimize(logical);
+
+    String plan = explainPlan(physical);
+    logger.info("SELECT * on logs plan:\n{}", plan);
+
+    // Verify the plan contains the scan
+    assertTrue("Plan should contain logs table scan", plan.contains("logs"));
+  }
+
+  /** Filter on dot-path field should produce a valid plan. */
+  public void testFilterOnDotPathFieldProducesValidPlan() {
+    RelBuilder rb = b();
+    RelNode logical =
+        rb.scan("logs")
+            .filter(rb.equals(rb.field("cloud.region"), rb.literal("eu-central-1")))
+            .build();
+
+    PhysicalOptimizer optimizer = new PhysicalOptimizer(false);
+    RelNode physical = optimizer.optimize(logical);
+
+    assertAllPhysicalRel(physical);
+  }
 }

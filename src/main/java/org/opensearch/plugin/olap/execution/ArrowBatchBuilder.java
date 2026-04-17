@@ -19,10 +19,13 @@ import org.apache.arrow.vector.SmallIntVector;
 import org.apache.arrow.vector.TinyIntVector;
 import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.complex.StructVector;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.types.pojo.Schema;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.apache.lucene.index.LeafReader;
 import org.opensearch.plugin.olap.execution.DocValueColumnReader.DocValueType;
 
@@ -35,6 +38,7 @@ import org.opensearch.plugin.olap.execution.DocValueColumnReader.DocValueType;
  */
 public class ArrowBatchBuilder {
 
+  private static final Logger logger = LogManager.getLogger(ArrowBatchBuilder.class);
   private static final int DEFAULT_BATCH_SIZE = 4096;
 
   private final BufferAllocator allocator;
@@ -56,11 +60,21 @@ public class ArrowBatchBuilder {
     private final String name;
     private final ArrowType arrowType;
     private final DocValueType docValueType;
+    private final List<ColumnSpec> children; // non-null for struct columns
 
     public ColumnSpec(String name, ArrowType arrowType, DocValueType docValueType) {
       this.name = name;
       this.arrowType = arrowType;
       this.docValueType = docValueType;
+      this.children = null;
+    }
+
+    /** Create a struct column with children. Each child reads from a flat doc-value field. */
+    public ColumnSpec(String name, List<ColumnSpec> children) {
+      this.name = name;
+      this.arrowType = ArrowType.Struct.INSTANCE;
+      this.docValueType = null;
+      this.children = children;
     }
 
     public String getName() {
@@ -73,6 +87,14 @@ public class ArrowBatchBuilder {
 
     public DocValueType getDocValueType() {
       return docValueType;
+    }
+
+    public boolean isStruct() {
+      return children != null;
+    }
+
+    public List<ColumnSpec> getChildren() {
+      return children;
     }
   }
 
@@ -107,38 +129,72 @@ public class ArrowBatchBuilder {
   public VectorSchemaRoot buildBatch(LeafReader reader, int[] docIds, int count)
       throws IOException {
 
-    // Create Arrow schema and vectors
+    // Create Arrow schema and vectors (supports nested struct columns)
     List<Field> fields = new ArrayList<>(columns.size());
     for (ColumnSpec col : columns) {
-      fields.add(new Field(col.name, FieldType.nullable(col.arrowType), null));
+      fields.add(buildArrowField(col));
     }
     Schema schema = new Schema(fields);
+    logger.info("Arrow batch schema: {}", schema);
     VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator);
     root.setRowCount(count);
 
-    // Open doc value readers for each column
-    List<DocValueColumnReader> readers = new ArrayList<>(columns.size());
-    for (ColumnSpec col : columns) {
-      DocValueColumnReader dvReader = new DocValueColumnReader(col.name, col.docValueType);
-      dvReader.open(reader);
-      readers.add(dvReader);
-    }
-
-    // Populate each vector
+    // Populate each column (flat or struct)
     for (int col = 0; col < columns.size(); col++) {
       ColumnSpec spec = columns.get(col);
-      DocValueColumnReader dvReader = readers.get(col);
       FieldVector vector = root.getVector(col);
       vector.allocateNew();
-
-      for (int row = 0; row < count; row++) {
-        populateValue(vector, row, docIds[row], dvReader, spec.arrowType);
-      }
-
+      populateColumn(vector, spec, reader, docIds, count);
       vector.setValueCount(count);
     }
 
     return root;
+  }
+
+  /** Build an Arrow Field from a ColumnSpec, handling nested structs recursively. */
+  private Field buildArrowField(ColumnSpec col) {
+    if (col.isStruct()) {
+      List<Field> childFields = new ArrayList<>();
+      for (ColumnSpec child : col.getChildren()) {
+        childFields.add(buildArrowField(child));
+      }
+      return new Field(col.getName(), FieldType.nullable(ArrowType.Struct.INSTANCE), childFields);
+    }
+    // Use the full field name (including dot-path like cloud.region) as the Arrow field name.
+    // The Velox scan output uses flat dot-path names.
+    String fieldName = col.getName();
+    return new Field(fieldName, FieldType.nullable(col.getArrowType()), null);
+  }
+
+  /**
+   * Populate a column (flat or struct) from Lucene doc values. For struct columns, reads flat
+   * doc-value fields and assembles them into a StructVector.
+   */
+  private void populateColumn(
+      FieldVector vector, ColumnSpec spec, LeafReader reader, int[] docIds, int count)
+      throws IOException {
+    if (spec.isStruct()) {
+      StructVector structVector = (StructVector) vector;
+      // Populate each child vector of the struct
+      for (int i = 0; i < spec.getChildren().size(); i++) {
+        ColumnSpec childSpec = spec.getChildren().get(i);
+        FieldVector childVector = structVector.getChildrenFromFields().get(i);
+        childVector.allocateNew();
+        populateColumn(childVector, childSpec, reader, docIds, count);
+        childVector.setValueCount(count);
+      }
+      // Mark all struct rows as non-null
+      for (int row = 0; row < count; row++) {
+        structVector.setIndexDefined(row);
+      }
+    } else {
+      DocValueColumnReader dvReader =
+          new DocValueColumnReader(spec.getName(), spec.getDocValueType());
+      dvReader.open(reader);
+      for (int row = 0; row < count; row++) {
+        populateValue(vector, row, docIds[row], dvReader, spec.getArrowType());
+      }
+    }
   }
 
   private void populateValue(

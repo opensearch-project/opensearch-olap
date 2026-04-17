@@ -73,6 +73,25 @@ public class CalciteTestHelper {
             .build();
     rootSchema.add("projects", new SimpleTable(projType));
 
+    // logs table (for nested object field tests, simulates big5-like schema)
+    // OpenSearch object fields appear as MAP<VARCHAR, ANY> with dot-path siblings.
+    RelDataType mapType =
+        TYPE_FACTORY.createMapType(
+            TYPE_FACTORY.createSqlType(SqlTypeName.VARCHAR),
+            TYPE_FACTORY.createSqlType(SqlTypeName.ANY));
+    RelDataType logsType =
+        TYPE_FACTORY
+            .builder()
+            .add("@timestamp", SqlTypeName.TIMESTAMP)
+            .add("message", SqlTypeName.VARCHAR)
+            .add("cloud", mapType)
+            .add("cloud.region", SqlTypeName.VARCHAR)
+            .add("metrics", mapType)
+            .add("metrics.size", SqlTypeName.BIGINT)
+            .add("metrics.tmin", SqlTypeName.BIGINT)
+            .build();
+    rootSchema.add("logs", new SimpleTable(logsType));
+
     return RelBuilder.create(Frameworks.newConfigBuilder().defaultSchema(rootSchema).build());
   }
 }

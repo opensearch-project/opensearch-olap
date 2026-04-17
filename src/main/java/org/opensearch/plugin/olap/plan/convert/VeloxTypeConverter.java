@@ -22,6 +22,8 @@ import org.boostscale.velox4j.type.SmallIntType;
 import org.boostscale.velox4j.type.TinyIntType;
 import org.boostscale.velox4j.type.Type;
 import org.boostscale.velox4j.type.VarCharType;
+import org.opensearch.sql.calcite.type.AbstractExprRelDataType;
+import org.opensearch.sql.calcite.utils.OpenSearchTypeFactory.ExprUDT;
 
 /** Converts Calcite RelDataType to velox4j Type. */
 public final class VeloxTypeConverter {
@@ -29,6 +31,24 @@ public final class VeloxTypeConverter {
   private VeloxTypeConverter() {}
 
   public static Type toVeloxType(RelDataType calciteType) {
+    // OpenSearch UDT types (ExprDateType, ExprTimeStampType) report SqlTypeName.VARCHAR
+    // but their doc values are stored as BIGINT (millis since epoch). Map them to BIGINT
+    // so the Velox scan output matches the Arrow data produced by LuceneArrowReader.
+    if (calciteType instanceof AbstractExprRelDataType<?>) {
+      ExprUDT udt = ((AbstractExprRelDataType<?>) calciteType).getUdt();
+      switch (udt) {
+        case EXPR_DATE:
+        case EXPR_TIMESTAMP:
+        case EXPR_TIME:
+          return new BigIntType();
+        case EXPR_IP:
+        case EXPR_BINARY:
+          return new VarCharType();
+        default:
+          // Fall through to SqlTypeName-based handling
+      }
+    }
+
     SqlTypeName typeName = calciteType.getSqlTypeName();
     switch (typeName) {
       case BOOLEAN:
@@ -58,6 +78,13 @@ public final class VeloxTypeConverter {
       case TIMESTAMP_WITH_LOCAL_TIME_ZONE:
         // Velox represents TIMESTAMP as BIGINT (micros since epoch)
         return new BigIntType();
+      case NULL:
+        // NULL type (from literal NULL expressions) — treat as VARCHAR
+        return new VarCharType();
+      case ANY:
+        // ANY type (from match_only_text, empty objects, or unresolved fields).
+        // Treat as VARCHAR — the actual data is handled by scan-level MAP→ROW conversion.
+        return new VarCharType();
       case ARRAY:
       case MULTISET:
         return ArrayType.create(toVeloxType(calciteType.getComponentType()));
@@ -73,6 +100,10 @@ public final class VeloxTypeConverter {
 
   /** Check if a Calcite type can be converted to a Velox type. */
   public static boolean isSupported(RelDataType calciteType) {
+    // OpenSearch UDT types map to Velox BIGINT/VARCHAR above. All supported.
+    if (calciteType instanceof AbstractExprRelDataType<?>) {
+      return true;
+    }
     SqlTypeName typeName = calciteType.getSqlTypeName();
     switch (typeName) {
       case BOOLEAN:
@@ -89,6 +120,8 @@ public final class VeloxTypeConverter {
       case DATE:
       case TIMESTAMP:
       case TIMESTAMP_WITH_LOCAL_TIME_ZONE:
+      case NULL:
+      case ANY:
         return true;
       case ARRAY:
       case MULTISET:

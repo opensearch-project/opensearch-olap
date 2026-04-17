@@ -195,11 +195,11 @@ public class VeloxTypeConverterTests extends OpenSearchTestCase {
   }
 
   public void testUnsupportedTypeThrows() {
-    RelDataType nullType = mock(RelDataType.class);
-    when(nullType.getSqlTypeName()).thenReturn(SqlTypeName.NULL);
+    RelDataType geoType = mock(RelDataType.class);
+    when(geoType.getSqlTypeName()).thenReturn(SqlTypeName.GEOMETRY);
 
     expectThrows(
-        UnsupportedOperationException.class, () -> VeloxTypeConverter.toVeloxType(nullType));
+        UnsupportedOperationException.class, () -> VeloxTypeConverter.toVeloxType(geoType));
   }
 
   public void testNestedArrayOfVarChar() {
