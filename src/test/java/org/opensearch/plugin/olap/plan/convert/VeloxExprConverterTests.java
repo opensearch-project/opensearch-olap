@@ -324,14 +324,17 @@ public class VeloxExprConverterTests extends OpenSearchTestCase {
     }
   }
 
-  public void testConvertNullLiteralThrows() {
+  public void testConvertNullLiteralProducesTypedNull() {
     RelDataType rowType = buildRowType();
     VeloxExprConverter converter = new VeloxExprConverter(rowType);
 
     RexLiteral nullLit = rexBuilder.makeNullLiteral(typeFactory.createSqlType(SqlTypeName.INTEGER));
+    TypedExpr result = converter.convert(nullLit);
 
-    // Null literals are not yet supported — ConstantTypedExpr requires a non-null variant
-    expectThrows(IllegalArgumentException.class, () -> converter.convert(nullLit));
+    // Null literals produce a ConstantTypedExpr with a typed null variant (e.g.,
+    // IntegerValue(null))
+    assertTrue(result instanceof ConstantTypedExpr);
+    assertTrue(result.getReturnType() instanceof IntegerType);
   }
 
   // ---- PPL UDF → Velox function name mapping (NAME_MAP) ----
@@ -498,5 +501,42 @@ public class VeloxExprConverterTests extends OpenSearchTestCase {
                     SqlStdOperatorTable.EQUALS,
                     intRef,
                     rexBuilder.makeLiteral(30, typeFactory.createSqlType(SqlTypeName.INTEGER)))));
+  }
+
+  // ---- ITEM (nested object field access) ----
+
+  /** ITEM(parent, 'field') should be recognized as supported by isSupported(). */
+  public void testIsSupportedForItemAccess() {
+    // Build MAP<VARCHAR, ANY> type (simulates OpenSearch object field)
+    RelDataType mapType =
+        typeFactory.createMapType(
+            typeFactory.createSqlType(SqlTypeName.VARCHAR),
+            typeFactory.createSqlType(SqlTypeName.ANY));
+    RexInputRef mapRef = rexBuilder.makeInputRef(mapType, 0);
+    RexLiteral fieldKey =
+        rexBuilder.makeLiteral("region", typeFactory.createSqlType(SqlTypeName.VARCHAR));
+    RexNode itemCall = rexBuilder.makeCall(SqlStdOperatorTable.ITEM, mapRef, fieldKey);
+    assertTrue(
+        "ITEM access should be supported", VeloxExprConverter.isSupported((RexCall) itemCall));
+  }
+
+  /** ITEM(parent, 'field') should convert to nested FieldAccessTypedExpr. */
+  public void testItemConvertsToNestedFieldAccess() {
+    // Row type: cloud is a ROW(region: VARCHAR), simulating MAP→ROW conversion
+    RelDataType innerRowType = typeFactory.builder().add("region", SqlTypeName.VARCHAR).build();
+    RelDataType rowType =
+        typeFactory.builder().add("cloud", innerRowType).add("name", SqlTypeName.VARCHAR).build();
+
+    VeloxExprConverter converter = new VeloxExprConverter(rowType);
+
+    // Build ITEM(cloud, 'region') — simulates PPL's cloud.region access
+    RexInputRef parentRef = rexBuilder.makeInputRef(innerRowType, 0);
+    RexLiteral fieldKey =
+        rexBuilder.makeLiteral("region", typeFactory.createSqlType(SqlTypeName.VARCHAR));
+    RexNode itemCall = rexBuilder.makeCall(SqlStdOperatorTable.ITEM, parentRef, fieldKey);
+
+    TypedExpr result = converter.convert(itemCall);
+    assertTrue(result instanceof FieldAccessTypedExpr);
+    assertEquals("region", ((FieldAccessTypedExpr) result).getFieldName());
   }
 }

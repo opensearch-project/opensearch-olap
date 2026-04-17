@@ -29,6 +29,7 @@ import org.apache.calcite.rex.RexLiteral;
 import org.apache.calcite.rex.RexNode;
 import org.apache.calcite.rex.RexWindowBound;
 import org.apache.calcite.sql.SqlKind;
+import org.apache.calcite.sql.type.SqlTypeName;
 import org.apache.calcite.util.ImmutableBitSet;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -58,6 +59,7 @@ import org.boostscale.velox4j.window.BoundType;
 import org.boostscale.velox4j.window.WindowFrame;
 import org.boostscale.velox4j.window.WindowFunction;
 import org.boostscale.velox4j.window.WindowType;
+import org.opensearch.plugin.olap.plan.convert.FieldMapping;
 import org.opensearch.plugin.olap.plan.convert.PlanIdGenerator;
 import org.opensearch.plugin.olap.plan.convert.VeloxAggConverter;
 import org.opensearch.plugin.olap.plan.convert.VeloxExprConverter;
@@ -89,6 +91,11 @@ public class VeloxPlanGenerator {
   private final AtomicInteger fragmentId = new AtomicInteger(0);
   private final List<PlanFragment> fragments = new ArrayList<>();
 
+  // Field mapping from Calcite field indices to Velox scan output, built during convertTableScan.
+  // Used by convertProject/convertFilter to remap field references for MAP→ROW conversion.
+  private FieldMapping[] currentFieldMappings;
+  private RowType currentVeloxOutputType;
+
   /**
    * Generate PlanFragments from an optimized physical plan.
    *
@@ -100,6 +107,8 @@ public class VeloxPlanGenerator {
     idGen.reset();
     fragmentId.set(0);
     fragments.clear();
+    currentFieldMappings = null;
+    currentVeloxOutputType = null;
 
     // Convert the physical plan to Velox PlanNode, creating fragments at Exchange boundaries
     PlanNode rootPlan = toVeloxPlan(physicalPlan);
@@ -219,6 +228,10 @@ public class VeloxPlanGenerator {
     int childFragId = fragmentId.getAndIncrement();
     fragments.add(new PlanFragment(childFragId, childPlan, props, Collections.emptyList()));
 
+    // Reset field mappings — the parent fragment has a different schema context
+    currentFieldMappings = null;
+    currentVeloxOutputType = null;
+
     // Return null — the parent will create an exchange scan placeholder
     return null;
   }
@@ -227,17 +240,90 @@ public class VeloxPlanGenerator {
     String nodeId = idGen.next();
     RelDataType rowType = scan.getRowType();
 
+    // Build field list, converting MAP<VARCHAR, ANY> (OpenSearch object) to ROW type
+    // by inspecting sibling dot-path columns (e.g., cloud: MAP + cloud.region: VARCHAR
+    // → cloud: ROW(region: VARCHAR)).
+    // Also build a field mapping from Calcite indices to Velox indices for expression remapping.
     List<String> names = new ArrayList<>();
     List<Type> types = new ArrayList<>();
+    FieldMapping[] mappings = new FieldMapping[rowType.getFieldCount()];
+    Map<String, Integer> parentVeloxIndex = new LinkedHashMap<>();
+    int veloxIdx = 0;
+
     for (RelDataTypeField field : rowType.getFieldList()) {
-      if (!METADATA_COLUMNS.contains(field.getName())) {
-        names.add(field.getName());
+      String fieldName = field.getName();
+      int calciteIdx = field.getIndex();
+      if (METADATA_COLUMNS.contains(fieldName)) {
+        // Metadata columns (_id, _index, etc.) are not present in the Velox scan output.
+        // Mark as skipped (-1) so Project can drop references to them.
+        mappings[calciteIdx] = new FieldMapping(-1, fieldName, null);
+        continue;
+      }
+      SqlTypeName typeName = field.getType().getSqlTypeName();
+
+      if (typeName == SqlTypeName.MAP) {
+        // MAP parent (OpenSearch object field, e.g., "cloud", "metrics") — skip from scan output.
+        // Its dot-path children are kept as flat top-level fields.
+        // Mark as skipped (-1) in mapping. The output Project reconstructs structs in Java.
+        mappings[calciteIdx] = new FieldMapping(-1, fieldName, null);
+      } else {
+        // Regular field or dot-path child (e.g., "@timestamp", "cloud.region", "metrics.size")
+        // Keep as flat top-level field in Velox scan output.
+        mappings[calciteIdx] = new FieldMapping(veloxIdx, fieldName, null);
+        names.add(fieldName);
         types.add(VeloxTypeConverter.toVeloxType(field.getType()));
+        veloxIdx++;
       }
     }
+
     RowType outputType = new RowType(names, types);
+    this.currentFieldMappings = mappings;
+    this.currentVeloxOutputType = outputType;
+
     return new TableScanNode(
         nodeId, outputType, new ExternalStreamTableHandle(CONNECTOR_ID), Collections.emptyList());
+  }
+
+  /**
+   * Build a Velox ROW type from dot-path children of a parent field. For example, if the parent is
+   * "cloud" and the row type contains "cloud.region: VARCHAR" and "cloud.provider: VARCHAR", this
+   * returns ROW(region: VARCHAR, provider: VARCHAR). Handles multi-level nesting recursively.
+   */
+  private RowType buildRowTypeFromChildren(String parentName, RelDataType rowType) {
+    String prefix = parentName + ".";
+    List<String> childNames = new ArrayList<>();
+    List<Type> childTypes = new ArrayList<>();
+
+    for (RelDataTypeField field : rowType.getFieldList()) {
+      String fieldName = field.getName();
+      if (!fieldName.startsWith(prefix)) {
+        continue;
+      }
+      String childPath = fieldName.substring(prefix.length());
+      // Only take direct children (no dots in remaining path)
+      if (childPath.contains(".")) {
+        // This is a grandchild — check if the intermediate parent is already added
+        String directChild = childPath.substring(0, childPath.indexOf('.'));
+        if (!childNames.contains(directChild)) {
+          // Recursively build nested ROW for intermediate object
+          RowType nestedRow = buildRowTypeFromChildren(prefix + directChild, rowType);
+          if (nestedRow != null && nestedRow.size() > 0) {
+            childNames.add(directChild);
+            childTypes.add(nestedRow);
+          }
+        }
+      } else {
+        SqlTypeName typeName = field.getType().getSqlTypeName();
+        if (typeName != SqlTypeName.MAP && typeName != SqlTypeName.ANY) {
+          childNames.add(childPath);
+          childTypes.add(VeloxTypeConverter.toVeloxType(field.getType()));
+        }
+      }
+    }
+    if (childNames.isEmpty()) {
+      return null;
+    }
+    return new RowType(childNames, childTypes);
   }
 
   private PlanNode convertFilter(PhysicalFilter filter) {
@@ -247,7 +333,7 @@ public class VeloxPlanGenerator {
       source = createExchangeScan(filter.getInput().getRowType());
     }
 
-    VeloxExprConverter exprConverter = new VeloxExprConverter(filter.getInput().getRowType());
+    VeloxExprConverter exprConverter = createExprConverter(filter.getInput().getRowType());
     TypedExpr filterExpr = exprConverter.convert(filter.getCondition());
 
     return new FilterNode(nodeId, Collections.singletonList(source), filterExpr);
@@ -255,24 +341,164 @@ public class VeloxPlanGenerator {
 
   private PlanNode convertProject(PhysicalProject project) {
     String nodeId = idGen.next();
+
+    // Snapshot the scan-level flat schema BEFORE descending into the input, so we can expand
+    // MAP parent projections into their flat dot-path children regardless of how deep this
+    // Project sits above the scan.
+    RowType scanOutputType = currentVeloxOutputType;
+
     PlanNode source = toVeloxPlan(project.getInput());
     if (source == null) {
       source = createExchangeScan(project.getInput().getRowType());
     }
+    if (scanOutputType == null) {
+      // Reconstruct a flat row type from the input's Calcite row type when mappings weren't
+      // populated (e.g., exchange-scan placeholder above a coordinator fragment).
+      scanOutputType = buildFlatRowType(project.getInput().getRowType());
+    }
 
-    VeloxExprConverter exprConverter = new VeloxExprConverter(project.getInput().getRowType());
+    VeloxExprConverter exprConverter = createExprConverter(project.getInput().getRowType());
 
     List<String> names = new ArrayList<>();
     List<TypedExpr> projections = new ArrayList<>();
     List<RelDataTypeField> outputFields = project.getRowType().getFieldList();
+    FieldMapping[] newMappings = new FieldMapping[outputFields.size()];
+    Map<String, Integer> emittedIndex = new LinkedHashMap<>();
 
     for (int i = 0; i < project.getProjects().size(); i++) {
       RexNode expr = project.getProjects().get(i);
-      names.add(outputFields.get(i).getName());
+      String outputName = outputFields.get(i).getName();
+
+      if (isMapParentRef(expr)) {
+        // MAP parent projection — expand into one projection per flat dot-path child
+        // (e.g., "metrics" → "metrics.size", "metrics.tmin"). The flat columns survive
+        // through downstream operators and Java's reconstructStructs reassembles them
+        // into a nested map in the final output.
+        String prefix = outputName + ".";
+        int expanded = 0;
+        for (int j = 0; j < scanOutputType.size(); j++) {
+          String flatName = scanOutputType.getNames().get(j);
+          if (flatName.startsWith(prefix) && !emittedIndex.containsKey(flatName)) {
+            emittedIndex.put(flatName, names.size());
+            names.add(flatName);
+            projections.add(
+                FieldAccessTypedExpr.create(scanOutputType.getChildren().get(j), flatName));
+            expanded++;
+          }
+        }
+        // Mark the Calcite MAP field as "expanded" — veloxIndex=-1 tells operators above to
+        // skip direct refs. Children remain accessible by name via reconstructStructs.
+        newMappings[i] = new FieldMapping(-1, outputName, null);
+        if (expanded == 0) {
+          logger.warn(
+              "MAP parent projection {} has no flat dot-path children in scan output", outputName);
+        }
+        continue;
+      }
+      // Skip duplicate outputs — a Project may reference both "cloud" (MAP) and "cloud.region" in
+      // the same output; the MAP-parent expansion already covers the child.
+      Integer existing = emittedIndex.get(outputName);
+      if (existing != null) {
+        newMappings[i] = new FieldMapping(existing, outputName, null);
+        continue;
+      }
+      emittedIndex.put(outputName, names.size());
+      newMappings[i] = new FieldMapping(names.size(), outputName, null);
+      names.add(outputName);
       projections.add(exprConverter.convert(expr));
     }
 
+    // Build the Project's Velox output type from the emitted names/projections so downstream
+    // operators can still resolve field references (e.g., Sort collation field indices).
+    List<Type> outTypes = new ArrayList<>(projections.size());
+    for (TypedExpr p : projections) {
+      outTypes.add(p.getReturnType());
+    }
+    currentVeloxOutputType = new RowType(new ArrayList<>(names), outTypes);
+    currentFieldMappings = newMappings;
+
     return new ProjectNode(nodeId, Collections.singletonList(source), names, projections);
+  }
+
+  /** Build a Velox RowType from a Calcite row type, skipping metadata and MAP parent columns. */
+  private RowType buildFlatRowType(RelDataType rowType) {
+    List<String> names = new ArrayList<>();
+    List<Type> types = new ArrayList<>();
+    for (RelDataTypeField field : rowType.getFieldList()) {
+      if (METADATA_COLUMNS.contains(field.getName())) {
+        continue;
+      }
+      if (field.getType().getSqlTypeName() == SqlTypeName.MAP) {
+        continue;
+      }
+      names.add(field.getName());
+      types.add(VeloxTypeConverter.toVeloxType(field.getType()));
+    }
+    return new RowType(names, types);
+  }
+
+  /**
+   * Check if a RexNode is a reference to a column absent from the Velox scan output. This includes:
+   *
+   * <ul>
+   *   <li>MAP/ANY parents (OpenSearch object types) — reconstructed as structs in Java post-scan.
+   *   <li>OpenSearch metadata columns (_id, _index, etc.) — not exposed through doc values.
+   * </ul>
+   */
+  private boolean isMapParentRef(RexNode expr) {
+    if (!(expr instanceof RexInputRef)) {
+      return false;
+    }
+    // Within the scan subtree, use field mappings (veloxIndex < 0 means skipped).
+    if (currentFieldMappings != null) {
+      int calciteIdx = ((RexInputRef) expr).getIndex();
+      if (calciteIdx < currentFieldMappings.length
+          && currentFieldMappings[calciteIdx] != null
+          && currentFieldMappings[calciteIdx].getVeloxIndex() < 0) {
+        return true;
+      }
+    }
+    // Above the scan subtree, detect MAP parents by Calcite type.
+    SqlTypeName typeName = expr.getType().getSqlTypeName();
+    return typeName == SqlTypeName.MAP;
+  }
+
+  /**
+   * Resolve a Calcite field index to a Velox FieldAccessTypedExpr, applying MAP→ROW field mapping
+   * when available. Used by sort keys, aggregation group keys, and other non-expression contexts.
+   */
+  private FieldAccessTypedExpr resolveFieldAccess(int calciteIndex, RelDataType inputRowType) {
+    if (currentFieldMappings != null
+        && calciteIndex < currentFieldMappings.length
+        && currentFieldMappings[calciteIndex] != null) {
+      FieldMapping mapping = currentFieldMappings[calciteIndex];
+      int veloxIndex = mapping.getVeloxIndex();
+      if (veloxIndex < 0) {
+        // MAP parent column (skipped from scan) — return null to skip this sort key.
+        // This happens when SystemLimit adds default sort on ALL columns including MAP parents.
+        return null;
+      }
+      Type veloxType = currentVeloxOutputType.getChildren().get(veloxIndex);
+      String fieldName = currentVeloxOutputType.getNames().get(veloxIndex);
+      return FieldAccessTypedExpr.create(veloxType, fieldName);
+    }
+    RelDataTypeField field = inputRowType.getFieldList().get(calciteIndex);
+    return FieldAccessTypedExpr.create(
+        VeloxTypeConverter.toVeloxType(field.getType()), field.getName());
+  }
+
+  /**
+   * Create a VeloxExprConverter with field mappings when available. Only uses mappings when the
+   * input row type matches the scan row type (same field count) — mappings are invalid for
+   * operators above aggregation/exchange that change the schema.
+   */
+  private VeloxExprConverter createExprConverter(RelDataType inputRowType) {
+    if (currentFieldMappings != null
+        && currentVeloxOutputType != null
+        && inputRowType.getFieldCount() == currentFieldMappings.length) {
+      return new VeloxExprConverter(inputRowType, currentFieldMappings, currentVeloxOutputType);
+    }
+    return new VeloxExprConverter(inputRowType);
   }
 
   private PlanNode convertAggregate(PhysicalAggregate agg) {
@@ -324,6 +550,10 @@ public class VeloxPlanGenerator {
       default:
         veloxStep = AggregateStep.SINGLE;
     }
+
+    // Aggregate reshapes the schema — mappings into the scan are invalid above this point.
+    currentFieldMappings = null;
+    currentVeloxOutputType = null;
 
     return new AggregationNode(
         nodeId,
@@ -435,18 +665,24 @@ public class VeloxPlanGenerator {
     }
 
     String finalId = idGen.next() + "_final";
-    return new AggregationNode(
-        finalId,
-        AggregateStep.FINAL,
-        groupingKeys,
-        Collections.emptyList(),
-        aggregateNames,
-        finalAggs,
-        false,
-        false,
-        Collections.emptyList(),
-        null,
-        Collections.emptyList());
+    AggregationNode finalAgg =
+        new AggregationNode(
+            finalId,
+            AggregateStep.FINAL,
+            groupingKeys,
+            Collections.emptyList(),
+            aggregateNames,
+            finalAggs,
+            false,
+            false,
+            Collections.emptyList(),
+            null,
+            Collections.emptyList());
+
+    // Aggregate reshapes the schema — mappings into the scan are invalid above this point.
+    currentFieldMappings = null;
+    currentVeloxOutputType = null;
+    return finalAgg;
   }
 
   private Type resolveIntermediateType(
@@ -535,18 +771,24 @@ public class VeloxPlanGenerator {
 
     JoinType veloxJoinType = convertJoinType(join.getJoinType());
 
-    return new HashJoinNode(
-        nodeId,
-        veloxJoinType,
-        leftKeys,
-        rightKeys,
-        null,
-        left,
-        right,
-        outputType,
-        false,
-        false,
-        false);
+    HashJoinNode joinNode =
+        new HashJoinNode(
+            nodeId,
+            veloxJoinType,
+            leftKeys,
+            rightKeys,
+            null,
+            left,
+            right,
+            outputType,
+            false,
+            false,
+            false);
+
+    // Join reshapes the schema — mappings into either scan are invalid above this point.
+    currentFieldMappings = null;
+    currentVeloxOutputType = null;
+    return joinNode;
   }
 
   private PlanNode convertSort(PhysicalSort sort) {
@@ -625,17 +867,40 @@ public class VeloxPlanGenerator {
     List<FieldAccessTypedExpr> sortingKeys = new ArrayList<>();
     List<SortOrder> sortingOrders = new ArrayList<>();
 
+    // Mappings are only valid when the sort's input schema matches the scan's schema.
+    // Operators that reshape the schema (Project, Aggregate, Join, Window) clear mappings
+    // on exit, so they are null here. But even a Filter above the scan preserves the schema,
+    // so we check the field count to distinguish.
+    boolean mappingsApplicable =
+        currentFieldMappings != null && inputRowType.getFieldCount() == currentFieldMappings.length;
+
     for (RelFieldCollation fieldCollation : sort.getCollation().getFieldCollations()) {
       int fieldIndex = fieldCollation.getFieldIndex();
-      RelDataTypeField field = inputRowType.getFieldList().get(fieldIndex);
-      Type veloxType = VeloxTypeConverter.toVeloxType(field.getType());
-      sortingKeys.add(FieldAccessTypedExpr.create(veloxType, field.getName()));
+      if (mappingsApplicable
+          && fieldIndex < currentFieldMappings.length
+          && currentFieldMappings[fieldIndex] != null) {
+        FieldAccessTypedExpr sortKey = resolveFieldAccess(fieldIndex, inputRowType);
+        if (sortKey == null) {
+          // MAP parent column — skip
+          continue;
+        }
+        sortingKeys.add(sortKey);
+      } else {
+        // No mapping — use direct field access (non-MAP tables, coordinator fragments)
+        RelDataTypeField field = inputRowType.getFieldList().get(fieldIndex);
+        Type veloxType = VeloxTypeConverter.toVeloxType(field.getType());
+        sortingKeys.add(FieldAccessTypedExpr.create(veloxType, field.getName()));
+      }
 
       boolean ascending = !fieldCollation.getDirection().isDescending();
       boolean nullsFirst = fieldCollation.nullDirection == RelFieldCollation.NullDirection.FIRST;
       sortingOrders.add(new SortOrder(ascending, nullsFirst));
     }
 
+    // If all sort keys were MAP parents (skipped), return source without sorting
+    if (sortingKeys.isEmpty()) {
+      return source;
+    }
     return new OrderByNode(
         orderNodeId, Collections.singletonList(source), sortingKeys, sortingOrders, false);
   }
@@ -727,15 +992,21 @@ public class VeloxPlanGenerator {
       windowFunctions.add(new WindowFunction(callExpr, frame, false));
     }
 
-    return new WindowNode(
-        nodeId,
-        partitionKeys,
-        sortingKeys,
-        sortingOrders,
-        windowColumnNames,
-        windowFunctions,
-        false,
-        Collections.singletonList(source));
+    WindowNode windowNode =
+        new WindowNode(
+            nodeId,
+            partitionKeys,
+            sortingKeys,
+            sortingOrders,
+            windowColumnNames,
+            windowFunctions,
+            false,
+            Collections.singletonList(source));
+
+    // Window reshapes the schema — mappings into the scan are invalid above this point.
+    currentFieldMappings = null;
+    currentVeloxOutputType = null;
+    return windowNode;
   }
 
   private BoundType convertBoundType(RexWindowBound bound, boolean isLower) {

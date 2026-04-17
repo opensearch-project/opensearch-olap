@@ -39,7 +39,15 @@ public abstract class OlapRestTestCase extends OpenSearchTestCase {
     EMPLOYEES("employees", "employees_mapping.json", "employees_data.json"),
     DEPARTMENTS("departments", "departments_mapping.json", "departments_data.json"),
     PROJECTS("projects", "projects_mapping.json", "projects_data.json"),
-    BIG5("big5", "big5_mapping.json", "big5_data.json");
+    BIG5("big5", "big5_mapping.json", "big5_data.json"),
+    NESTED_SIMPLE(
+        "opensearch-sql_test_index_nested_simple",
+        "nested_simple_mapping.json",
+        "nested_simple_data.json"),
+    DEEP_NESTED(
+        "opensearch-sql_test_index_deep_nested",
+        "deep_nested_mapping.json",
+        "deep_nested_data.json");
 
     private final String indexName;
     private final String mappingFile;

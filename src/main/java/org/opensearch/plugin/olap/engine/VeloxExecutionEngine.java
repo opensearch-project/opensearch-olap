@@ -1272,15 +1272,15 @@ public class VeloxExecutionEngine {
         int rowCount = root.getRowCount();
 
         for (int row = 0; row < rowCount; row++) {
-          LinkedHashMap<String, Object> tupleValues = new LinkedHashMap<>();
+          LinkedHashMap<String, Object> flatValues = new LinkedHashMap<>();
           for (int col = 0; col < fields.size(); col++) {
             String name = fields.get(col).getName();
-            Object value = root.getVector(col).getObject(row);
-            if (value instanceof Text) {
-              value = value.toString();
-            }
-            tupleValues.put(name, value);
+            Object value = extractVectorValue(root.getVector(col), row);
+            flatValues.put(name, value);
           }
+          // Reconstruct nested structs from flat dot-path columns.
+          // e.g., {cloud.region: "eu"} → {cloud: {region: "eu"}}
+          LinkedHashMap<String, Object> tupleValues = reconstructStructs(flatValues);
           rows.add(ExprValueUtils.tupleValue(tupleValues));
         }
       }
@@ -1290,6 +1290,75 @@ public class VeloxExecutionEngine {
       allocator.close();
     }
     return rows;
+  }
+
+  /**
+   * Extract a value from an Arrow vector, handling StructVector (nested objects) without calling
+   * getObject() — Arrow's StructVector.getObject() uses JsonStringHashMap which requires
+   * jackson-datatype-jsr310 at class init time.
+   */
+  private Object extractVectorValue(FieldVector vector, int row) {
+    if (vector instanceof org.apache.arrow.vector.complex.StructVector) {
+      org.apache.arrow.vector.complex.StructVector structVector =
+          (org.apache.arrow.vector.complex.StructVector) vector;
+      if (structVector.isNull(row)) {
+        return null;
+      }
+      LinkedHashMap<String, Object> structValues = new LinkedHashMap<>();
+      for (FieldVector child : structVector.getChildrenFromFields()) {
+        structValues.put(child.getName(), extractVectorValue(child, row));
+      }
+      return structValues;
+    }
+    // For non-struct vectors, use getObject() (safe — no Jackson dependency)
+    Object value = vector.getObject(row);
+    if (value instanceof Text) {
+      return value.toString();
+    }
+    return value;
+  }
+
+  /**
+   * Reconstruct nested struct objects from flat dot-path columns. Converts flat result columns like
+   * {cloud.region: "eu", metrics.size: 100, message: "hi"} into nested structs: {cloud: {region:
+   * "eu"}, metrics: {size: 100}, message: "hi"}.
+   */
+  @SuppressWarnings("unchecked")
+  private LinkedHashMap<String, Object> reconstructStructs(LinkedHashMap<String, Object> flat) {
+    LinkedHashMap<String, Object> result = new LinkedHashMap<>();
+    for (Map.Entry<String, Object> entry : flat.entrySet()) {
+      String key = entry.getKey();
+      Object value = entry.getValue();
+      if (key.contains(".")) {
+        // Dot-path field: nest into parent struct
+        String[] parts = key.split("\\.", 2);
+        String parent = parts[0];
+        String child = parts[1];
+        LinkedHashMap<String, Object> struct =
+            (LinkedHashMap<String, Object>)
+                result.computeIfAbsent(parent, k -> new LinkedHashMap<String, Object>());
+        // Recursively handle multi-level nesting (e.g., log.file.path)
+        if (child.contains(".")) {
+          LinkedHashMap<String, Object> childFlat = new LinkedHashMap<>();
+          childFlat.put(child, value);
+          LinkedHashMap<String, Object> childStruct = reconstructStructs(childFlat);
+          for (Map.Entry<String, Object> ce : childStruct.entrySet()) {
+            Object existing = struct.get(ce.getKey());
+            if (existing instanceof LinkedHashMap) {
+              ((LinkedHashMap<String, Object>) existing)
+                  .putAll((LinkedHashMap<String, Object>) ce.getValue());
+            } else {
+              struct.put(ce.getKey(), ce.getValue());
+            }
+          }
+        } else {
+          struct.put(child, value);
+        }
+      } else {
+        result.put(key, value);
+      }
+    }
+    return result;
   }
 
   private ExprType mapToExprType(SqlTypeName typeName) {

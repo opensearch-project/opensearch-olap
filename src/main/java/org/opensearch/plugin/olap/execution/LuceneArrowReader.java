@@ -291,30 +291,135 @@ public class LuceneArrowReader {
 
   /**
    * Resolve column specifications from index mappings. Maps OpenSearch field types to Arrow types
-   * and DocValue types.
+   * and DocValue types. Groups dot-path fields into nested StructColumnSpecs to match the Velox ROW
+   * type structure (e.g., cloud.region + cloud.provider → cloud: Struct(region, provider)).
    */
   private List<ColumnSpec> resolveColumnSpecs(IndexService indexService, List<String> fieldNames) {
-    List<ColumnSpec> specs = new ArrayList<>();
-
+    // First, resolve all flat field specs
+    List<ColumnSpec> flatSpecs = new ArrayList<>();
     for (String fieldName : fieldNames) {
       MappedFieldType fieldType = indexService.mapperService().fieldType(fieldName);
       if (fieldType == null) {
         logger.warn("Field {} not found in index mappings, skipping", fieldName);
         continue;
       }
-
       ArrowType arrowType = mapToArrowType(fieldType.typeName());
       DocValueType dvType = mapToDocValueType(fieldType.typeName());
-
       if (arrowType != null && dvType != null) {
-        specs.add(new ColumnSpec(fieldName, arrowType, dvType));
+        flatSpecs.add(new ColumnSpec(fieldName, arrowType, dvType));
       } else {
         logger.warn(
             "Unsupported field type {} for field {}, skipping", fieldType.typeName(), fieldName);
       }
     }
 
-    return specs;
+    // Return flat specs directly — no struct grouping needed.
+    // The Velox scan output is flat (dot-path fields as top-level columns).
+    // Struct reconstruction happens in Java result conversion.
+    return flatSpecs;
+  }
+
+  /**
+   * Group flat dot-path column specs into nested struct specs. Top-level fields (no dots) remain
+   * flat. Dot-path fields are grouped by their first path component into StructColumnSpecs.
+   */
+  private List<ColumnSpec> buildNestedColumnSpecs(List<ColumnSpec> flatSpecs) {
+    // Separate top-level and dot-path fields
+    java.util.LinkedHashMap<String, List<ColumnSpec>> structGroups =
+        new java.util.LinkedHashMap<>();
+    List<ColumnSpec> result = new ArrayList<>();
+
+    for (ColumnSpec spec : flatSpecs) {
+      String name = spec.getName();
+      int dotIndex = name.indexOf('.');
+      if (dotIndex > 0) {
+        String parent = name.substring(0, dotIndex);
+        String childPath = name.substring(dotIndex + 1);
+        structGroups
+            .computeIfAbsent(parent, k -> new ArrayList<>())
+            .add(new ColumnSpec(childPath, spec.getArrowType(), spec.getDocValueType()));
+      } else {
+        // Flush any pending struct group before this top-level field
+        // (preserve original field order)
+        result.add(spec);
+      }
+    }
+
+    // Build struct specs from groups
+    // We need to insert struct specs at the right position. Simplify: collect top-level names
+    // first, then insert struct groups where their first child appeared.
+    List<ColumnSpec> finalResult = new ArrayList<>();
+    java.util.Set<String> addedStructs = new java.util.HashSet<>();
+
+    for (ColumnSpec spec : flatSpecs) {
+      String name = spec.getName();
+      int dotIndex = name.indexOf('.');
+      if (dotIndex > 0) {
+        String parent = name.substring(0, dotIndex);
+        if (!addedStructs.contains(parent)) {
+          addedStructs.add(parent);
+          List<ColumnSpec> children = structGroups.get(parent);
+          // Recursively nest multi-level paths
+          List<ColumnSpec> nestedChildren = buildNestedColumnSpecs(children);
+          // Child names in the struct use their doc-value full path for reading
+          // but the struct field name is the local name (without parent prefix)
+          List<ColumnSpec> docValueChildren = new ArrayList<>();
+          for (ColumnSpec child : nestedChildren) {
+            if (child.isStruct()) {
+              // Nested struct: prepend parent path to all leaf descendants' doc-value names.
+              // e.g., for parent="log", child struct "file" with leaf "path",
+              // the leaf's doc-value name must be "log.file.path" not just "file.path".
+              docValueChildren.add(prependPathToStruct(parent, child));
+            } else {
+              // Leaf: use full doc-value path (parent.child) for reading
+              docValueChildren.add(
+                  new ColumnSpec(
+                      parent + "." + child.getName(),
+                      child.getArrowType(),
+                      child.getDocValueType()));
+            }
+          }
+          // Create struct spec with short child names (for Arrow schema)
+          // but doc-value paths preserved in child specs (for reading)
+          finalResult.add(new ColumnSpec(parent, docValueChildren));
+        }
+      } else {
+        finalResult.add(spec);
+      }
+    }
+    return finalResult;
+  }
+
+  /**
+   * Prepend a parent path prefix to all leaf doc-value names in a nested struct ColumnSpec.
+   * Recursively handles multi-level nesting. For example:
+   *
+   * <pre>
+   *   prependPathToStruct("log", Struct("file", [Leaf("path")]))
+   *   → Struct("file", [Leaf("log.file.path")])
+   * </pre>
+   */
+  private ColumnSpec prependPathToStruct(String parentPath, ColumnSpec structSpec) {
+    String fullPrefix = parentPath + "." + structSpec.getName();
+    List<ColumnSpec> fixedChildren = new ArrayList<>();
+    for (ColumnSpec child : structSpec.getChildren()) {
+      if (child.isStruct()) {
+        fixedChildren.add(prependPathToStruct(fullPrefix, child));
+      } else {
+        // Child name from recursive call is just the local name (e.g., "path").
+        // Prepend the full path for doc-value reading (e.g., "log.file.path").
+        String leafName = child.getName();
+        // If the child already has a dot-path from the recursive call, extract just the leaf
+        int lastDot = leafName.lastIndexOf('.');
+        if (lastDot >= 0) {
+          leafName = leafName.substring(lastDot + 1);
+        }
+        fixedChildren.add(
+            new ColumnSpec(
+                fullPrefix + "." + leafName, child.getArrowType(), child.getDocValueType()));
+      }
+    }
+    return new ColumnSpec(structSpec.getName(), fixedChildren);
   }
 
   /** Map OpenSearch field type name to Arrow type. */

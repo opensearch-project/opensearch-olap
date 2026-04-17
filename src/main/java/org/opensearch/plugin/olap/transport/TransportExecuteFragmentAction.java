@@ -684,7 +684,7 @@ public class TransportExecuteFragmentAction
       if (scan.getId().equals(targetScanId)) {
         Type outputType = scan.getOutputType();
         if (outputType instanceof RowType) {
-          return ((RowType) outputType).getNames();
+          return flattenRowTypeNames((RowType) outputType, "");
         }
       }
     }
@@ -707,10 +707,31 @@ public class TransportExecuteFragmentAction
       TableScanNode tableScan = (TableScanNode) scanNode;
       Type outputType = tableScan.getOutputType();
       if (outputType instanceof RowType) {
-        return ((RowType) outputType).getNames();
+        // Flatten ROW-typed fields into dot-path names for Lucene doc-value reading.
+        // e.g., cloud: ROW(region: VARCHAR) → "cloud.region"
+        return flattenRowTypeNames((RowType) outputType, "");
       }
     }
     return List.of();
+  }
+
+  /**
+   * Flatten a RowType into dot-path field names. Scalar fields are added as-is. ROW-typed fields
+   * (nested objects) are recursively flattened with dot prefix.
+   */
+  private List<String> flattenRowTypeNames(RowType rowType, String prefix) {
+    List<String> result = new ArrayList<>();
+    for (int i = 0; i < rowType.size(); i++) {
+      String name =
+          prefix.isEmpty() ? rowType.getNames().get(i) : prefix + "." + rowType.getNames().get(i);
+      Type childType = rowType.getChildren().get(i);
+      if (childType instanceof RowType) {
+        result.addAll(flattenRowTypeNames((RowType) childType, name));
+      } else {
+        result.add(name);
+      }
+    }
+    return result;
   }
 
   private org.apache.lucene.search.Query extractPushdownQuery(String planJson) {

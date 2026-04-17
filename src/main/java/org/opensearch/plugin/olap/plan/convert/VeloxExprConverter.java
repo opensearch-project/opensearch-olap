@@ -215,6 +215,7 @@ public class VeloxExprConverter {
     kinds.add(SqlKind.SEARCH);
     kinds.add(SqlKind.CASE);
     kinds.add(SqlKind.TRIM);
+    kinds.add(SqlKind.ITEM); // Struct/MAP field access (e.g., cloud['region'])
     kinds.add(SqlKind.OTHER_FUNCTION); // Named functions resolved via NAME_MAP
     kinds.add(SqlKind.OTHER); // Named functions resolved via NAME_MAP
     SUPPORTED_SQLKINDS = Set.copyOf(kinds);
@@ -223,8 +224,25 @@ public class VeloxExprConverter {
   private final RelDataType inputRowType;
   private final RexBuilder rexBuilder;
 
+  private final FieldMapping[] fieldMappings; // MAP→ROW index remapping (nullable)
+  private final org.boostscale.velox4j.type.RowType veloxOutputType; // Velox scan output type
+
   public VeloxExprConverter(RelDataType inputRowType) {
+    this(inputRowType, null, null);
+  }
+
+  /**
+   * Create a converter with field mappings for MAP→ROW remapping. The mappings array has one entry
+   * per Calcite field index. Each entry specifies the Velox output index and optional child path
+   * for nested struct access.
+   */
+  public VeloxExprConverter(
+      RelDataType inputRowType,
+      FieldMapping[] fieldMappings,
+      org.boostscale.velox4j.type.RowType veloxOutputType) {
     this.inputRowType = inputRowType;
+    this.fieldMappings = fieldMappings;
+    this.veloxOutputType = veloxOutputType;
     this.rexBuilder = new RexBuilder(new JavaTypeFactoryImpl());
   }
 
@@ -262,7 +280,8 @@ public class VeloxExprConverter {
         || kind == SqlKind.BETWEEN
         || kind == SqlKind.SEARCH
         || kind == SqlKind.TRIM
-        || kind == SqlKind.CASE) {
+        || kind == SqlKind.CASE
+        || kind == SqlKind.ITEM) {
       return true;
     }
 
@@ -272,10 +291,38 @@ public class VeloxExprConverter {
   }
 
   private TypedExpr convertInputRef(RexInputRef inputRef) {
-    int index = inputRef.getIndex();
-    RelDataTypeField field = inputRowType.getFieldList().get(index);
+    int calciteIndex = inputRef.getIndex();
+
+    // Use field mappings for MAP→ROW index remapping when available
+    if (fieldMappings != null
+        && calciteIndex < fieldMappings.length
+        && fieldMappings[calciteIndex] != null) {
+      return convertMappedInputRef(calciteIndex);
+    }
+
+    // Fallback: no mapping (exchange scans, join contexts, etc.)
+    RelDataTypeField field = inputRowType.getFieldList().get(calciteIndex);
     Type veloxType = VeloxTypeConverter.toVeloxType(field.getType());
     return FieldAccessTypedExpr.create(veloxType, field.getName());
+  }
+
+  /**
+   * Convert a RexInputRef using field mapping. All fields are flat in the Velox scan output. MAP
+   * parent columns (veloxIndex=-1) are skipped — they should only appear in output Projects, not in
+   * sort/filter expressions.
+   */
+  private TypedExpr convertMappedInputRef(int calciteIndex) {
+    FieldMapping mapping = fieldMappings[calciteIndex];
+    int veloxIndex = mapping.getVeloxIndex();
+    if (veloxIndex < 0) {
+      // MAP parent column (cloud, metrics, etc.) — skipped from scan output.
+      // This happens when SELECT * projects the parent MAP column.
+      // Return a VARCHAR placeholder — the actual struct reconstruction happens in Java.
+      return FieldAccessTypedExpr.create(new VarCharType(), mapping.getVeloxFieldName());
+    }
+    Type veloxType = veloxOutputType.getChildren().get(veloxIndex);
+    String fieldName = veloxOutputType.getNames().get(veloxIndex);
+    return FieldAccessTypedExpr.create(veloxType, fieldName);
   }
 
   private TypedExpr convertLiteral(RexLiteral literal) {
@@ -308,7 +355,7 @@ public class VeloxExprConverter {
 
   private Variant toVariant(RexLiteral literal) {
     if (literal.isNull()) {
-      return null;
+      return toNullVariant(literal.getType().getSqlTypeName());
     }
     SqlTypeName typeName = literal.getTypeName();
     switch (typeName) {
@@ -348,6 +395,36 @@ public class VeloxExprConverter {
     }
   }
 
+  /**
+   * Create a typed Variant with null inner value. velox4j requires a non-null Variant object to
+   * represent a null constant — the Variant wraps the null value while preserving the type.
+   */
+  private Variant toNullVariant(SqlTypeName typeName) {
+    switch (typeName) {
+      case BOOLEAN:
+        return new BooleanValue(null);
+      case TINYINT:
+      case SMALLINT:
+      case INTEGER:
+        return new IntegerValue(null);
+      case BIGINT:
+        return new BigIntValue(null);
+      case FLOAT:
+      case REAL:
+        return new RealValue(null);
+      case DOUBLE:
+      case DECIMAL:
+        return new DoubleValue(null);
+      case CHAR:
+      case VARCHAR:
+      case NULL:
+      case ANY:
+        return new VarCharValue(null);
+      default:
+        return new VarCharValue(null);
+    }
+  }
+
   private TypedExpr convertCall(RexCall call) {
     SqlKind kind = call.getKind();
 
@@ -374,6 +451,12 @@ public class VeloxExprConverter {
     // Handle BETWEEN as AND(GTE, LTE)
     if (kind == SqlKind.BETWEEN) {
       return convertBetween(call);
+    }
+
+    // Handle ITEM(parent, 'field') → nested FieldAccess for struct/ROW columns.
+    // The SQL plugin generates ITEM(cloud, 'region') for PPL's cloud.region access.
+    if (kind == SqlKind.ITEM) {
+      return convertItem(call);
     }
 
     // Handle TRIM with flag (LEADING → ltrim, TRAILING → rtrim, BOTH → trim)
@@ -457,6 +540,27 @@ public class VeloxExprConverter {
     }
     Type returnType = VeloxTypeConverter.toVeloxType(call.getType());
     return new CallTypedExpr(returnType, inputs, "switch");
+  }
+
+  /**
+   * Convert ITEM(parent, 'fieldName') → Velox FieldAccessTypedExpr. The SQL plugin generates ITEM
+   * calls for nested object field access (e.g., cloud.region → ITEM(cloud, 'region')). The scan
+   * produces cloud as a ROW(region: VARCHAR), so this becomes FieldAccessTypedExpr(parent,
+   * "region") — a nested field access into the struct.
+   */
+  private TypedExpr convertItem(RexCall call) {
+    List<RexNode> operands = call.getOperands();
+    TypedExpr parent = convert(operands.get(0));
+    // The second operand is the field name as a string literal
+    RexNode keyNode = operands.get(1);
+    String fieldName;
+    if (keyNode instanceof RexLiteral) {
+      fieldName = ((RexLiteral) keyNode).getValueAs(String.class);
+    } else {
+      throw new UnsupportedOperationException(
+          "ITEM access with non-literal key: " + keyNode.getClass().getSimpleName());
+    }
+    return FieldAccessTypedExpr.create(parent, fieldName);
   }
 
   private TypedExpr convertIn(RexCall call) {

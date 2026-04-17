@@ -18,6 +18,7 @@ import org.apache.calcite.rel.logical.LogicalWindow;
 import org.apache.calcite.rel.type.RelDataTypeField;
 import org.apache.calcite.rex.RexCall;
 import org.apache.calcite.rex.RexNode;
+import org.apache.calcite.sql.type.SqlTypeName;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.plugin.olap.plan.convert.VeloxExprConverter;
@@ -154,13 +155,27 @@ public class VectorizedEngineExtension implements ExecutionEngine {
       return node.getClass().getName();
     }
 
-    // Check field types in scan nodes for unsupported types (e.g. ANY from match_only_text)
+    // Check field types in scan nodes for unsupported types.
+    // MAP<VARCHAR, ANY> (OpenSearch object fields) are accepted — they are converted to ROW types
+    // in VeloxPlanGenerator.convertTableScan() using the dot-path sibling columns.
+    // Dot-path child columns (e.g., cloud.region) are also accepted (they feed into the ROW).
     if (node instanceof LogicalTableScan
         || node.getClass().getSimpleName().contains("TableScan")
         || node.getClass().getSimpleName().contains("IndexScan")) {
       for (RelDataTypeField field : node.getRowType().getFieldList()) {
+        SqlTypeName typeName = field.getType().getSqlTypeName();
+        // MAP parents (OpenSearch object fields) are accepted — handled by flat scan
+        // + struct reconstruction in Java result conversion.
+        if (typeName == SqlTypeName.MAP) {
+          continue;
+        }
+        // Top-level ANY fields (match_only_text, empty objects, unresolved fields) cannot be
+        // read from OpenSearch doc values. Reject so the query falls back to the default engine.
+        if (typeName == SqlTypeName.ANY) {
+          return "type:ANY in field " + field.getName();
+        }
         if (!VeloxTypeConverter.isSupported(field.getType())) {
-          return "type:" + field.getType().getSqlTypeName() + " in field " + field.getName();
+          return "type:" + typeName + " in field " + field.getName();
         }
       }
     }
