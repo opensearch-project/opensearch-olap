@@ -444,7 +444,10 @@ public class LuceneArrowReader {
       case "text":
         return new ArrowType.Utf8();
       case "date":
-        return new ArrowType.Int(64, true); // millis since epoch
+        // Emit Arrow Timestamp(MICROSECOND, UTC) so the Arrow→Velox bridge produces a
+        // Velox TimestampVector. velox4j's Arrow bridge is configured for microsecond unit
+        // (see Arrow.cc makeOptions). Doc values store millis; ArrowBatchBuilder converts.
+        return new ArrowType.Timestamp(org.apache.arrow.vector.types.TimeUnit.MICROSECOND, null);
       default:
         return null;
     }

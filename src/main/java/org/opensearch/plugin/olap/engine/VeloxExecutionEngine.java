@@ -1310,7 +1310,9 @@ public class VeloxExecutionEngine {
       }
       return structValues;
     }
-    // For non-struct vectors, use getObject() (safe — no Jackson dependency)
+    // For non-struct vectors, use getObject() (safe — no Jackson dependency).
+    // TimeStampMicroVector.getObject returns a LocalDateTime; ExprValueUtils.fromObjectValue
+    // already handles LocalDateTime by wrapping in ExprTimestampValue.
     Object value = vector.getObject(row);
     if (value instanceof Text) {
       return value.toString();

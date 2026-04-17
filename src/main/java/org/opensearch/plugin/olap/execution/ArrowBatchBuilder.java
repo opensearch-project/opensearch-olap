@@ -16,6 +16,7 @@ import org.apache.arrow.vector.Float4Vector;
 import org.apache.arrow.vector.Float8Vector;
 import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.SmallIntVector;
+import org.apache.arrow.vector.TimeStampMicroVector;
 import org.apache.arrow.vector.TinyIntVector;
 import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
@@ -242,6 +243,14 @@ public class ArrowBatchBuilder {
       String value = reader.readString(docId);
       if (value != null) {
         vcv.set(row, value.getBytes(StandardCharsets.UTF_8));
+      }
+    } else if (arrowType instanceof ArrowType.Timestamp) {
+      // OpenSearch date doc values are epoch millis. We emit Arrow Timestamp(micros) to
+      // match velox4j's Arrow bridge microsecond configuration; the bridge then produces
+      // a Velox TimestampVector backed by (seconds, nanos) pairs.
+      TimeStampMicroVector tsv = (TimeStampMicroVector) vector;
+      if (reader.hasValue(docId)) {
+        tsv.set(row, reader.readLong(docId) * 1000L);
       }
     }
   }

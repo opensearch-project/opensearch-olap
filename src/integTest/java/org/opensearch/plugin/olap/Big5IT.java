@@ -51,9 +51,6 @@ public class Big5IT extends OlapRestTestCase {
     runQuery("term");
   }
 
-  @Ignore(
-      "Unsupported: PPL @timestamp VARCHAR comparison lowers to timestamp() UDF not registered in"
-          + " Velox")
   public void testRange() throws IOException {
     runQuery("range");
   }
@@ -67,8 +64,8 @@ public class Big5IT extends OlapRestTestCase {
   }
 
   @Ignore(
-      "Unsupported: PPL @timestamp VARCHAR comparison lowers to timestamp() UDF not registered in"
-          + " Velox")
+      "Unsupported: SQL plugin emits map(VARCHAR, VARCHAR) helper for process.name match; not"
+          + " registered in Velox")
   public void testKeywordInRange() throws IOException {
     runQuery("keyword_in_range");
   }
@@ -171,16 +168,10 @@ public class Big5IT extends OlapRestTestCase {
     runQuery("sort_keyword_no_can_match_shortcut");
   }
 
-  @Ignore(
-      "Unsupported: PPL @timestamp VARCHAR comparison lowers to timestamp() UDF not registered in"
-          + " Velox")
   public void testRangeWithAscSort() throws IOException {
     runQuery("range_with_asc_sort");
   }
 
-  @Ignore(
-      "Unsupported: PPL @timestamp VARCHAR comparison lowers to timestamp() UDF not registered in"
-          + " Velox")
   public void testRangeWithDescSort() throws IOException {
     runQuery("range_with_desc_sort");
   }
