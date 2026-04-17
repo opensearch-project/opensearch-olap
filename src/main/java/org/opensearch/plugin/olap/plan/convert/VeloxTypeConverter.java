@@ -19,6 +19,7 @@ import org.boostscale.velox4j.type.MapType;
 import org.boostscale.velox4j.type.RealType;
 import org.boostscale.velox4j.type.RowType;
 import org.boostscale.velox4j.type.SmallIntType;
+import org.boostscale.velox4j.type.TimestampType;
 import org.boostscale.velox4j.type.TinyIntType;
 import org.boostscale.velox4j.type.Type;
 import org.boostscale.velox4j.type.VarCharType;
@@ -31,16 +32,18 @@ public final class VeloxTypeConverter {
   private VeloxTypeConverter() {}
 
   public static Type toVeloxType(RelDataType calciteType) {
-    // OpenSearch UDT types (ExprDateType, ExprTimeStampType) report SqlTypeName.VARCHAR
-    // but their doc values are stored as BIGINT (millis since epoch). Map them to BIGINT
-    // so the Velox scan output matches the Arrow data produced by LuceneArrowReader.
+    // OpenSearch UDT types (ExprDateType, ExprTimeStampType) report SqlTypeName.VARCHAR.
+    // We map the datetime UDTs to Velox TimestampType so the scan, expressions, and native
+    // Velox datetime functions (year, date_trunc, comparisons with timestamp literals) all
+    // operate on a logical timestamp type. LuceneArrowReader emits Arrow Timestamp(micros)
+    // for these fields — the Arrow→Velox bridge converts to Velox's Timestamp struct.
     if (calciteType instanceof AbstractExprRelDataType<?>) {
       ExprUDT udt = ((AbstractExprRelDataType<?>) calciteType).getUdt();
       switch (udt) {
         case EXPR_DATE:
         case EXPR_TIMESTAMP:
         case EXPR_TIME:
-          return new BigIntType();
+          return new TimestampType();
         case EXPR_IP:
         case EXPR_BINARY:
           return new VarCharType();
@@ -76,8 +79,7 @@ public final class VeloxTypeConverter {
         return new IntegerType();
       case TIMESTAMP:
       case TIMESTAMP_WITH_LOCAL_TIME_ZONE:
-        // Velox represents TIMESTAMP as BIGINT (micros since epoch)
-        return new BigIntType();
+        return new TimestampType();
       case NULL:
         // NULL type (from literal NULL expressions) — treat as VARCHAR
         return new VarCharType();

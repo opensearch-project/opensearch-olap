@@ -22,6 +22,7 @@ import org.boostscale.velox4j.type.MapType;
 import org.boostscale.velox4j.type.RealType;
 import org.boostscale.velox4j.type.RowType;
 import org.boostscale.velox4j.type.SmallIntType;
+import org.boostscale.velox4j.type.TimestampType;
 import org.boostscale.velox4j.type.TinyIntType;
 import org.boostscale.velox4j.type.Type;
 import org.boostscale.velox4j.type.VarCharType;
@@ -113,16 +114,15 @@ public class VeloxTypeConverterTests extends OpenSearchTestCase {
     assertTrue(result instanceof IntegerType);
   }
 
-  public void testTimestampMapsToBigInt() {
-    // Velox represents TIMESTAMP as BIGINT (micros since epoch)
+  public void testTimestampMapsToTimestampType() {
     Type result = VeloxTypeConverter.toVeloxType(mockType(SqlTypeName.TIMESTAMP));
-    assertTrue(result instanceof BigIntType);
+    assertTrue(result instanceof TimestampType);
   }
 
-  public void testTimestampWithLocalTimeZoneMapsToBigInt() {
+  public void testTimestampWithLocalTimeZoneMapsToTimestampType() {
     Type result =
         VeloxTypeConverter.toVeloxType(mockType(SqlTypeName.TIMESTAMP_WITH_LOCAL_TIME_ZONE));
-    assertTrue(result instanceof BigIntType);
+    assertTrue(result instanceof TimestampType);
   }
 
   public void testArray() {

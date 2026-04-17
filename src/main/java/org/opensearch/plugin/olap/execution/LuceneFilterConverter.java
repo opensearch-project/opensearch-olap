@@ -27,6 +27,7 @@ import org.boostscale.velox4j.type.DoubleType;
 import org.boostscale.velox4j.type.IntegerType;
 import org.boostscale.velox4j.type.RealType;
 import org.boostscale.velox4j.type.SmallIntType;
+import org.boostscale.velox4j.type.TimestampType;
 import org.boostscale.velox4j.type.TinyIntType;
 import org.boostscale.velox4j.type.Type;
 import org.boostscale.velox4j.type.VarCharType;
@@ -35,6 +36,7 @@ import org.boostscale.velox4j.variant.BooleanValue;
 import org.boostscale.velox4j.variant.DoubleValue;
 import org.boostscale.velox4j.variant.IntegerValue;
 import org.boostscale.velox4j.variant.RealValue;
+import org.boostscale.velox4j.variant.TimestampValue;
 import org.boostscale.velox4j.variant.VarCharValue;
 import org.boostscale.velox4j.variant.Variant;
 
@@ -264,7 +266,9 @@ public class LuceneFilterConverter {
         || fieldType instanceof TinyIntType) {
       return IntPoint.newExactQuery(fieldName, variantToInt(value));
     }
-    if (fieldType instanceof BigIntType) {
+    if (fieldType instanceof BigIntType || fieldType instanceof TimestampType) {
+      // TimestampType fields are date columns — Lucene stores the on-disk representation
+      // as epoch millis in a LongPoint, regardless of the Velox logical type.
       return LongPoint.newExactQuery(fieldName, variantToLong(value));
     }
     if (fieldType instanceof RealType) {
@@ -314,7 +318,7 @@ public class LuceneFilterConverter {
       return IntPoint.newRangeQuery(fieldName, lo, hi);
     }
 
-    if (fieldType instanceof BigIntType) {
+    if (fieldType instanceof BigIntType || fieldType instanceof TimestampType) {
       long v = variantToLong(value);
       long lo, hi;
       switch (op) {
@@ -410,6 +414,11 @@ public class LuceneFilterConverter {
     if (v instanceof IntegerValue) return ((IntegerValue) v).getValue().longValue();
     if (v instanceof DoubleValue) return ((DoubleValue) v).getValue().longValue();
     if (v instanceof RealValue) return ((RealValue) v).getValue().longValue();
+    if (v instanceof TimestampValue) {
+      // Lucene date fields are stored as epoch millis. Collapse (seconds, nanos) back.
+      TimestampValue ts = (TimestampValue) v;
+      return ts.getSeconds() * 1000L + ts.getNanos() / 1_000_000L;
+    }
     throw new UnsupportedOperationException("Cannot convert " + v.getClass() + " to long");
   }
 

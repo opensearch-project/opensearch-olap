@@ -23,6 +23,7 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.plugin.olap.plan.convert.VeloxExprConverter;
 import org.opensearch.plugin.olap.plan.convert.VeloxTypeConverter;
+import org.opensearch.plugin.olap.plan.physical.TimestampUdfRewriter;
 import org.opensearch.sql.ast.statement.ExplainMode;
 import org.opensearch.sql.calcite.CalcitePlanContext;
 import org.opensearch.sql.calcite.plan.rel.LogicalSystemLimit;
@@ -227,6 +228,11 @@ public class VectorizedEngineExtension implements ExecutionEngine {
   private String findUnsupportedRexCall(RexNode node) {
     if (node instanceof RexCall) {
       RexCall call = (RexCall) node;
+      // PPL's timestamp() UDF is stripped by TimestampUdfRewriter before Velox conversion
+      // when it wraps a string literal or an EXPR_TIMESTAMP/DATE/TIME ref.
+      if (TimestampUdfRewriter.isRewritable(call)) {
+        return null;
+      }
       if (!VeloxExprConverter.isSupported(call)) {
         return "function:" + call.getOperator().getName();
       }

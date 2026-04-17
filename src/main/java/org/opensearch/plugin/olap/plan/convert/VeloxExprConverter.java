@@ -37,6 +37,7 @@ import org.boostscale.velox4j.type.DoubleType;
 import org.boostscale.velox4j.type.IntegerType;
 import org.boostscale.velox4j.type.RealType;
 import org.boostscale.velox4j.type.SmallIntType;
+import org.boostscale.velox4j.type.TimestampType;
 import org.boostscale.velox4j.type.TinyIntType;
 import org.boostscale.velox4j.type.Type;
 import org.boostscale.velox4j.type.VarCharType;
@@ -45,6 +46,7 @@ import org.boostscale.velox4j.variant.BooleanValue;
 import org.boostscale.velox4j.variant.DoubleValue;
 import org.boostscale.velox4j.variant.IntegerValue;
 import org.boostscale.velox4j.variant.RealValue;
+import org.boostscale.velox4j.variant.TimestampValue;
 import org.boostscale.velox4j.variant.VarCharValue;
 import org.boostscale.velox4j.variant.Variant;
 
@@ -349,6 +351,8 @@ public class VeloxExprConverter {
       return new BooleanType();
     } else if (variant instanceof VarCharValue) {
       return new VarCharType();
+    } else if (variant instanceof TimestampValue) {
+      return new TimestampType();
     }
     throw new UnsupportedOperationException("Unknown variant type: " + variant.getClass());
   }
@@ -390,9 +394,34 @@ public class VeloxExprConverter {
       case VARCHAR:
         NlsString nls = literal.getValueAs(NlsString.class);
         return new VarCharValue(nls != null ? nls.getValue() : null);
+      case TIMESTAMP:
+      case TIMESTAMP_WITH_LOCAL_TIME_ZONE:
+        {
+          Long millis = literal.getValueAs(Long.class);
+          if (millis == null) {
+            return TimestampValue.createNull();
+          }
+          return timestampVariantFromMillis(millis);
+        }
+      case DATE:
+        {
+          // Calcite DATE literals: days since epoch. Convert to timestamp at midnight UTC.
+          Integer days = literal.getValueAs(Integer.class);
+          if (days == null) {
+            return TimestampValue.createNull();
+          }
+          return timestampVariantFromMillis(days.longValue() * 86_400_000L);
+        }
       default:
         throw new UnsupportedOperationException("Unsupported literal type: " + typeName);
     }
+  }
+
+  /** Build a TimestampValue variant from epoch milliseconds. */
+  public static TimestampValue timestampVariantFromMillis(long millis) {
+    long seconds = Math.floorDiv(millis, 1000L);
+    long nanos = Math.floorMod(millis, 1000L) * 1_000_000L;
+    return TimestampValue.create(seconds, nanos);
   }
 
   /**
@@ -420,6 +449,10 @@ public class VeloxExprConverter {
       case NULL:
       case ANY:
         return new VarCharValue(null);
+      case TIMESTAMP:
+      case TIMESTAMP_WITH_LOCAL_TIME_ZONE:
+      case DATE:
+        return TimestampValue.createNull();
       default:
         return new VarCharValue(null);
     }

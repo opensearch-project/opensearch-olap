@@ -90,6 +90,7 @@ Use simple class name + import in coding as much as possible, except there is ob
 ./gradlew spotlessApply            # Auto-format code (always run after Java code changes)
 ./gradlew test --tests "*.VeloxExprConverterTests"  # Run a specific test class
 ```
+Integration test logs are at `build/testclusters/integTest-0/logs/integTest.log`. `./gradlew integTest --rerun-tasks` wipes the log — capture it between runs if diffing behavior. Native JVM crashes leave `hs_err_pid*.log` in `build/testclusters/integTest-0/distro/.../logs/`.
 
 ## Jar hell and classloader isolation
 OpenSearch plugins run in isolated classloaders that cannot see classes from OpenSearch core or other plugins (except declared `extendedPlugins`). This causes several dependency conflicts:
@@ -107,6 +108,8 @@ The SQL plugin uses custom Calcite RelNode subclasses, not always the standard `
 - **Table scan**: `CalciteLogicalIndexScan` (from `unified-query-opensearch`), extends `TableScan` via `AbstractCalciteIndexScan`. Use `instanceof TableScan` (the base class) instead of `LogicalTableScan` to match both.
 - **System limit**: `LogicalSystemLimit` (from `unified-query-core`), extends `Sort`. Applied automatically by the SQL plugin to cap query results (default 10000 rows). Handle as a `Sort` with fetch/offset.
 - **Table qualified name**: `TableScan.getTable().getQualifiedName()` returns `["OpenSearch", "index_name"]`. Extract the last element for the actual index name.
+- **UDT types**: `ExprDateType`/`ExprTimeStampType`/`ExprTimeType` report `SqlTypeName.VARCHAR` but doc values are BIGINT (millis since epoch). Check `instanceof AbstractExprRelDataType` and `getUdt()` in `VeloxTypeConverter` — EXPR_DATE/EXPR_TIMESTAMP/EXPR_TIME → `BigIntType`, EXPR_IP/EXPR_BINARY → `VarCharType`.
+- **Outer sort + system limit**: `QueryService.convertToCalcitePlan` wraps every plan in `LogicalSort(collation from input) → LogicalSystemLimit(fetch=query_size_limit)`. The outer Sort inherits the inner sort's collation; schema-reshaping operators below must rewrite/clear field-index references before this outer layer consumes them.
 
 ## velox4j integration details
 - **ExternalStream connector ID**: The connector is registered in velox4j's C++ init as `"connector-external-stream"` (not `"external_stream"`). The `ExternalStreamTableHandle` and `ExternalStreamConnectorSplit` must use this exact ID.
@@ -197,6 +200,26 @@ For MPP: binary joins (2 tables) use BROADCAST/HASH_SHUFFLE as before. Multi-way
 ### Two-stage aggregation in VeloxPlanGenerator
 The PARTIAL/FINAL split requires Velox-specific intermediate accumulator types (e.g., avg → ROW(DOUBLE, BIGINT)) that don't map to Calcite's type system. The `TwoStageAggRule` Calcite rule can't produce these types. Instead, `VeloxPlanGenerator.convertTwoStageAggregate()` detects `Aggregate(SINGLE) → Exchange` and splits it with proper Velox accumulator types.
 
+### MAP parent / object field handling
+OpenSearch `object` fields appear as `MAP<VARCHAR, ANY>` in Calcite, with flat dot-path children as sibling fields (e.g., `cloud: MAP` + `cloud.region: VARCHAR`). Three-way invariant:
+1. **Scan** (`convertTableScan`): drops MAP parents from Velox output (veloxIndex=-1), keeps flat dot-path children as top-level columns.
+2. **Project** (`convertProject`): when a MAP parent is projected, **expand** into one FieldAccess per flat child already in scan output (e.g., projecting `metrics` emits `metrics.size`, `metrics.tmin`). De-dupe against other flat projections in the same Project.
+3. **Java result** (`reconstructStructs` in `VeloxExecutionEngine`): reassembles flat dot-path columns back into nested maps for the final response.
+
+Dropping a MAP parent ref anywhere else (filter/sort/outer Project) breaks output width — operators above index Calcite fields by position and will reference non-existent columns.
+
+`ANY` top-level fields (`match_only_text`, empty objects, unresolved fields) are rejected by `canVectorize()` — not readable from doc values. Only MAP is treated as an object parent.
+
+Metadata columns (`_id`, `_index`, `_score`, `_maxscore`, `_sort`, `_routing`) must be skipped in scan with veloxIndex=-1 mappings so projections referencing them are dropped.
+
+### Field mapping scope in VeloxPlanGenerator
+`currentFieldMappings` / `currentVeloxOutputType` track Calcite→Velox field index remapping. They are **scoped to the scan subtree** and must be rebuilt/cleared when schema changes:
+- **Project** rebuilds mappings to describe its output (including `-1` for expanded MAP parents).
+- **Aggregate / Join / Window** clear mappings (new schema, no mapping needed above — use name-based resolution).
+- **Filter / Sort** pass through (same schema as input).
+- **Exchange boundary** (`handleExchange`) clears mappings — parent fragment has a different schema.
+- `buildOrderByNode` field-count guard: mappings are only valid when `inputRowType.getFieldCount() == currentFieldMappings.length`.
+
 ## Per-query session creation
 `VeloxLifecycleService.getSession()` creates a new `Session` per call (not a shared singleton). Each session gets its own memory pool namespace, preventing "Leaf child memory pool already exists" collisions between sequential queries. The `MemoryManager` is shared across sessions.
 
@@ -204,6 +227,7 @@ The PARTIAL/FINAL split requires Velox-specific intermediate accumulator types (
 - **OpenSearch doc values types**: OpenSearch stores all numeric types as `SORTED_NUMERIC` (not `NUMERIC`) and keyword/text as `SORTED_SET` (not `SORTED`). `LuceneArrowReader.mapToDocValueType()` handles this.
 - **Arrow Text → String**: Arrow Utf8 vectors return `org.apache.arrow.vector.util.Text` objects. Must convert to `String` before passing to `ExprValueUtils.tupleValue()` in `VeloxExecutionEngine.readArrowIpcToExprValues()`.
 - **Velox temp dirs in /tmp**: Each Velox initialization creates ~490MB temp dir under `/tmp`. Multiple restarts or multi-node clusters on the same host can fill `/tmp` (tmpfs). Clean with `rm -rf /tmp/opensearch-*`.
+- **Big5IT @Ignore'd tests (33/58)**: unsupported PPL lowerings — `timestamp()` UDF on VARCHAR `@timestamp` comparisons, `map(VARCHAR,VARCHAR)` helper from PPL match(), `hint AGG_ARGS` for composite/date-histogram, `width_bucket`/`||`/`rex_extract`/`to_unixtime(BIGINT)` not registered in Velox, `row_number()` return-type mismatch (BIGINT vs INTEGER), `coalesce` with mixed VARCHAR/BIGINT operands. Each test's `@Ignore` reason documents the specific missing lowering.
 
 ## Graceful degradation
 `VeloxLifecycleService` catches native library load failures and disables itself (logs a warning). This allows the plugin to install on unsupported platforms (e.g. macOS/aarch64) without crashing OpenSearch. `canVectorize()` returns `false` when Velox is unavailable.

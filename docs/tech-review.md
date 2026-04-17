@@ -172,6 +172,9 @@ The coordinator runs a multi-stage pipeline to transform a logical plan into dis
        │  ClusterCopyShuttle deep-copies the plan into the new cluster,
        │  stripping CalciteLogicalIndexScan → plain LogicalTableScan
        │  (prevents SQL plugin pushdown rules from leaking in).
+       │  TimestampUdfRewriter strips PPL timestamp() coercion UDFs so
+       │  @timestamp comparisons bind directly to Velox TimestampType
+       │  (string literal → TIMESTAMP RexLiteral; UDT ref → inner ref).
        │  Runs HepPlanner (FilterMergeRule) then VolcanoPlanner:
        │    Convention.NONE → PhysicalConvention
        │    PhysicalAggregateRule inserts PhysicalExchange(SINGLETON)
@@ -286,13 +289,14 @@ The feeder thread reads data from OpenSearch's Lucene index. For each assigned s
 2. **Resolve column specs** — Maps each requested field to an Arrow type and Lucene doc-value type via the index mapping service:
    ```
    OpenSearch Type     Doc-Value Type     Arrow Type
-   ───────────────     ──────────────     ──────────
+   ───────────────     ──────────────     ──────────────────────
    keyword, text       SORTED_SET         Utf8
    long, integer       SORTED_NUMERIC     Int(64/32)
    double, float       SORTED_NUMERIC     FloatingPoint
    boolean             SORTED_NUMERIC     Bool
-   date                SORTED_NUMERIC     Int(64)
+   date                SORTED_NUMERIC     Timestamp(MICROSECOND)
    ```
+   Doc values store epoch millis; `ArrowBatchBuilder` multiplies by 1000 into a `TimeStampMicroVector`. velox4j's Arrow bridge is configured for microsecond precision (`Arrow.cc makeOptions()`), so the feeder output becomes a Velox `TimestampVector` — enabling native `year()`, `date_trunc()`, and `timestamp <op> timestamp` scalars without BIGINT coercion.
 3. **Iterate segments** — A Lucene index shard consists of multiple segments (immutable on-disk units). The reader iterates each `LeafReaderContext` in the searcher.
 4. **Batch documents** — Within each segment, documents are read in batches of 4,096 rows. For each batch, `ArrowBatchBuilder` creates a `VectorSchemaRoot`:
    - Opens `DocValueColumnReader` per column per segment (calls `DocValues.getSortedNumeric()` or `DocValues.getSortedSet()`)
@@ -391,6 +395,12 @@ Doc values are columnar on disk — sequential iteration per segment is ideal fo
 
 Writing a custom C++ Velox connector for OpenSearch would require building and maintaining native code. velox4j's `ExternalStream` with `BlockingQueue` lets us stay entirely in Java for data reading (Lucene → Arrow) and use a simple producer-consumer pattern to feed Velox. The Arrow C Data Interface makes the handoff efficient.
 
+### Why Velox `TIMESTAMP` end-to-end (not BIGINT millis)?
+
+Presto and Spark-on-Velox carry `TIMESTAMP` logically through the plan because their Parquet readers decode INT64-with-LogicalType into Velox `TimestampVector` during scan. Our scan reads Lucene doc values (always millis) through the Arrow bridge, so we made the same choice at the bridge layer: the Arrow feeder emits `Timestamp(MICROSECOND)`, velox4j's Arrow bridge produces a Velox `TimestampVector`, and `VeloxTypeConverter` maps the SQL plugin's `EXPR_DATE/TIME/TIMESTAMP` UDTs to Velox `TimestampType`. The payoff is that Velox's native `year()`, `date_trunc()`, comparison, and cast functions bind directly — no rewrite of each datetime UDF into BIGINT arithmetic. The cost is one `* 1000` in `ArrowBatchBuilder` and a `TimestampValue` variant path in `VeloxExprConverter`.
+
+`TimestampUdfRewriter` collaborates with this choice: the SQL plugin coerces `@timestamp >= '2023-01-01 00:00:00'` to `timestamp(@timestamp) >= timestamp('2023-01-01 00:00:00')`, but Velox has no `timestamp(varchar)` scalar. The rewriter strips the wrappers so the comparison binds to `greaterthanorequal(TIMESTAMP, TIMESTAMP)` using Velox's built-in comparator. Shapes that cannot be simplified at plan time (e.g. `timestamp(concat(...))`) fall back via `canVectorize()`.
+
 ---
 
 ## 6. Comparison with RFC #4812
@@ -454,6 +464,7 @@ Our design extends the SQL plugin rather than rewriting it, while adopting key R
 - PPL UDF → Velox function mapping: 89 of 195 PPL functions mapped to Velox Presto-style names (46% coverage). Math (90%), trig (100%), string (64%), conditional (64%), date extraction (34%). `canVectorize()` checks function support and field types — unsupported functions/types cause query-level fallback. See `docs/velox-function-support.md` for the full matrix.
 - Plan explain: PPL `explain` command outputs Velox plan tree via `PlanNode.toFormatString()`, showing operator pipeline, column projections, and filter expressions.
 - Big5 benchmark: 58 PPL queries from the SQL plugin's Big5 benchmark migrated. Currently all fall back to the default engine due to nested object fields (`MAP<VARCHAR, ANY>` type). Flat-schema queries with keyword/numeric/date fields execute through Velox.
+- Velox native TIMESTAMP: `@timestamp` and other date fields are carried as Velox `TimestampType` from scan to projection. Arrow feeder emits `Timestamp(MICROSECOND)`; `TimestampUdfRewriter` strips the SQL plugin's `timestamp()` coercion UDF so `@timestamp <op> 'yyyy-MM-dd HH:mm:ss'` compiles to a native `timestamp <op> timestamp` comparison. Unblocks Big5 range/sort queries without per-UDF BIGINT rewrites.
 - Per-query session creation (prevents memory pool collisions)
 - Graceful degradation on unsupported platforms
 - Data types: boolean, integer, long, float, double, keyword, date, timestamp
