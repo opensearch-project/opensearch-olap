@@ -92,7 +92,7 @@ Use simple class name + import in coding as much as possible, except there is ob
 ```
 Integration test logs are at `build/testclusters/integTest-0/logs/integTest.log`. `./gradlew integTest --rerun-tasks` wipes the log — capture it between runs if diffing behavior. Native JVM crashes leave `hs_err_pid*.log` in `build/testclusters/integTest-0/distro/.../logs/`.
 
-**JDK pin**: Project targets JDK 21 (`sourceCompatibility = VERSION_21`). System default is often JDK 25, which causes a misleading `com.sun.tools.javac.code.Symbol$CompletionFailure: class file for org.checkerframework.checker.nullness.qual.Nullable not found` with no source line. Prepend `JAVA_HOME=/usr/lib/jvm/java-21-amazon-corretto.x86_64` to every `./gradlew` invocation.
+**JDK 21 / JDK 25 compile classpath**: Project targets JDK 21 bytecode (`sourceCompatibility = VERSION_21`) but also compiles cleanly under JDK 25. JDK 25's javac is stricter about missing annotation class files — it fails hard where JDK 21 merely warned. Four `compileOnly` entries in `build.gradle` supply the annotations/helper classes referenced by Calcite/Arrow/SQL-plugin bytecode: `org.checkerframework:checker-qual`, `org.apiguardian:apiguardian-api`, `com.fasterxml.jackson.core:jackson-annotations`, `org.apache.calcite:calcite-linq4j`. If a new JDK version surfaces another `CompletionFailure: class file for X not found`, add that library as a `compileOnly` entry in the same block.
 
 ## Jar hell and classloader isolation
 OpenSearch plugins run in isolated classloaders that cannot see classes from OpenSearch core or other plugins (except declared `extendedPlugins`). This causes several dependency conflicts:
