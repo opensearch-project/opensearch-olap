@@ -84,10 +84,10 @@ public class PhysicalOptimizer {
     // so Calcite's join reorder rules can make cost-based decisions.
     RelNode copiedPlan = logicalPlan.accept(new ClusterCopyShuttle(newCluster, statsMap));
 
-    // Step 3.1: Strip PPL's timestamp() coercion UDF where possible so Velox can
-    // execute @timestamp comparisons directly. Shapes we can't simplify (e.g.
-    // timestamp(expr)) are left intact and will fall back via canVectorize().
-    copiedPlan = TimestampUdfRewriter.rewrite(copiedPlan);
+    // Step 3.1: Strip PPL's timestamp()/date()/time() coercion UDFs where possible so Velox can
+    // execute datetime comparisons directly. Shapes we can't simplify (e.g. timestamp(concat(..)))
+    // are left intact and will fall back via canVectorize().
+    copiedPlan = DateTimeUdfRewriter.rewrite(copiedPlan);
 
     // Step 3.5: Run HepPlanner for lightweight logical optimization (same as
     // CalciteToolsHelper.optimize() in the SQL plugin). FilterMergeRule merges

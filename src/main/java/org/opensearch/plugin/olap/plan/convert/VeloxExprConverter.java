@@ -329,12 +329,17 @@ public class VeloxExprConverter {
 
   private TypedExpr convertLiteral(RexLiteral literal) {
     Variant variant = toVariant(literal);
-    // Derive the type from the variant to ensure consistency (e.g., DECIMAL(30)
-    // produces IntegerValue, so type must be IntegerType, not DoubleType)
-    Type veloxType =
-        (variant != null)
-            ? variantToType(variant)
-            : VeloxTypeConverter.toVeloxType(literal.getType());
+    // Prefer the Calcite literal's declared type so DATE/TIME literals carry DateType /
+    // BigIntType (Velox TIME) rather than whatever the backing variant happens to be
+    // (IntegerValue / BigIntValue). For the DECIMAL→INTEGER/BIGINT/DOUBLE widening case,
+    // the variant does encode the promoted type, so fall back to variant-derived type only
+    // for SqlTypeName.DECIMAL (and nulls).
+    Type veloxType;
+    if (literal.getTypeName() == SqlTypeName.DECIMAL && variant != null) {
+      veloxType = variantToType(variant);
+    } else {
+      veloxType = VeloxTypeConverter.toVeloxType(literal.getType());
+    }
     return ConstantTypedExpr.create(veloxType, variant);
   }
 
@@ -405,12 +410,16 @@ public class VeloxExprConverter {
         }
       case DATE:
         {
-          // Calcite DATE literals: days since epoch. Convert to timestamp at midnight UTC.
+          // Calcite DATE literals: days since epoch. Velox DateType is int32 days since epoch.
           Integer days = literal.getValueAs(Integer.class);
-          if (days == null) {
-            return TimestampValue.createNull();
-          }
-          return timestampVariantFromMillis(days.longValue() * 86_400_000L);
+          return new IntegerValue(days);
+        }
+      case TIME:
+      case TIME_WITH_LOCAL_TIME_ZONE:
+        {
+          // Calcite TIME literals: millis since midnight. Velox TIME is BIGINT-backed.
+          Integer timeMillis = literal.getValueAs(Integer.class);
+          return new BigIntValue(timeMillis == null ? null : timeMillis.longValue());
         }
       default:
         throw new UnsupportedOperationException("Unsupported literal type: " + typeName);
@@ -451,8 +460,12 @@ public class VeloxExprConverter {
         return new VarCharValue(null);
       case TIMESTAMP:
       case TIMESTAMP_WITH_LOCAL_TIME_ZONE:
-      case DATE:
         return TimestampValue.createNull();
+      case DATE:
+        return new IntegerValue(null);
+      case TIME:
+      case TIME_WITH_LOCAL_TIME_ZONE:
+        return new BigIntValue(null);
       default:
         return new VarCharValue(null);
     }

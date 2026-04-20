@@ -15,15 +15,24 @@ import org.apache.calcite.rex.RexLiteral;
 import org.apache.calcite.rex.RexNode;
 import org.apache.calcite.sql.fun.SqlStdOperatorTable;
 import org.apache.calcite.sql.type.SqlTypeName;
+import org.apache.calcite.util.DateString;
+import org.apache.calcite.util.TimeString;
+import org.apache.calcite.util.TimestampString;
 import org.boostscale.velox4j.expression.CallTypedExpr;
 import org.boostscale.velox4j.expression.ConstantTypedExpr;
 import org.boostscale.velox4j.expression.FieldAccessTypedExpr;
 import org.boostscale.velox4j.expression.TypedExpr;
 import org.boostscale.velox4j.type.BigIntType;
 import org.boostscale.velox4j.type.BooleanType;
+import org.boostscale.velox4j.type.DateType;
 import org.boostscale.velox4j.type.DoubleType;
 import org.boostscale.velox4j.type.IntegerType;
+import org.boostscale.velox4j.type.TimestampType;
 import org.boostscale.velox4j.type.VarCharType;
+import org.boostscale.velox4j.variant.BigIntValue;
+import org.boostscale.velox4j.variant.IntegerValue;
+import org.boostscale.velox4j.variant.TimestampValue;
+import org.boostscale.velox4j.variant.Variant;
 import org.opensearch.test.OpenSearchTestCase;
 
 public class VeloxExprConverterTests extends OpenSearchTestCase {
@@ -538,5 +547,116 @@ public class VeloxExprConverterTests extends OpenSearchTestCase {
     TypedExpr result = converter.convert(itemCall);
     assertTrue(result instanceof FieldAccessTypedExpr);
     assertEquals("region", ((FieldAccessTypedExpr) result).getFieldName());
+  }
+
+  // ---- Datetime literal conversions ----
+
+  public void testConvertTimestampLiteralToTimestampValue() {
+    VeloxExprConverter converter = new VeloxExprConverter(buildRowType());
+
+    // 2023-01-01 00:00:00 UTC = 1672531200000 millis since epoch
+    long millis = 1_672_531_200_000L;
+    RexLiteral literal =
+        rexBuilder.makeTimestampLiteral(TimestampString.fromMillisSinceEpoch(millis), 3);
+
+    TypedExpr result = converter.convert(literal);
+
+    assertTrue(result instanceof ConstantTypedExpr);
+    assertTrue(result.getReturnType() instanceof TimestampType);
+    Variant variant = ((ConstantTypedExpr) result).getValue();
+    assertTrue(variant instanceof TimestampValue);
+    TimestampValue tv = (TimestampValue) variant;
+    assertEquals(millis / 1000L, tv.getSeconds());
+    assertEquals((millis % 1000L) * 1_000_000L, tv.getNanos());
+  }
+
+  public void testConvertTimestampLiteralWithMillisPrecision() {
+    VeloxExprConverter converter = new VeloxExprConverter(buildRowType());
+
+    // 2023-01-01 00:00:00.123 → seconds=1672531200, nanos=123_000_000
+    long millis = 1_672_531_200_123L;
+    RexLiteral literal =
+        rexBuilder.makeTimestampLiteral(TimestampString.fromMillisSinceEpoch(millis), 3);
+
+    TypedExpr result = converter.convert(literal);
+
+    TimestampValue tv = (TimestampValue) ((ConstantTypedExpr) result).getValue();
+    assertEquals(1_672_531_200L, tv.getSeconds());
+    assertEquals(123_000_000L, tv.getNanos());
+  }
+
+  public void testConvertDateLiteralProducesDateTypedConstant() {
+    VeloxExprConverter converter = new VeloxExprConverter(buildRowType());
+
+    // 2023-01-01 = 19358 days since epoch
+    RexLiteral literal = rexBuilder.makeDateLiteral(new DateString(2023, 1, 1));
+
+    TypedExpr result = converter.convert(literal);
+
+    assertTrue(result instanceof ConstantTypedExpr);
+    // The ConstantTypedExpr must carry Velox DateType so it binds against DATE-typed fields.
+    // velox4j has no DateValue variant; IntegerValue is the int32 backing for days since epoch.
+    assertTrue(result.getReturnType() instanceof DateType);
+    Variant variant = ((ConstantTypedExpr) result).getValue();
+    assertTrue(variant instanceof IntegerValue);
+    assertEquals(Integer.valueOf(19358), ((IntegerValue) variant).getValue());
+  }
+
+  public void testConvertTimeLiteralToBigIntValue() {
+    VeloxExprConverter converter = new VeloxExprConverter(buildRowType());
+
+    // 12:34:56.000 = 45_296_000 millis since midnight
+    RexLiteral literal = rexBuilder.makeTimeLiteral(new TimeString(12, 34, 56), 3);
+
+    TypedExpr result = converter.convert(literal);
+
+    assertTrue(result instanceof ConstantTypedExpr);
+    // Velox TIME is BIGINT-backed (millis from midnight); velox4j has no TimeType wrapper.
+    assertTrue(result.getReturnType() instanceof BigIntType);
+    Variant variant = ((ConstantTypedExpr) result).getValue();
+    assertTrue(variant instanceof BigIntValue);
+    assertEquals(Long.valueOf(45_296_000L), ((BigIntValue) variant).getValue());
+  }
+
+  public void testConvertNullTimestampLiteralProducesNullTimestampVariant() {
+    VeloxExprConverter converter = new VeloxExprConverter(buildRowType());
+
+    RelDataType tsType = typeFactory.createSqlType(SqlTypeName.TIMESTAMP);
+    RexLiteral literal = (RexLiteral) rexBuilder.makeNullLiteral(tsType);
+
+    TypedExpr result = converter.convert(literal);
+
+    assertTrue(result.getReturnType() instanceof TimestampType);
+    Variant variant = ((ConstantTypedExpr) result).getValue();
+    assertTrue(variant instanceof TimestampValue);
+    assertNull(((TimestampValue) variant).getValue());
+  }
+
+  public void testConvertNullDateLiteralProducesNullIntegerVariant() {
+    VeloxExprConverter converter = new VeloxExprConverter(buildRowType());
+
+    RelDataType dateType = typeFactory.createSqlType(SqlTypeName.DATE);
+    RexLiteral literal = (RexLiteral) rexBuilder.makeNullLiteral(dateType);
+
+    TypedExpr result = converter.convert(literal);
+
+    assertTrue(result.getReturnType() instanceof DateType);
+    Variant variant = ((ConstantTypedExpr) result).getValue();
+    assertTrue(variant instanceof IntegerValue);
+    assertNull(((IntegerValue) variant).getValue());
+  }
+
+  public void testConvertNullTimeLiteralProducesNullBigIntVariant() {
+    VeloxExprConverter converter = new VeloxExprConverter(buildRowType());
+
+    RelDataType timeType = typeFactory.createSqlType(SqlTypeName.TIME);
+    RexLiteral literal = (RexLiteral) rexBuilder.makeNullLiteral(timeType);
+
+    TypedExpr result = converter.convert(literal);
+
+    assertTrue(result.getReturnType() instanceof BigIntType);
+    Variant variant = ((ConstantTypedExpr) result).getValue();
+    assertTrue(variant instanceof BigIntValue);
+    assertNull(((BigIntValue) variant).getValue());
   }
 }

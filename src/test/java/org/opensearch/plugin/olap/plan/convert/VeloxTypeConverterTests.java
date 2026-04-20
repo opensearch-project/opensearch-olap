@@ -15,6 +15,7 @@ import org.apache.calcite.sql.type.SqlTypeName;
 import org.boostscale.velox4j.type.ArrayType;
 import org.boostscale.velox4j.type.BigIntType;
 import org.boostscale.velox4j.type.BooleanType;
+import org.boostscale.velox4j.type.DateType;
 import org.boostscale.velox4j.type.DecimalType;
 import org.boostscale.velox4j.type.DoubleType;
 import org.boostscale.velox4j.type.IntegerType;
@@ -26,6 +27,8 @@ import org.boostscale.velox4j.type.TimestampType;
 import org.boostscale.velox4j.type.TinyIntType;
 import org.boostscale.velox4j.type.Type;
 import org.boostscale.velox4j.type.VarCharType;
+import org.opensearch.sql.calcite.utils.OpenSearchTypeFactory;
+import org.opensearch.sql.calcite.utils.OpenSearchTypeFactory.ExprUDT;
 import org.opensearch.test.OpenSearchTestCase;
 
 public class VeloxTypeConverterTests extends OpenSearchTestCase {
@@ -108,10 +111,15 @@ public class VeloxTypeConverterTests extends OpenSearchTestCase {
     assertTrue(result instanceof VarCharType);
   }
 
-  public void testDateMapsToInteger() {
-    // Velox represents DATE as INTEGER (days since epoch)
+  public void testDateMapsToDateType() {
     Type result = VeloxTypeConverter.toVeloxType(mockType(SqlTypeName.DATE));
-    assertTrue(result instanceof IntegerType);
+    assertTrue(result instanceof DateType);
+  }
+
+  public void testTimeMapsToBigInt() {
+    // Velox TIME is BIGINT-backed (millis from midnight); velox4j has no TimeType.
+    Type result = VeloxTypeConverter.toVeloxType(mockType(SqlTypeName.TIME));
+    assertTrue(result instanceof BigIntType);
   }
 
   public void testTimestampMapsToTimestampType() {
@@ -200,6 +208,45 @@ public class VeloxTypeConverterTests extends OpenSearchTestCase {
 
     expectThrows(
         UnsupportedOperationException.class, () -> VeloxTypeConverter.toVeloxType(geoType));
+  }
+
+  // ---- OpenSearch UDT datetime types ----
+  //
+  // The SQL plugin exposes @timestamp, cast(x as date), etc. as UDTs that report
+  // SqlTypeName.VARCHAR but carry distinct logical semantics. Each maps to a distinct Velox type.
+
+  public void testExprTimestampUdtMapsToTimestampType() {
+    RelDataType udt = OpenSearchTypeFactory.TYPE_FACTORY.createUDT(ExprUDT.EXPR_TIMESTAMP);
+    Type result = VeloxTypeConverter.toVeloxType(udt);
+    assertTrue(result instanceof TimestampType);
+  }
+
+  public void testExprDateUdtMapsToDateType() {
+    RelDataType udt = OpenSearchTypeFactory.TYPE_FACTORY.createUDT(ExprUDT.EXPR_DATE);
+    Type result = VeloxTypeConverter.toVeloxType(udt);
+    assertTrue(result instanceof DateType);
+  }
+
+  public void testExprTimeUdtMapsToBigIntType() {
+    // Velox TIME is BIGINT-backed (millis from midnight); velox4j has no TimeType wrapper yet.
+    RelDataType udt = OpenSearchTypeFactory.TYPE_FACTORY.createUDT(ExprUDT.EXPR_TIME);
+    Type result = VeloxTypeConverter.toVeloxType(udt);
+    assertTrue(result instanceof BigIntType);
+  }
+
+  public void testExprTimestampUdtIsSupported() {
+    RelDataType udt = OpenSearchTypeFactory.TYPE_FACTORY.createUDT(ExprUDT.EXPR_TIMESTAMP);
+    assertTrue(VeloxTypeConverter.isSupported(udt));
+  }
+
+  public void testExprDateUdtIsSupported() {
+    RelDataType udt = OpenSearchTypeFactory.TYPE_FACTORY.createUDT(ExprUDT.EXPR_DATE);
+    assertTrue(VeloxTypeConverter.isSupported(udt));
+  }
+
+  public void testExprTimeUdtIsSupported() {
+    RelDataType udt = OpenSearchTypeFactory.TYPE_FACTORY.createUDT(ExprUDT.EXPR_TIME);
+    assertTrue(VeloxTypeConverter.isSupported(udt));
   }
 
   public void testNestedArrayOfVarChar() {
