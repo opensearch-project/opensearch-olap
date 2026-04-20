@@ -148,6 +148,11 @@ dependencies {
     // Guava: required at compile time for extending Calcite RelNode classes (provided at runtime
     // by the SQL plugin). Calcite uses ImmutableList/ImmutableSet in its base class constructors.
     compileOnly "com.google.guava:guava:33.4.8-jre"
+    // JDK 25 javac requires referenced annotation types to be present on compile classpath.
+    compileOnly "org.checkerframework:checker-qual:3.49.5"
+    compileOnly "org.apiguardian:apiguardian-api:1.1.2"
+    compileOnly "com.fasterxml.jackson.core:jackson-annotations:2.21"
+    compileOnly "org.apache.calcite:calcite-linq4j:${calcite_version}"
 
     // Apache Arrow for columnar in-memory data
     implementation "org.apache.arrow:arrow-vector:${arrow_version}"
@@ -332,7 +337,7 @@ test {
 // =============================================================================
 
 jacoco {
-    toolVersion = "0.8.12"
+    toolVersion = "0.8.13"
 }
 
 jacocoTestReport {
