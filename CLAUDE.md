@@ -92,6 +92,8 @@ Use simple class name + import in coding as much as possible, except there is ob
 ```
 Integration test logs are at `build/testclusters/integTest-0/logs/integTest.log`. `./gradlew integTest --rerun-tasks` wipes the log — capture it between runs if diffing behavior. Native JVM crashes leave `hs_err_pid*.log` in `build/testclusters/integTest-0/distro/.../logs/`.
 
+**JDK pin**: Project targets JDK 21 (`sourceCompatibility = VERSION_21`). System default is often JDK 25, which causes a misleading `com.sun.tools.javac.code.Symbol$CompletionFailure: class file for org.checkerframework.checker.nullness.qual.Nullable not found` with no source line. Prepend `JAVA_HOME=/usr/lib/jvm/java-21-amazon-corretto.x86_64` to every `./gradlew` invocation.
+
 ## Jar hell and classloader isolation
 OpenSearch plugins run in isolated classloaders that cannot see classes from OpenSearch core or other plugins (except declared `extendedPlugins`). This causes several dependency conflicts:
 
@@ -108,7 +110,8 @@ The SQL plugin uses custom Calcite RelNode subclasses, not always the standard `
 - **Table scan**: `CalciteLogicalIndexScan` (from `unified-query-opensearch`), extends `TableScan` via `AbstractCalciteIndexScan`. Use `instanceof TableScan` (the base class) instead of `LogicalTableScan` to match both.
 - **System limit**: `LogicalSystemLimit` (from `unified-query-core`), extends `Sort`. Applied automatically by the SQL plugin to cap query results (default 10000 rows). Handle as a `Sort` with fetch/offset.
 - **Table qualified name**: `TableScan.getTable().getQualifiedName()` returns `["OpenSearch", "index_name"]`. Extract the last element for the actual index name.
-- **UDT types**: `ExprDateType`/`ExprTimeStampType`/`ExprTimeType` report `SqlTypeName.VARCHAR` but doc values are BIGINT (millis since epoch). Check `instanceof AbstractExprRelDataType` and `getUdt()` in `VeloxTypeConverter` — EXPR_DATE/EXPR_TIMESTAMP/EXPR_TIME → `BigIntType`, EXPR_IP/EXPR_BINARY → `VarCharType`.
+- **UDT types**: `ExprDateType`/`ExprTimeStampType`/`ExprTimeType` report `SqlTypeName.VARCHAR`. Check `instanceof AbstractExprRelDataType` and `getUdt()` in `VeloxTypeConverter` — `EXPR_TIMESTAMP → TimestampType`, `EXPR_DATE → DateType` (int32 days), `EXPR_TIME → BigIntType` (millis, no velox4j wrapper), `EXPR_IP`/`EXPR_BINARY → VarCharType`.
+- **Datetime coercion UDFs**: SQL plugin's `CoercionUtils` wraps both sides of comparisons between a datetime UDT column and a string literal in matching coercion UDFs — `@timestamp >= '2023-01-01 00:00:00'` becomes `timestamp(@timestamp) >= timestamp('2023-01-01 00:00:00')`, same pattern for `date()` and `time()`. Velox has no `timestamp(varchar)`/`date(varchar)`/`time(varchar)` scalar, so `DateTimeUdfRewriter` strips these at plan time. `timestamp(<TIMESTAMP>)`/`date(<DATE>)`/`time(<TIME>)` are identity strips; cross-type wrappers (e.g. `timestamp(<DATE>)`) are real casts and fall back via `canVectorize()`.
 - **Outer sort + system limit**: `QueryService.convertToCalcitePlan` wraps every plan in `LogicalSort(collation from input) → LogicalSystemLimit(fetch=query_size_limit)`. The outer Sort inherits the inner sort's collation; schema-reshaping operators below must rewrite/clear field-index references before this outer layer consumes them.
 
 ## velox4j integration details
@@ -117,6 +120,7 @@ The SQL plugin uses custom Calcite RelNode subclasses, not always the standard `
 - **ExternalStream split wiring**: `SerialTask.addSplit(planNodeId, split)` takes the **plan node ID** of the `TableScanNode` (not the connector ID). The `ExternalStreamConnectorSplit` takes `(connectorId, queueId)` where `queueId` is `BlockingQueue.id()`.
 - **Query construction**: A velox4j `Query` wraps `PlanNode` + `Config` + `ConnectorConfig`. The `ConnectorConfig` must register the connector ID with `ConnectorConfig.create(Map.of("connector-external-stream", Config.empty()))`. Plan serialization uses `Serde.toJson(query)` / `Serde.fromJson(json, Query.class)`.
 - **Calcite DECIMAL literals**: Calcite represents integer literals (e.g. `30`) as `DECIMAL` type with scale 0. Velox requires exact type match in expressions, so `VeloxExprConverter` must produce `IntegerValue`/`BigIntValue` (not `DoubleValue`) for zero-scale decimals.
+- **DATE/TIME constants**: velox4j has no `DateValue`/`TimeValue` variants. Use `ConstantTypedExpr.create(new DateType(), new IntegerValue(days))` and `ConstantTypedExpr.create(new BigIntType(), new BigIntValue(millis))`. The Velox return type is carried on `ConstantTypedExpr`, not derived from the variant — typing the constant as `IntegerType` breaks binding against a `DateType` column.
 - **PARTIAL/FINAL aggregation exchange**: Arrow IPC does NOT preserve Velox's intermediate accumulator state (e.g., avg's `{sum, count}`). The coordinator exchange must use Velox native serialization (`BaseVectors.serializeToBuf/deserializeFromBuf`) — added to velox4j as a custom extension. Without this, the FINAL aggregation hangs because it can't interpret Arrow-deserialized data as valid intermediate state.
 - **ExternalStream empty assignments**: `ExternalStreamConnector` enforces `columnHandles.empty()` in C++. `TableScanNode` for ExternalStream must have empty assignments list — the schema is defined solely by `outputType`.
 - **velox4j source**: `../velox4j`

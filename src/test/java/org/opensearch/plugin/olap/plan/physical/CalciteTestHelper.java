@@ -92,6 +92,18 @@ public class CalciteTestHelper {
             .build();
     rootSchema.add("logs", new SimpleTable(logsType));
 
+    // datetime_data — used by DateTimeUdfRewriterTests to exercise identity-strip on native
+    // TIMESTAMP/DATE/TIME columns. Kept separate from `logs` so adding columns here does not
+    // shift positional references in unrelated tests.
+    RelDataType datetimeType =
+        TYPE_FACTORY
+            .builder()
+            .add("ts_col", SqlTypeName.TIMESTAMP)
+            .add("date_col", SqlTypeName.DATE)
+            .add("time_col", SqlTypeName.TIME)
+            .build();
+    rootSchema.add("datetime_data", new SimpleTable(datetimeType));
+
     return RelBuilder.create(Frameworks.newConfigBuilder().defaultSchema(rootSchema).build());
   }
 }

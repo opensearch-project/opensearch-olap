@@ -12,6 +12,7 @@ import org.apache.calcite.sql.type.SqlTypeName;
 import org.boostscale.velox4j.type.ArrayType;
 import org.boostscale.velox4j.type.BigIntType;
 import org.boostscale.velox4j.type.BooleanType;
+import org.boostscale.velox4j.type.DateType;
 import org.boostscale.velox4j.type.DecimalType;
 import org.boostscale.velox4j.type.DoubleType;
 import org.boostscale.velox4j.type.IntegerType;
@@ -32,18 +33,24 @@ public final class VeloxTypeConverter {
   private VeloxTypeConverter() {}
 
   public static Type toVeloxType(RelDataType calciteType) {
-    // OpenSearch UDT types (ExprDateType, ExprTimeStampType) report SqlTypeName.VARCHAR.
-    // We map the datetime UDTs to Velox TimestampType so the scan, expressions, and native
-    // Velox datetime functions (year, date_trunc, comparisons with timestamp literals) all
-    // operate on a logical timestamp type. LuceneArrowReader emits Arrow Timestamp(micros)
-    // for these fields — the Arrow→Velox bridge converts to Velox's Timestamp struct.
+    // OpenSearch UDT types (ExprDateType, ExprTimeType, ExprTimeStampType) report
+    // SqlTypeName.VARCHAR but each has a distinct logical Velox mapping:
+    //   EXPR_TIMESTAMP → TimestampType (struct of seconds+nanos)
+    //   EXPR_DATE      → DateType      (int32 days since epoch)
+    //   EXPR_TIME      → BigIntType    (millis from midnight; Velox TIME is BIGINT-backed,
+    //                                   velox4j Java bindings do not expose a TimeType wrapper)
+    // LuceneArrowReader emits Arrow Timestamp(micros) for OpenSearch date fields — the Arrow→
+    // Velox bridge converts that to Velox Timestamp. EXPR_DATE/EXPR_TIME only arise from
+    // expression-level casts/UDFs, not scans.
     if (calciteType instanceof AbstractExprRelDataType<?>) {
       ExprUDT udt = ((AbstractExprRelDataType<?>) calciteType).getUdt();
       switch (udt) {
-        case EXPR_DATE:
         case EXPR_TIMESTAMP:
-        case EXPR_TIME:
           return new TimestampType();
+        case EXPR_DATE:
+          return new DateType();
+        case EXPR_TIME:
+          return new BigIntType();
         case EXPR_IP:
         case EXPR_BINARY:
           return new VarCharType();
@@ -75,8 +82,11 @@ public final class VeloxTypeConverter {
       case VARCHAR:
         return new VarCharType();
       case DATE:
-        // Velox represents DATE as INTEGER (days since epoch)
-        return new IntegerType();
+        return new DateType();
+      case TIME:
+      case TIME_WITH_LOCAL_TIME_ZONE:
+        // Velox TIME is BIGINT-backed (millis from midnight); velox4j has no TimeType wrapper.
+        return new BigIntType();
       case TIMESTAMP:
       case TIMESTAMP_WITH_LOCAL_TIME_ZONE:
         return new TimestampType();
@@ -120,6 +130,8 @@ public final class VeloxTypeConverter {
       case CHAR:
       case VARCHAR:
       case DATE:
+      case TIME:
+      case TIME_WITH_LOCAL_TIME_ZONE:
       case TIMESTAMP:
       case TIMESTAMP_WITH_LOCAL_TIME_ZONE:
       case NULL:
