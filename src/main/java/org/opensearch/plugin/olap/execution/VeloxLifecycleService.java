@@ -121,6 +121,47 @@ public class VeloxLifecycleService implements Closeable {
           Setting.Property.Dynamic);
 
   /**
+   * Enable the BLOOM variant of runtime filter. When true, build-side cardinalities above the TERMS
+   * cap but below the BLOOM cap produce a bloom filter instead of being abandoned. When false,
+   * behavior reverts to pre-BLOOM: the RF is dropped once cardinality exceeds the TERMS cap.
+   */
+  public static final Setting<Boolean> RUNTIME_FILTER_BLOOM_ENABLED =
+      Setting.boolSetting(
+          "plugins.velox.runtime_filter_bloom_enabled",
+          true,
+          Setting.Property.NodeScope,
+          Setting.Property.Dynamic);
+
+  /**
+   * Upper cap on distinct build-side values for the BLOOM RF. Cardinalities above this are
+   * abandoned (no filter emitted). Bounds bloom-filter memory footprint at roughly {@code
+   * -N*ln(fpp)/ln(2)^2} bits — at the default 10M insertions and fpp=1%, about 12 MB.
+   */
+  public static final Setting<Integer> RUNTIME_FILTER_BLOOM_MAX_CARDINALITY =
+      Setting.intSetting(
+          "plugins.velox.runtime_filter_bloom_max_cardinality",
+          10_000_000,
+          0,
+          Setting.Property.NodeScope,
+          Setting.Property.Dynamic);
+
+  /**
+   * Enable two-stage distributed BLOOM build. When true, each data node builds a PARTIAL bloom
+   * filter over its own build-side rows and ships it back to the coordinator, which merges them via
+   * bitwise-OR into a FINAL bloom. When false, the coordinator rebuilds the bloom single-stage by
+   * reading the broadcast build data (v1 behavior).
+   *
+   * <p>Two-stage is cheaper: the coordinator does not need to re-scan build rows, and partial
+   * blooms are typically a small fixed-size binary payload (~MB), regardless of build cardinality.
+   */
+  public static final Setting<Boolean> RUNTIME_FILTER_BLOOM_TWO_STAGE =
+      Setting.boolSetting(
+          "plugins.velox.runtime_filter_bloom_two_stage",
+          true,
+          Setting.Property.NodeScope,
+          Setting.Property.Dynamic);
+
+  /**
    * CBO statistics mode. RUNTIME collects row counts from IndicesStatsResponse before optimization.
    * NONE skips statistics collection (uses Calcite defaults).
    */
@@ -152,6 +193,9 @@ public class VeloxLifecycleService implements Closeable {
   private volatile int taskMaxRetries;
   private volatile boolean runtimeFilterEnabled;
   private volatile int runtimeFilterMaxCardinality;
+  private volatile boolean runtimeFilterBloomEnabled;
+  private volatile int runtimeFilterBloomMaxCardinality;
+  private volatile boolean runtimeFilterBloomTwoStage;
   private volatile String cboStatisticsMode;
   private volatile MemoryManager memoryManager;
   private volatile Session session;
@@ -167,6 +211,9 @@ public class VeloxLifecycleService implements Closeable {
     this.taskMaxRetries = TASK_MAX_RETRIES.get(settings);
     this.runtimeFilterEnabled = RUNTIME_FILTER_ENABLED.get(settings);
     this.runtimeFilterMaxCardinality = RUNTIME_FILTER_MAX_CARDINALITY.get(settings);
+    this.runtimeFilterBloomEnabled = RUNTIME_FILTER_BLOOM_ENABLED.get(settings);
+    this.runtimeFilterBloomMaxCardinality = RUNTIME_FILTER_BLOOM_MAX_CARDINALITY.get(settings);
+    this.runtimeFilterBloomTwoStage = RUNTIME_FILTER_BLOOM_TWO_STAGE.get(settings);
     this.cboStatisticsMode = CBO_STATISTICS_MODE.get(settings);
 
     if (enabled) {
@@ -305,6 +352,30 @@ public class VeloxLifecycleService implements Closeable {
     this.runtimeFilterMaxCardinality = runtimeFilterMaxCardinality;
   }
 
+  public boolean isRuntimeFilterBloomEnabled() {
+    return runtimeFilterBloomEnabled;
+  }
+
+  public void setRuntimeFilterBloomEnabled(boolean runtimeFilterBloomEnabled) {
+    this.runtimeFilterBloomEnabled = runtimeFilterBloomEnabled;
+  }
+
+  public int getRuntimeFilterBloomMaxCardinality() {
+    return runtimeFilterBloomMaxCardinality;
+  }
+
+  public void setRuntimeFilterBloomMaxCardinality(int runtimeFilterBloomMaxCardinality) {
+    this.runtimeFilterBloomMaxCardinality = runtimeFilterBloomMaxCardinality;
+  }
+
+  public boolean isRuntimeFilterBloomTwoStage() {
+    return runtimeFilterBloomTwoStage;
+  }
+
+  public void setRuntimeFilterBloomTwoStage(boolean runtimeFilterBloomTwoStage) {
+    this.runtimeFilterBloomTwoStage = runtimeFilterBloomTwoStage;
+  }
+
   public String getCboStatisticsMode() {
     return cboStatisticsMode;
   }
@@ -329,6 +400,9 @@ public class VeloxLifecycleService implements Closeable {
         TASK_MAX_RETRIES,
         RUNTIME_FILTER_ENABLED,
         RUNTIME_FILTER_MAX_CARDINALITY,
+        RUNTIME_FILTER_BLOOM_ENABLED,
+        RUNTIME_FILTER_BLOOM_MAX_CARDINALITY,
+        RUNTIME_FILTER_BLOOM_TWO_STAGE,
         CBO_STATISTICS_MODE,
         FORCE_VECTORIZE);
   }

@@ -12,6 +12,7 @@ import org.opensearch.action.ActionRequestValidationException;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
 import org.opensearch.core.index.shard.ShardId;
+import org.opensearch.plugin.olap.execution.RfKind;
 
 /**
  * Request to execute a Velox plan fragment on a data node.
@@ -46,17 +47,46 @@ public class ExecuteFragmentRequest extends ActionRequest {
   private int broadcastBuildScanIndex = 1;
 
   // --- Runtime filter fields ---
-  /** Probe-side join key field name for runtime filter pushdown. Null if RF not applicable. */
+  /**
+   * Probe-side join key field name — populated for BOTH TERMS and BLOOM. Reconstructed on the
+   * receiver from whichever trailer is present (terms values or bloom bytes).
+   */
   private String rfFieldName;
 
   /** OpenSearch field type of the RF field ("keyword", "integer", "long"). */
   private String rfFieldType;
 
-  /** Distinct join key values from the build side, serialized as strings. */
+  /**
+   * Distinct join key values for a TERMS runtime filter, serialized as strings. Null for BLOOM or
+   * NONE.
+   */
   private List<String> rfValues;
+
+  /** Serialized bloom filter bytes for a BLOOM runtime filter. Null for TERMS or NONE. */
+  private byte[] rfBloomBytes;
 
   /** Probe-side leaf fragment plan JSON for extracting pushdown query in broadcast join. */
   private String probePlanJson;
+
+  // --- Two-stage BLOOM build fields (build-side request) ---
+  /**
+   * Column name in the build-side scan output to feed into a PARTIAL bloom. Non-null signals the
+   * data node to build a partial bloom over this column and attach it to the response. Null skips
+   * PARTIAL bloom construction (v1 single-stage path).
+   */
+  private String buildBloomFieldName;
+
+  /**
+   * Field type ("keyword"/"text"/"integer"/"long") used by OlapBloomFilter.encodeKey on both sides.
+   */
+  private String buildBloomFieldType;
+
+  /**
+   * Expected insertion count — must be identical across all data nodes in the same build, so the
+   * partial blooms share sizing (bit count + hash count) and can be merged via bitwise-OR at the
+   * coordinator.
+   */
+  private int buildBloomExpectedInsertions;
 
   // --- Shuffle scan fields ---
   /** Target node IDs for each shuffle partition. Null if not a shuffle scan. */
@@ -112,14 +142,19 @@ public class ExecuteFragmentRequest extends ActionRequest {
       this.broadcastBuildScanIndex = in.readVInt();
     }
 
-    // Runtime filter
+    // Runtime filter (TERMS). rfFieldName is also shared with BLOOM — if fieldName is present
+    // but no rfValues follow, this is a BLOOM request (the bloom trailer at the end of the
+    // stream carries the bytes).
     this.rfFieldName = in.readOptionalString();
     if (this.rfFieldName != null) {
       this.rfFieldType = in.readString();
-      int rfCount = in.readVInt();
-      this.rfValues = new ArrayList<>(rfCount);
-      for (int i = 0; i < rfCount; i++) {
-        this.rfValues.add(in.readString());
+      boolean hasTerms = in.readBoolean();
+      if (hasTerms) {
+        int rfCount = in.readVInt();
+        this.rfValues = new ArrayList<>(rfCount);
+        for (int i = 0; i < rfCount; i++) {
+          this.rfValues.add(in.readString());
+        }
       }
     }
 
@@ -149,6 +184,22 @@ public class ExecuteFragmentRequest extends ActionRequest {
       this.shuffleJoinStageId = in.readVInt();
       this.expectedLeftSenders = in.readVInt();
       this.expectedRightSenders = in.readVInt();
+    }
+
+    // Bloom RF trailer: an optional byte array. Sender always emits the length-prefixed
+    // byte array (zero-length means "no bloom"), so this is unconditional and cluster-wide
+    // version-homogeneous because it ships as part of a single plugin deploy.
+    this.rfBloomBytes = in.readByteArray();
+    if (this.rfBloomBytes.length == 0) {
+      this.rfBloomBytes = null;
+    }
+
+    // Two-stage BLOOM build trailer: fieldName/fieldType/expectedInsertions. Only populated
+    // when the coordinator asks the data node to produce a PARTIAL bloom over the build output.
+    this.buildBloomFieldName = in.readOptionalString();
+    if (this.buildBloomFieldName != null) {
+      this.buildBloomFieldType = in.readString();
+      this.buildBloomExpectedInsertions = in.readVInt();
     }
   }
 
@@ -192,13 +243,18 @@ public class ExecuteFragmentRequest extends ActionRequest {
       out.writeVInt(0);
     }
 
-    // Runtime filter
+    // Runtime filter (TERMS half of the block). rfFieldName/rfFieldType are shared with BLOOM;
+    // rfValues are only present for TERMS. Bloom bytes ride the trailer at the end of the stream.
     out.writeOptionalString(rfFieldName);
     if (rfFieldName != null) {
       out.writeString(rfFieldType);
-      out.writeVInt(rfValues.size());
-      for (String v : rfValues) {
-        out.writeString(v);
+      boolean hasTerms = rfValues != null;
+      out.writeBoolean(hasTerms);
+      if (hasTerms) {
+        out.writeVInt(rfValues.size());
+        for (String v : rfValues) {
+          out.writeString(v);
+        }
       }
     }
 
@@ -229,7 +285,20 @@ public class ExecuteFragmentRequest extends ActionRequest {
       out.writeVInt(expectedLeftSenders);
       out.writeVInt(expectedRightSenders);
     }
+
+    // Bloom RF trailer: always write a (possibly empty) byte array — simpler than a separate
+    // boolean tag, and the length prefix handles the "no bloom" case at zero overhead.
+    out.writeByteArray(rfBloomBytes == null ? EMPTY_BYTES : rfBloomBytes);
+
+    // Two-stage BLOOM build trailer.
+    out.writeOptionalString(buildBloomFieldName);
+    if (buildBloomFieldName != null) {
+      out.writeString(buildBloomFieldType);
+      out.writeVInt(buildBloomExpectedInsertions);
+    }
   }
+
+  private static final byte[] EMPTY_BYTES = new byte[0];
 
   @Override
   public ActionRequestValidationException validate() {
@@ -291,8 +360,26 @@ public class ExecuteFragmentRequest extends ActionRequest {
     return rfValues;
   }
 
-  public boolean hasRuntimeFilter() {
+  public byte[] getRfBloomBytes() {
+    return rfBloomBytes;
+  }
+
+  public boolean hasBloomFilter() {
+    return rfFieldName != null && rfBloomBytes != null && rfBloomBytes.length > 0;
+  }
+
+  public boolean hasTermsFilter() {
     return rfFieldName != null && rfValues != null && !rfValues.isEmpty();
+  }
+
+  public boolean hasRuntimeFilter() {
+    return hasTermsFilter() || hasBloomFilter();
+  }
+
+  public RfKind getRfKind() {
+    if (hasBloomFilter()) return RfKind.BLOOM;
+    if (hasTermsFilter()) return RfKind.TERMS;
+    return RfKind.NONE;
   }
 
   public String getProbePlanJson() {
@@ -307,6 +394,38 @@ public class ExecuteFragmentRequest extends ActionRequest {
     this.rfFieldName = fieldName;
     this.rfFieldType = fieldType;
     this.rfValues = values;
+    this.rfBloomBytes = null;
+  }
+
+  public void setBloomRuntimeFilter(String fieldName, String fieldType, byte[] bloomBytes) {
+    this.rfFieldName = fieldName;
+    this.rfFieldType = fieldType;
+    this.rfValues = null;
+    this.rfBloomBytes = bloomBytes;
+  }
+
+  public String getBuildBloomFieldName() {
+    return buildBloomFieldName;
+  }
+
+  public String getBuildBloomFieldType() {
+    return buildBloomFieldType;
+  }
+
+  public int getBuildBloomExpectedInsertions() {
+    return buildBloomExpectedInsertions;
+  }
+
+  public boolean shouldBuildPartialBloom() {
+    return buildBloomFieldName != null
+        && buildBloomFieldType != null
+        && buildBloomExpectedInsertions > 0;
+  }
+
+  public void setBuildPartialBloom(String fieldName, String fieldType, int expectedInsertions) {
+    this.buildBloomFieldName = fieldName;
+    this.buildBloomFieldType = fieldType;
+    this.buildBloomExpectedInsertions = expectedInsertions;
   }
 
   public List<String> getShuffleTargetNodeIds() {

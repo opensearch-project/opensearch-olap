@@ -108,6 +108,21 @@ public class OlapPlugin extends Plugin implements ActionPlugin {
     clusterService
         .getClusterSettings()
         .addSettingsUpdateConsumer(
+            VeloxLifecycleService.RUNTIME_FILTER_BLOOM_ENABLED,
+            veloxLifecycleService::setRuntimeFilterBloomEnabled);
+    clusterService
+        .getClusterSettings()
+        .addSettingsUpdateConsumer(
+            VeloxLifecycleService.RUNTIME_FILTER_BLOOM_MAX_CARDINALITY,
+            veloxLifecycleService::setRuntimeFilterBloomMaxCardinality);
+    clusterService
+        .getClusterSettings()
+        .addSettingsUpdateConsumer(
+            VeloxLifecycleService.RUNTIME_FILTER_BLOOM_TWO_STAGE,
+            veloxLifecycleService::setRuntimeFilterBloomTwoStage);
+    clusterService
+        .getClusterSettings()
+        .addSettingsUpdateConsumer(
             VeloxLifecycleService.CBO_STATISTICS_MODE, veloxLifecycleService::setCboStatisticsMode);
     clusterService
         .getClusterSettings()

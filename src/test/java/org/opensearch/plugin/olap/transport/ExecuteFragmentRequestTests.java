@@ -10,6 +10,7 @@ import org.opensearch.common.io.stream.BytesStreamOutput;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.index.Index;
 import org.opensearch.core.index.shard.ShardId;
+import org.opensearch.plugin.olap.execution.RfKind;
 import org.opensearch.test.OpenSearchTestCase;
 
 public class ExecuteFragmentRequestTests extends OpenSearchTestCase {
@@ -119,5 +120,99 @@ public class ExecuteFragmentRequestTests extends OpenSearchTestCase {
   public void testValidateHappyPath() {
     ExecuteFragmentRequest request = new ExecuteFragmentRequest("q1", 0, 0, "{}", List.of(), null);
     assertNull(request.validate());
+  }
+
+  // ---- Runtime filter serde ----
+
+  public void testSerializeDeserializeTermsRuntimeFilter() throws IOException {
+    ExecuteFragmentRequest original =
+        new ExecuteFragmentRequest("q6", 0, 0, "{}", List.of(testShardId(0)), "probe");
+    original.setRuntimeFilter("user_id", "keyword", List.of("a", "b", "c"));
+
+    BytesStreamOutput out = new BytesStreamOutput();
+    original.writeTo(out);
+
+    StreamInput in = out.bytes().streamInput();
+    ExecuteFragmentRequest deserialized = new ExecuteFragmentRequest(in);
+
+    assertTrue(deserialized.hasRuntimeFilter());
+    assertTrue(deserialized.hasTermsFilter());
+    assertFalse(deserialized.hasBloomFilter());
+    assertEquals(RfKind.TERMS, deserialized.getRfKind());
+    assertEquals("user_id", deserialized.getRfFieldName());
+    assertEquals("keyword", deserialized.getRfFieldType());
+    assertEquals(List.of("a", "b", "c"), deserialized.getRfValues());
+    assertNull(deserialized.getRfBloomBytes());
+  }
+
+  public void testSerializeDeserializeBloomRuntimeFilter() throws IOException {
+    byte[] bloomBytes = new byte[] {1, 2, 3, 4, 5};
+    ExecuteFragmentRequest original =
+        new ExecuteFragmentRequest("q7", 0, 0, "{}", List.of(testShardId(0)), "probe");
+    original.setBloomRuntimeFilter("user_id", "keyword", bloomBytes);
+
+    BytesStreamOutput out = new BytesStreamOutput();
+    original.writeTo(out);
+
+    StreamInput in = out.bytes().streamInput();
+    ExecuteFragmentRequest deserialized = new ExecuteFragmentRequest(in);
+
+    assertTrue(deserialized.hasRuntimeFilter());
+    assertFalse(deserialized.hasTermsFilter());
+    assertTrue(deserialized.hasBloomFilter());
+    assertEquals(RfKind.BLOOM, deserialized.getRfKind());
+    assertEquals("user_id", deserialized.getRfFieldName());
+    assertEquals("keyword", deserialized.getRfFieldType());
+    assertArrayEquals(bloomBytes, deserialized.getRfBloomBytes());
+    assertNull(deserialized.getRfValues());
+  }
+
+  public void testSerializeDeserializeNoRuntimeFilter() throws IOException {
+    ExecuteFragmentRequest original =
+        new ExecuteFragmentRequest("q8", 0, 0, "{}", List.of(testShardId(0)), "probe");
+
+    BytesStreamOutput out = new BytesStreamOutput();
+    original.writeTo(out);
+
+    StreamInput in = out.bytes().streamInput();
+    ExecuteFragmentRequest deserialized = new ExecuteFragmentRequest(in);
+
+    assertFalse(deserialized.hasRuntimeFilter());
+    assertEquals(RfKind.NONE, deserialized.getRfKind());
+    assertNull(deserialized.getRfBloomBytes());
+    assertNull(deserialized.getRfValues());
+  }
+
+  // ---- Two-stage BLOOM build trailer serde ----
+
+  public void testSerializeDeserializeBuildPartialBloom() throws IOException {
+    ExecuteFragmentRequest original =
+        new ExecuteFragmentRequest("q9", 0, 0, "{}", List.of(testShardId(0)), "build_idx");
+    original.setBuildPartialBloom("user_id", "keyword", 1_000_000);
+
+    BytesStreamOutput out = new BytesStreamOutput();
+    original.writeTo(out);
+
+    StreamInput in = out.bytes().streamInput();
+    ExecuteFragmentRequest deserialized = new ExecuteFragmentRequest(in);
+
+    assertTrue(deserialized.shouldBuildPartialBloom());
+    assertEquals("user_id", deserialized.getBuildBloomFieldName());
+    assertEquals("keyword", deserialized.getBuildBloomFieldType());
+    assertEquals(1_000_000, deserialized.getBuildBloomExpectedInsertions());
+  }
+
+  public void testSerializeDeserializeBuildPartialBloomAbsent() throws IOException {
+    ExecuteFragmentRequest original =
+        new ExecuteFragmentRequest("q10", 0, 0, "{}", List.of(testShardId(0)), "probe");
+
+    BytesStreamOutput out = new BytesStreamOutput();
+    original.writeTo(out);
+
+    StreamInput in = out.bytes().streamInput();
+    ExecuteFragmentRequest deserialized = new ExecuteFragmentRequest(in);
+
+    assertFalse(deserialized.shouldBuildPartialBloom());
+    assertNull(deserialized.getBuildBloomFieldName());
   }
 }

@@ -24,6 +24,8 @@ import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.plugin.olap.common.QueryId;
+import org.opensearch.plugin.olap.execution.OlapBloomFilter;
+import org.opensearch.plugin.olap.execution.RuntimeFilterPayload;
 import org.opensearch.plugin.olap.scheduler.BadResourceTracker;
 import org.opensearch.plugin.olap.scheduler.ErrorClassifier;
 import org.opensearch.plugin.olap.scheduler.ErrorClassifier.ErrorCategory;
@@ -79,6 +81,34 @@ public class NodeResultCollector {
     return dispatchTasks(queryId, allTasks, task -> createNormalRequest(queryId, task));
   }
 
+  /**
+   * Dispatch build-side tasks for a broadcast join and request a two-stage PARTIAL BLOOM build
+   * alongside the scan. Every dispatched request is stamped with the same {@code fieldName}, {@code
+   * fieldType}, and {@code expectedInsertions} so the returned partial blooms share bit layout and
+   * can be merged at the coordinator via {@link OlapBloomFilter#merge}.
+   */
+  public List<ExecuteFragmentResponse> dispatchAndCollectWithPartialBloom(
+      QueryExecution execution,
+      List<Stage> stages,
+      String fieldName,
+      String fieldType,
+      int expectedInsertions) {
+    QueryId queryId = execution.getQueryId();
+    List<TaskDescriptor> allTasks = new ArrayList<>();
+    for (var stage : stages) {
+      allTasks.addAll(stage.getTasks());
+    }
+
+    return dispatchTasks(
+        queryId,
+        allTasks,
+        task -> {
+          ExecuteFragmentRequest request = createNormalRequest(queryId, task);
+          request.setBuildPartialBloom(fieldName, fieldType, expectedInsertions);
+          return request;
+        });
+  }
+
   /** Dispatch broadcast join tasks: each task receives the broadcast data along with the plan. */
   public List<ExecuteFragmentResponse> dispatchAndCollectBroadcast(
       QueryExecution execution, List<Stage> stages, List<byte[]> broadcastData) {
@@ -96,24 +126,19 @@ public class NodeResultCollector {
       List<byte[]> broadcastData,
       int buildScanIndex) {
     return dispatchAndCollectBroadcast(
-        execution, stages, broadcastData, buildScanIndex, null, null, null, null);
+        execution, stages, broadcastData, buildScanIndex, RuntimeFilterPayload.none(), null);
   }
 
   /**
-   * Dispatch broadcast join tasks with build scan index and optional runtime filter.
-   *
-   * @param rfFieldName probe-side join key field name (null to skip RF)
-   * @param rfFieldType field type ("keyword", "integer", "long")
-   * @param rfValues distinct build-side join key values as strings
+   * Dispatch broadcast join tasks with build scan index and an optional runtime filter. The RF kind
+   * (TERMS / BLOOM / NONE) is encoded in {@code payload} — see {@link RuntimeFilterPayload}.
    */
   public List<ExecuteFragmentResponse> dispatchAndCollectBroadcast(
       QueryExecution execution,
       List<Stage> stages,
       List<byte[]> broadcastData,
       int buildScanIndex,
-      String rfFieldName,
-      String rfFieldType,
-      List<String> rfValues,
+      RuntimeFilterPayload payload,
       String probePlanJson) {
     QueryId queryId = execution.getQueryId();
     List<TaskDescriptor> allTasks = new ArrayList<>();
@@ -127,8 +152,20 @@ public class NodeResultCollector {
         task -> {
           ExecuteFragmentRequest request = createNormalRequest(queryId, task);
           request.setBroadcastData(broadcastData, buildScanIndex);
-          if (rfFieldName != null && rfValues != null && !rfValues.isEmpty()) {
-            request.setRuntimeFilter(rfFieldName, rfFieldType, rfValues);
+          if (payload != null) {
+            switch (payload.getKind()) {
+              case TERMS:
+                request.setRuntimeFilter(
+                    payload.getFieldName(), payload.getFieldType(), payload.getTermsValues());
+                break;
+              case BLOOM:
+                request.setBloomRuntimeFilter(
+                    payload.getFieldName(), payload.getFieldType(), payload.getBloomBytes());
+                break;
+              case NONE:
+              default:
+                break;
+            }
           }
           if (probePlanJson != null) {
             request.setProbePlanJson(probePlanJson);

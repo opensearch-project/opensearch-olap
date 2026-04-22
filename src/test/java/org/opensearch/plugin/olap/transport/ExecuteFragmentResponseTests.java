@@ -150,4 +150,32 @@ public class ExecuteFragmentResponseTests extends OpenSearchTestCase {
     ExecuteFragmentResponse deserialized = new ExecuteFragmentResponse(in);
     assertEquals(bigRowCount, deserialized.getRowCount());
   }
+
+  public void testSerializeDeserializePartialBloomBytes() throws IOException {
+    ExecuteFragmentResponse original = ExecuteFragmentResponse.success(10, new byte[] {0});
+    byte[] partialBloom = new byte[] {0x42, 0x43, 0x44, 0x45, 0x46};
+    original.setPartialBloomBytes(partialBloom);
+
+    BytesStreamOutput out = new BytesStreamOutput();
+    original.writeTo(out);
+
+    StreamInput in = out.bytes().streamInput();
+    ExecuteFragmentResponse deserialized = new ExecuteFragmentResponse(in);
+
+    assertTrue(deserialized.hasPartialBloom());
+    assertArrayEquals(partialBloom, deserialized.getPartialBloomBytes());
+  }
+
+  public void testSerializeDeserializeNoPartialBloom() throws IOException {
+    ExecuteFragmentResponse original = ExecuteFragmentResponse.success(10, new byte[] {0});
+
+    BytesStreamOutput out = new BytesStreamOutput();
+    original.writeTo(out);
+
+    StreamInput in = out.bytes().streamInput();
+    ExecuteFragmentResponse deserialized = new ExecuteFragmentResponse(in);
+
+    assertFalse(deserialized.hasPartialBloom());
+    assertNull(deserialized.getPartialBloomBytes());
+  }
 }

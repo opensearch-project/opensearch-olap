@@ -41,6 +41,7 @@ import org.opensearch.plugin.olap.engine.VeloxExecutionEngine;
 import org.opensearch.plugin.olap.execution.ExternalStreamBridge;
 import org.opensearch.plugin.olap.execution.LuceneArrowReader;
 import org.opensearch.plugin.olap.execution.LuceneFilterConverter;
+import org.opensearch.plugin.olap.execution.OlapBloomFilter;
 import org.opensearch.plugin.olap.execution.RuntimeFilterBuilder;
 import org.opensearch.plugin.olap.execution.VeloxExecutor;
 import org.opensearch.plugin.olap.execution.VeloxLifecycleService;
@@ -198,7 +199,21 @@ public class TransportExecuteFragmentAction
       boolean isPartialAgg = request.getPlanFragmentJson().contains("\"step\":\"PARTIAL\"");
 
       ExecuteFragmentResponse response;
-      if (isPartialAgg) {
+      if (request.shouldBuildPartialBloom() && !isPartialAgg) {
+        // Two-stage BLOOM build path: produce the normal Arrow IPC payload AND a serialized
+        // PARTIAL bloom over the requested column, for the coordinator to merge with other nodes'.
+        VeloxExecutor.ExecuteWithBloomResult res =
+            executor.executeWithPartialBloom(
+                request.getPlanFragmentJson(),
+                bridge.getConnectorId(),
+                bridge.getQueue(),
+                request.getBuildBloomFieldName(),
+                request.getBuildBloomFieldType(),
+                request.getBuildBloomExpectedInsertions());
+        feederThread.join(30_000);
+        response = ExecuteFragmentResponse.success(bridge.getRowCount(), res.arrowIpc);
+        response.setPartialBloomBytes(res.partialBloomBytes);
+      } else if (isPartialAgg) {
         List<byte[]> nativeBatches =
             executor.executeNative(
                 request.getPlanFragmentJson(), bridge.getConnectorId(), bridge.getQueue());
@@ -271,14 +286,27 @@ public class TransportExecuteFragmentAction
       }
       probeBridge.setRequestedFields(scanFields);
 
-      // Build runtime filter query if present in request
+      // Build runtime filter query if present in request. Both TERMS and BLOOM are pushed down as
+      // Lucene queries — BLOOM is applied as a BloomFilterQuery (doc-values iteration + per-doc
+      // mightContain). NOTE: BLOOM pushdown treats a doc with no value for the RF field as
+      // non-matching (stricter than the previous feeder-level predicate, which passed such docs
+      // through). Correctness is preserved because the hash-join above re-verifies keys — a doc
+      // without the join key cannot match the join anyway.
       org.apache.lucene.search.Query rfQuery = buildRuntimeFilterQuery(request);
       if (rfQuery != null) {
-        logger.info(
-            "Runtime filter applied for query {}: field={}, {} values",
-            queryId,
-            request.getRfFieldName(),
-            request.getRfValues().size());
+        if (request.hasTermsFilter()) {
+          logger.info(
+              "Runtime filter applied for query {}: field={}, kind=TERMS, {} values",
+              queryId,
+              request.getRfFieldName(),
+              request.getRfValues().size());
+        } else if (request.hasBloomFilter()) {
+          logger.info(
+              "Runtime filter applied for query {}: field={}, kind=BLOOM, {} bytes",
+              queryId,
+              request.getRfFieldName(),
+              request.getRfBloomBytes().length);
+        }
       }
 
       // Extract pushdown from the probe-side leaf fragment plan (safe — only probe branch).
@@ -651,12 +679,21 @@ public class TransportExecuteFragmentAction
   // ---- Plan Introspection Helpers ----
 
   /** Extract field names from a specific TableScanNode by ID. */
-  /** Build a Lucene runtime filter query from the request's RF metadata. */
+  /**
+   * Build a Lucene runtime filter query from the request's RF metadata. TERMS RFs produce a point
+   * or term-set query; BLOOM RFs produce a {@link
+   * org.opensearch.plugin.olap.execution.BloomFilterQuery} that walks doc values and keeps docs
+   * passing {@code bloom.mightContain}.
+   */
   private org.apache.lucene.search.Query buildRuntimeFilterQuery(ExecuteFragmentRequest request) {
-    if (!request.hasRuntimeFilter()) return null;
+    String fieldType = request.getRfFieldType();
+    if (request.hasBloomFilter()) {
+      OlapBloomFilter bloom = OlapBloomFilter.fromBytes(request.getRfBloomBytes());
+      return RuntimeFilterBuilder.buildBloom(request.getRfFieldName(), fieldType, bloom);
+    }
+    if (!request.hasTermsFilter()) return null;
 
     Set<Object> values = new LinkedHashSet<>();
-    String fieldType = request.getRfFieldType();
     for (String v : request.getRfValues()) {
       try {
         switch (fieldType) {
