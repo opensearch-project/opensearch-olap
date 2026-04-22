@@ -178,4 +178,34 @@ public class ExecuteFragmentResponseTests extends OpenSearchTestCase {
     assertFalse(deserialized.hasPartialBloom());
     assertNull(deserialized.getPartialBloomBytes());
   }
+
+  public void testSerializeDeserializeWithTaskProfile() throws IOException {
+    ExecuteFragmentResponse original = ExecuteFragmentResponse.success(42, new byte[] {1});
+    org.opensearch.plugin.olap.profile.OlapTaskProfile tp =
+        new org.opensearch.plugin.olap.profile.OlapTaskProfile(
+            2, 5, "data-3", 99_999_999L, 500L, 42L, 42L, "BLOOM", 256);
+    original.setTaskProfile(tp);
+
+    BytesStreamOutput out = new BytesStreamOutput();
+    original.writeTo(out);
+
+    StreamInput in = out.bytes().streamInput();
+    ExecuteFragmentResponse deserialized = new ExecuteFragmentResponse(in);
+
+    assertTrue(deserialized.hasTaskProfile());
+    assertEquals(tp, deserialized.getTaskProfile());
+  }
+
+  public void testSerializeDeserializeNoTaskProfile() throws IOException {
+    ExecuteFragmentResponse original = ExecuteFragmentResponse.success(10, new byte[] {0});
+
+    BytesStreamOutput out = new BytesStreamOutput();
+    original.writeTo(out);
+
+    StreamInput in = out.bytes().streamInput();
+    ExecuteFragmentResponse deserialized = new ExecuteFragmentResponse(in);
+
+    assertFalse(deserialized.hasTaskProfile());
+    assertNull(deserialized.getTaskProfile());
+  }
 }

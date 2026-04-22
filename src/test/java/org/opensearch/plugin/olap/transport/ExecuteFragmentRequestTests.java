@@ -215,4 +215,31 @@ public class ExecuteFragmentRequestTests extends OpenSearchTestCase {
     assertFalse(deserialized.shouldBuildPartialBloom());
     assertNull(deserialized.getBuildBloomFieldName());
   }
+
+  public void testSerializeDeserializeProfileEnabled() throws IOException {
+    ExecuteFragmentRequest original =
+        new ExecuteFragmentRequest("q11", 0, 0, "{}", List.of(testShardId(0)), "idx");
+    original.setProfileEnabled(true);
+
+    BytesStreamOutput out = new BytesStreamOutput();
+    original.writeTo(out);
+
+    StreamInput in = out.bytes().streamInput();
+    ExecuteFragmentRequest deserialized = new ExecuteFragmentRequest(in);
+
+    assertTrue(deserialized.isProfileEnabled());
+  }
+
+  public void testSerializeDeserializeProfileDisabledByDefault() throws IOException {
+    ExecuteFragmentRequest original =
+        new ExecuteFragmentRequest("q12", 0, 0, "{}", List.of(testShardId(0)), "idx");
+
+    BytesStreamOutput out = new BytesStreamOutput();
+    original.writeTo(out);
+
+    StreamInput in = out.bytes().streamInput();
+    ExecuteFragmentRequest deserialized = new ExecuteFragmentRequest(in);
+
+    assertFalse(deserialized.isProfileEnabled());
+  }
 }

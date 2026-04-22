@@ -204,10 +204,18 @@ public abstract class OlapRestTestCase extends OpenSearchTestCase {
 
   /** Execute a PPL query and return the JSON response. */
   protected JSONObject executePPLQuery(String query) throws IOException {
+    return executePPLQuery(query, false);
+  }
+
+  /** Execute a PPL query, optionally with the {@code profile=true} body flag. */
+  protected JSONObject executePPLQuery(String query, boolean profile) throws IOException {
     Request request = new Request("POST", PPL_ENDPOINT);
     // Use JSONObject to properly escape the query string (handles newlines, quotes, etc.)
     JSONObject payload = new JSONObject();
     payload.put("query", query);
+    if (profile) {
+      payload.put("profile", true);
+    }
     request.setJsonEntity(payload.toString());
     Response response = client().performRequest(request);
     assertEquals(200, response.getStatusLine().getStatusCode());

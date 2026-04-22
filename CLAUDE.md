@@ -241,6 +241,19 @@ Wire format additions on `ExecuteFragmentRequest`: `buildBloomFieldName/Type/Exp
 
 BLOOM is pushed down as a Lucene `BloomFilterQuery` (via `RuntimeFilterBuilder.buildBloom`), same layer as TERMS. The Query's Weight/Scorer walks doc values for the RF field and matches docs passing `bloom.mightContain`. **Missing-field semantics**: a segment without the RF field (or a doc without a value) yields zero matches — stricter than the earlier feeder-layer predicate, which passed missing docs through. Correctness is preserved because the hash-join above re-verifies keys: a doc without the join key cannot match the join anyway.
 
+## PPL profile integration
+The plugin participates in the SQL plugin's PPL `{"profile":true}` flow (see `../search-plugins-sql/docs/user/ppl/interfaces/endpoint.md` § Profile). Flow:
+
+1. Coordinator checks `QueryProfiling.current().isEnabled()` in `VeloxExecutionEngine.execute()`.
+2. If enabled, `NodeResultCollector.setProfileEnabled(true)` stamps every outgoing `ExecuteFragmentRequest` with `profileEnabled=true`.
+3. On each data node, `TransportExecuteFragmentAction` threads a `LuceneArrowReader.ScanStats` counter through the feeder, and stamps the response with an `OlapTaskProfile` carrying `{fragmentId, partitionId, nodeId, durationNanos, docsRead, docsMatched, rowsEmitted, rfKind, rfBloomBytes}`. `docsRead` counts every live doc the Lucene scorer iterated over; `docsMatched` counts those emitted into the Arrow bridge — their delta is the observable effect of the runtime filter at the Lucene level.
+4. Coordinator accumulates every `ExecuteFragmentResponse` in a thread-local list (`VeloxExecutionEngine.profileAccumulator`), hands them to `OlapProfileAssembler.buildPlan` which produces a `ProfilePlanNode` tree, and calls `QueryProfiling.current().setPlanRoot(root)`.
+5. SQL plugin's `SimpleJsonResponseFormatter` snapshots the profile and emits it as `profile.plan` in the PPL response.
+
+**User verification** for "did Lucene BLOOM narrow the scan?": run the same query twice with `profile=true`, once with `runtime_filter_enabled=false` (baseline) and once forced to BLOOM via low TERMS cap. Compare `docsMatched` across the leaf-task nodes — BLOOM should narrow. See `ProfileBloomNarrowsScanIT` for the encoded assertion.
+
+Wire format: `ExecuteFragmentRequest.profileEnabled` (boolean trailer), `ExecuteFragmentResponse.taskProfile` (optional `OlapTaskProfile` block, tagged by leading bool).
+
 ## Known issues / TODOs
 - **OpenSearch doc values types**: OpenSearch stores all numeric types as `SORTED_NUMERIC` (not `NUMERIC`) and keyword/text as `SORTED_SET` (not `SORTED`). `LuceneArrowReader.mapToDocValueType()` handles this.
 - **Arrow Text → String**: Arrow Utf8 vectors return `org.apache.arrow.vector.util.Text` objects. Must convert to `String` before passing to `ExprValueUtils.tupleValue()` in `VeloxExecutionEngine.readArrowIpcToExprValues()`.

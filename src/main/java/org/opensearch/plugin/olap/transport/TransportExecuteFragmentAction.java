@@ -45,6 +45,7 @@ import org.opensearch.plugin.olap.execution.OlapBloomFilter;
 import org.opensearch.plugin.olap.execution.RuntimeFilterBuilder;
 import org.opensearch.plugin.olap.execution.VeloxExecutor;
 import org.opensearch.plugin.olap.execution.VeloxLifecycleService;
+import org.opensearch.plugin.olap.profile.OlapTaskProfile;
 import org.opensearch.tasks.Task;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.TransportException;
@@ -155,6 +156,9 @@ public class TransportExecuteFragmentAction
     ExternalStreamBridge bridge = new ExternalStreamBridge(veloxLifecycle.getSession());
     LuceneArrowReader reader = new LuceneArrowReader(indicesService, bridge.getAllocator());
 
+    final LuceneArrowReader.ScanStats scanStats =
+        request.isProfileEnabled() ? new LuceneArrowReader.ScanStats() : null;
+    final long startNanos = System.nanoTime();
     try {
       bridge.open();
 
@@ -180,10 +184,11 @@ public class TransportExecuteFragmentAction
                           request.getSourceIndex(),
                           bridge,
                           finalPushdownQuery,
-                          segmentExecutor);
+                          segmentExecutor,
+                          scanStats);
                     } else {
                       reader.readShardIntoStream(
-                          shardId, request.getSourceIndex(), bridge, finalPushdownQuery);
+                          shardId, request.getSourceIndex(), bridge, finalPushdownQuery, scanStats);
                     }
                   }
                   bridge.noMoreInput();
@@ -227,6 +232,7 @@ public class TransportExecuteFragmentAction
         response = ExecuteFragmentResponse.success(bridge.getRowCount(), resultData);
       }
 
+      attachTaskProfile(request, response, scanStats, startNanos);
       return response;
 
     } catch (Exception e) {
@@ -235,6 +241,47 @@ public class TransportExecuteFragmentAction
     } finally {
       bridge.close();
     }
+  }
+
+  /**
+   * Stamp the response with a task profile when the coordinator requested profiling. {@code rfKind}
+   * is derived from the request trailers; for queries without a runtime filter this is {@code
+   * NONE}, which lets the user clearly see "no RF was applied on this task" in the profile output.
+   */
+  private void attachTaskProfile(
+      ExecuteFragmentRequest request,
+      ExecuteFragmentResponse response,
+      LuceneArrowReader.ScanStats scanStats,
+      long startNanos) {
+    if (!request.isProfileEnabled()
+        || response.getStatus() != ExecuteFragmentResponse.Status.SUCCESS) {
+      return;
+    }
+    String rfKind;
+    int bloomBytes = 0;
+    if (request.hasBloomFilter()) {
+      rfKind = "BLOOM";
+      bloomBytes = request.getRfBloomBytes() == null ? 0 : request.getRfBloomBytes().length;
+    } else if (request.hasTermsFilter()) {
+      rfKind = "TERMS";
+    } else {
+      rfKind = "NONE";
+    }
+    long duration = System.nanoTime() - startNanos;
+    long docsRead = scanStats == null ? 0 : scanStats.getDocsRead();
+    long docsMatched = scanStats == null ? 0 : scanStats.getDocsMatched();
+    String nodeId = clusterService.localNode() == null ? "" : clusterService.localNode().getId();
+    response.setTaskProfile(
+        new OlapTaskProfile(
+            request.getFragmentId(),
+            request.getPartitionId(),
+            nodeId,
+            duration,
+            docsRead,
+            docsMatched,
+            response.getRowCount(),
+            rfKind,
+            bloomBytes));
   }
 
   // ---- Broadcast Join Execution ----
@@ -255,6 +302,10 @@ public class TransportExecuteFragmentAction
     Session session = veloxLifecycle.getSession();
     VeloxExecutor executor = new VeloxExecutor(session);
     String connectorId = "connector-external-stream";
+
+    final LuceneArrowReader.ScanStats scanStats =
+        request.isProfileEnabled() ? new LuceneArrowReader.ScanStats() : null;
+    final long startNanos = System.nanoTime();
 
     // Find the two TableScanNode IDs in the join plan.
     // broadcastBuildScanIndex tells us which scan is the build side (default 1 = right).
@@ -332,10 +383,15 @@ public class TransportExecuteFragmentAction
                           request.getSourceIndex(),
                           probeBridge,
                           finalCombinedQuery,
-                          segmentExecutor);
+                          segmentExecutor,
+                          scanStats);
                     } else {
                       reader.readShardIntoStream(
-                          shardId, request.getSourceIndex(), probeBridge, finalCombinedQuery);
+                          shardId,
+                          request.getSourceIndex(),
+                          probeBridge,
+                          finalCombinedQuery,
+                          scanStats);
                     }
                   }
                   probeBridge.noMoreInput();
@@ -398,6 +454,7 @@ public class TransportExecuteFragmentAction
         response = ExecuteFragmentResponse.success(probeBridge.getRowCount(), resultData);
       }
 
+      attachTaskProfile(request, response, scanStats, startNanos);
       return response;
 
     } catch (Exception e) {
@@ -428,6 +485,10 @@ public class TransportExecuteFragmentAction
     ExternalStreamBridge bridge = new ExternalStreamBridge(session);
     LuceneArrowReader reader = new LuceneArrowReader(indicesService, bridge.getAllocator());
 
+    final LuceneArrowReader.ScanStats scanStats =
+        request.isProfileEnabled() ? new LuceneArrowReader.ScanStats() : null;
+    final long startNanos = System.nanoTime();
+
     try {
       bridge.open();
       List<String> scanFields = extractScanFields(request.getPlanFragmentJson());
@@ -439,7 +500,8 @@ public class TransportExecuteFragmentAction
               () -> {
                 try {
                   for (ShardId shardId : request.getShardIds()) {
-                    reader.readShardIntoStream(shardId, request.getSourceIndex(), bridge, null);
+                    reader.readShardIntoStream(
+                        shardId, request.getSourceIndex(), bridge, null, scanStats);
                   }
                   bridge.noMoreInput();
                 } catch (Throwable e) {
@@ -506,7 +568,9 @@ public class TransportExecuteFragmentAction
       feederThread.join(30_000);
       logger.info("Shuffle scan complete: {} rows sent for query {}", totalRows, queryId);
 
-      return ExecuteFragmentResponse.success(totalRows, new byte[0]);
+      ExecuteFragmentResponse resp = ExecuteFragmentResponse.success(totalRows, new byte[0]);
+      attachTaskProfile(request, resp, scanStats, startNanos);
+      return resp;
 
     } catch (Exception e) {
       logger.error("Shuffle scan execution failed for query {}", queryId, e);
@@ -533,6 +597,8 @@ public class TransportExecuteFragmentAction
     Session session = veloxLifecycle.getSession();
     VeloxExecutor executor = new VeloxExecutor(session);
     String connectorId = "connector-external-stream";
+
+    final long startNanos = System.nanoTime();
 
     // Get or create the shuffle buffer and set expected sender counts
     ShuffleManager.ShuffleBuffer buffer = shuffleManager.getOrCreateBuffer(shuffleQueryId, stageId);
@@ -626,6 +692,7 @@ public class TransportExecuteFragmentAction
         response = ExecuteFragmentResponse.success(0, resultData);
       }
 
+      attachTaskProfile(request, response, null, startNanos);
       return response;
 
     } catch (Exception e) {

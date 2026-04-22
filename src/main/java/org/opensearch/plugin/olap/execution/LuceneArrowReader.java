@@ -10,6 +10,7 @@ import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.LongAdder;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.types.FloatingPointPrecision;
@@ -66,10 +67,50 @@ public class LuceneArrowReader {
     this.allocator = allocator;
   }
 
+  /**
+   * Thread-safe accumulator for scan statistics surfaced up through feeder threads back to the
+   * dispatcher. {@code docsRead} counts every live doc the reader visited (for a full scan this is
+   * the shard's maxDoc minus deletions; for a pushdown scan it is the number of docs the Lucene
+   * scorer's iterator advanced over) — i.e., the universe the runtime filter acted on. {@code
+   * docsMatched} counts docs actually emitted into the Arrow bridge.
+   *
+   * <p>The delta between the two is the observable effect of BLOOM/TERMS pushdown: if BLOOM is
+   * narrowing the scan at the Lucene level, {@code docsMatched} will be meaningfully below {@code
+   * docsRead} for queries where the join selectivity is low. This is the signal the "profile=true"
+   * flow reports back to the user.
+   */
+  public static final class ScanStats {
+    private final LongAdder docsRead = new LongAdder();
+    private final LongAdder docsMatched = new LongAdder();
+
+    public void addDocsRead(long n) {
+      docsRead.add(n);
+    }
+
+    public void addDocsMatched(long n) {
+      docsMatched.add(n);
+    }
+
+    public long getDocsRead() {
+      return docsRead.sum();
+    }
+
+    public long getDocsMatched() {
+      return docsMatched.sum();
+    }
+  }
+
   /** Read all doc values from a shard and feed them into the ExternalStreamBridge (full scan). */
   public void readShardIntoStream(ShardId shardId, String indexName, ExternalStreamBridge bridge)
       throws IOException {
-    readShardIntoStream(shardId, indexName, bridge, null);
+    readShardIntoStream(shardId, indexName, bridge, null, null);
+  }
+
+  /** Back-compat overload that discards scan stats. */
+  public void readShardIntoStream(
+      ShardId shardId, String indexName, ExternalStreamBridge bridge, Query pushdownQuery)
+      throws IOException {
+    readShardIntoStream(shardId, indexName, bridge, pushdownQuery, null);
   }
 
   /**
@@ -82,9 +123,14 @@ public class LuceneArrowReader {
    * <p>When {@code pushdownQuery} is null, falls back to a full scan of all documents.
    *
    * @param pushdownQuery optional Lucene query for predicate pushdown; null means full scan
+   * @param stats optional scan counters; null when profiling is disabled
    */
   public void readShardIntoStream(
-      ShardId shardId, String indexName, ExternalStreamBridge bridge, Query pushdownQuery)
+      ShardId shardId,
+      String indexName,
+      ExternalStreamBridge bridge,
+      Query pushdownQuery,
+      ScanStats stats)
       throws IOException {
     IndexService indexService = indicesService.indexServiceSafe(shardId.getIndex());
     IndexShard shard = indexService.getShard(shardId.id());
@@ -96,9 +142,9 @@ public class LuceneArrowReader {
       ArrowBatchBuilder batchBuilder = new ArrowBatchBuilder(allocator, columnSpecs, BATCH_SIZE);
 
       if (pushdownQuery != null) {
-        readWithPushdown(searcher, batchBuilder, bridge, shardId, pushdownQuery);
+        readWithPushdown(searcher, batchBuilder, bridge, shardId, pushdownQuery, stats);
       } else {
-        readFullScan(searcher, batchBuilder, bridge, shardId);
+        readFullScan(searcher, batchBuilder, bridge, shardId, stats);
       }
 
       logger.debug(
@@ -125,6 +171,18 @@ public class LuceneArrowReader {
       Query pushdownQuery,
       ExecutorService segmentExecutor)
       throws IOException {
+    readShardIntoStreamParallel(shardId, indexName, bridge, pushdownQuery, segmentExecutor, null);
+  }
+
+  /** Parallel variant with optional scan-stats accumulator. */
+  public void readShardIntoStreamParallel(
+      ShardId shardId,
+      String indexName,
+      ExternalStreamBridge bridge,
+      Query pushdownQuery,
+      ExecutorService segmentExecutor,
+      ScanStats stats)
+      throws IOException {
     IndexService indexService = indicesService.indexServiceSafe(shardId.getIndex());
     IndexShard shard = indexService.getShard(shardId.id());
 
@@ -136,9 +194,9 @@ public class LuceneArrowReader {
         // Single segment — no benefit from parallelism, use sequential path
         ArrowBatchBuilder batchBuilder = new ArrowBatchBuilder(allocator, columnSpecs, BATCH_SIZE);
         if (pushdownQuery != null) {
-          readWithPushdown(searcher, batchBuilder, bridge, shardId, pushdownQuery);
+          readWithPushdown(searcher, batchBuilder, bridge, shardId, pushdownQuery, stats);
         } else {
-          readFullScan(searcher, batchBuilder, bridge, shardId);
+          readFullScan(searcher, batchBuilder, bridge, shardId, stats);
         }
         return;
       }
@@ -155,6 +213,7 @@ public class LuceneArrowReader {
       // Submit one task per segment
       List<Future<?>> futures = new ArrayList<>(leaves.size());
       final Weight finalWeight = weight;
+      final ScanStats finalStats = stats;
       for (LeafReaderContext leafCtx : leaves) {
         futures.add(
             segmentExecutor.submit(
@@ -164,9 +223,10 @@ public class LuceneArrowReader {
                     ArrowBatchBuilder taskBuilder =
                         new ArrowBatchBuilder(allocator, columnSpecs, BATCH_SIZE);
                     if (finalWeight != null) {
-                      readSegmentWithPushdown(taskBuilder, bridge, shardId, leafCtx, finalWeight);
+                      readSegmentWithPushdown(
+                          taskBuilder, bridge, shardId, leafCtx, finalWeight, finalStats);
                     } else {
-                      readSegmentFullScan(taskBuilder, bridge, shardId, leafCtx);
+                      readSegmentFullScan(taskBuilder, bridge, shardId, leafCtx, finalStats);
                     }
                   } catch (IOException e) {
                     throw new RuntimeException(
@@ -209,10 +269,11 @@ public class LuceneArrowReader {
       Engine.Searcher searcher,
       ArrowBatchBuilder batchBuilder,
       ExternalStreamBridge bridge,
-      ShardId shardId)
+      ShardId shardId,
+      ScanStats stats)
       throws IOException {
     for (LeafReaderContext leafCtx : searcher.getIndexReader().leaves()) {
-      readSegmentFullScan(batchBuilder, bridge, shardId, leafCtx);
+      readSegmentFullScan(batchBuilder, bridge, shardId, leafCtx, stats);
     }
   }
 
@@ -222,14 +283,15 @@ public class LuceneArrowReader {
       ArrowBatchBuilder batchBuilder,
       ExternalStreamBridge bridge,
       ShardId shardId,
-      Query pushdownQuery)
+      Query pushdownQuery,
+      ScanStats stats)
       throws IOException {
     Query rewritten = searcher.rewrite(pushdownQuery);
     Weight weight = searcher.createWeight(rewritten, ScoreMode.COMPLETE_NO_SCORES, 1.0f);
 
     long rowCountBefore = bridge.getRowCount();
     for (LeafReaderContext leafCtx : searcher.getIndexReader().leaves()) {
-      readSegmentWithPushdown(batchBuilder, bridge, shardId, leafCtx, weight);
+      readSegmentWithPushdown(batchBuilder, bridge, shardId, leafCtx, weight, stats);
     }
     long docsMatched = bridge.getRowCount() - rowCountBefore;
     logger.debug("Pushdown scan completed for shard {}: {} docs matched", shardId, docsMatched);
@@ -242,9 +304,16 @@ public class LuceneArrowReader {
       ArrowBatchBuilder batchBuilder,
       ExternalStreamBridge bridge,
       ShardId shardId,
-      LeafReaderContext leafCtx)
+      LeafReaderContext leafCtx,
+      ScanStats stats)
       throws IOException {
     int maxDoc = leafCtx.reader().maxDoc();
+    if (stats != null) {
+      // For a full scan docsRead == docsMatched == maxDoc; record once per segment so the
+      // accumulator reflects the real universe the RF acted on (zero pushdown selectivity).
+      stats.addDocsRead(maxDoc);
+      stats.addDocsMatched(maxDoc);
+    }
     for (int startDoc = 0; startDoc < maxDoc; startDoc += BATCH_SIZE) {
       int endDoc = Math.min(startDoc + BATCH_SIZE, maxDoc);
       VectorSchemaRoot batch = batchBuilder.buildBatch(leafCtx.reader(), startDoc, endDoc);
@@ -260,8 +329,16 @@ public class LuceneArrowReader {
       ExternalStreamBridge bridge,
       ShardId shardId,
       LeafReaderContext leafCtx,
-      Weight weight)
+      Weight weight,
+      ScanStats stats)
       throws IOException {
+    // docsRead tracks the universe — the number of live docs in this segment that the pushdown
+    // query had to examine, regardless of whether the scorer admitted them. Comparing this to
+    // docsMatched below is the only honest way to see whether a BLOOM RF actually narrowed the
+    // Lucene scan.
+    if (stats != null) {
+      stats.addDocsRead(leafCtx.reader().maxDoc());
+    }
     Scorer scorer = weight.scorer(leafCtx);
     if (scorer == null) {
       logger.trace("Pushdown: no matches in shard {} segment {}", shardId, leafCtx.ord);
@@ -271,11 +348,13 @@ public class LuceneArrowReader {
     DocIdSetIterator docIdIter = scorer.iterator();
     int[] batch = new int[BATCH_SIZE];
     int count = 0;
+    long emitted = 0;
 
     for (int docId = docIdIter.nextDoc();
         docId != DocIdSetIterator.NO_MORE_DOCS;
         docId = docIdIter.nextDoc()) {
       batch[count++] = docId;
+      emitted++;
       if (count == BATCH_SIZE) {
         VectorSchemaRoot arrowBatch = batchBuilder.buildBatch(leafCtx.reader(), batch, count);
         bridge.feedBatch(arrowBatch);
@@ -286,6 +365,10 @@ public class LuceneArrowReader {
     if (count > 0) {
       VectorSchemaRoot arrowBatch = batchBuilder.buildBatch(leafCtx.reader(), batch, count);
       bridge.feedBatch(arrowBatch);
+    }
+
+    if (stats != null) {
+      stats.addDocsMatched(emitted);
     }
   }
 

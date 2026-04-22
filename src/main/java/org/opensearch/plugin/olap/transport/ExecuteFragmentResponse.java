@@ -12,6 +12,7 @@ import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
 import org.opensearch.core.xcontent.ToXContentObject;
 import org.opensearch.core.xcontent.XContentBuilder;
+import org.opensearch.plugin.olap.profile.OlapTaskProfile;
 
 /**
  * Response from executing a Velox plan fragment on a data node.
@@ -44,6 +45,12 @@ public class ExecuteFragmentResponse extends ActionResponse implements ToXConten
    */
   private byte[] partialBloomBytes;
 
+  /**
+   * Optional per-task profile populated on the data node when {@code
+   * ExecuteFragmentRequest.profileEnabled} is true. Null otherwise (empty-length trailer on wire).
+   */
+  private OlapTaskProfile taskProfile;
+
   private String errorMessage;
 
   public ExecuteFragmentResponse() {}
@@ -69,6 +76,10 @@ public class ExecuteFragmentResponse extends ActionResponse implements ToXConten
     // PARTIAL bloom bytes trailer: always a length-prefixed byte array, zero-length means none.
     byte[] partial = in.readByteArray();
     this.partialBloomBytes = partial.length == 0 ? null : partial;
+    // Task profile trailer: tagged by a single boolean.
+    if (in.readBoolean()) {
+      this.taskProfile = new OlapTaskProfile(in);
+    }
   }
 
   public ExecuteFragmentResponse(Status status, long rowCount, byte[] resultData) {
@@ -116,6 +127,12 @@ public class ExecuteFragmentResponse extends ActionResponse implements ToXConten
     }
     out.writeOptionalString(errorMessage);
     out.writeByteArray(partialBloomBytes == null ? EMPTY_BYTES : partialBloomBytes);
+    if (taskProfile != null) {
+      out.writeBoolean(true);
+      taskProfile.writeTo(out);
+    } else {
+      out.writeBoolean(false);
+    }
   }
 
   private static final byte[] EMPTY_BYTES = new byte[0];
@@ -162,6 +179,18 @@ public class ExecuteFragmentResponse extends ActionResponse implements ToXConten
 
   public void setPartialBloomBytes(byte[] partialBloomBytes) {
     this.partialBloomBytes = partialBloomBytes;
+  }
+
+  public OlapTaskProfile getTaskProfile() {
+    return taskProfile;
+  }
+
+  public boolean hasTaskProfile() {
+    return taskProfile != null;
+  }
+
+  public void setTaskProfile(OlapTaskProfile taskProfile) {
+    this.taskProfile = taskProfile;
   }
 
   public String getErrorMessage() {

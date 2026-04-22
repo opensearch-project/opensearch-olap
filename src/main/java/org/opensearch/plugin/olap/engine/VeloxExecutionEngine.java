@@ -88,6 +88,7 @@ import org.opensearch.plugin.olap.plan.fragment.FragmentProperties;
 import org.opensearch.plugin.olap.plan.fragment.PlanFragment;
 import org.opensearch.plugin.olap.plan.physical.PhysicalOptimizer;
 import org.opensearch.plugin.olap.plan.physical.VeloxPlanGenerator;
+import org.opensearch.plugin.olap.profile.OlapProfileAssembler;
 import org.opensearch.plugin.olap.scheduler.CostEstimator;
 import org.opensearch.plugin.olap.scheduler.ExecutionPolicy;
 import org.opensearch.plugin.olap.scheduler.JoinStrategy;
@@ -105,6 +106,8 @@ import org.opensearch.sql.data.type.ExprCoreType;
 import org.opensearch.sql.data.type.ExprType;
 import org.opensearch.sql.executor.ExecutionEngine;
 import org.opensearch.sql.executor.pagination.Cursor;
+import org.opensearch.sql.monitor.profile.ProfileContext;
+import org.opensearch.sql.monitor.profile.QueryProfiling;
 import org.opensearch.transport.TransportService;
 
 /**
@@ -174,6 +177,16 @@ public class VeloxExecutionEngine {
     QueryId queryId = QueryId.generate();
     logger.info("Executing query {} via Velox engine", queryId);
 
+    // Reset query-scoped profile accumulator. Populated by every NodeResultCollector dispatch
+    // and by local coordinator fragment execution. The assembler consumes it at the end of
+    // execute() to hand a ProfilePlanNode tree to QueryProfiling.current().setPlanRoot.
+    profileAccumulator.set(null);
+    profileRfSummary.set(null);
+    boolean profile = QueryProfiling.current().isEnabled();
+    if (profile) {
+      profileAccumulator.set(new ArrayList<>());
+    }
+
     try {
       // Step 0: Collect CBO statistics (row counts) if enabled.
       // Stats are used for join reorder (planning time) and MPP strategy selection (execution
@@ -202,11 +215,62 @@ public class VeloxExecutionEngine {
         }
       }
 
-      return executeFragments(relNode, fragments, queryId, statsMap);
+      ExecutionEngine.QueryResponse result =
+          executeFragments(relNode, fragments, queryId, statsMap);
+
+      if (profile) {
+        List<ExecuteFragmentResponse> collected = profileAccumulator.get();
+        if (collected != null && !collected.isEmpty()) {
+          ProfileContext ctx = QueryProfiling.current();
+          ctx.setPlanRoot(OlapProfileAssembler.buildPlan(profileRfSummary.get(), collected));
+        }
+      }
+
+      return result;
 
     } catch (Exception e) {
       logger.error("Velox execution failed for query {}", queryId, e);
       throw new RuntimeException("Velox execution failed: " + e.getMessage(), e);
+    } finally {
+      profileAccumulator.remove();
+      profileRfSummary.remove();
+    }
+  }
+
+  /**
+   * Query-scoped accumulator for data-node profiles. Populated by {@link #newCollector()} and by
+   * paths that have their own response lists (broadcast/shuffle execution). Consumed once in {@link
+   * #execute(RelNode)} before returning.
+   */
+  private final ThreadLocal<List<ExecuteFragmentResponse>> profileAccumulator = new ThreadLocal<>();
+
+  /** Optional label describing the runtime filter applied (e.g. "rf=BLOOM bloomBytes=512"). */
+  private final ThreadLocal<String> profileRfSummary = new ThreadLocal<>();
+
+  /** Set the RF summary string surfaced in the profile root node. No-op if profile disabled. */
+  private void recordProfileRf(String summary) {
+    if (profileAccumulator.get() != null) {
+      profileRfSummary.set(summary);
+    }
+  }
+
+  /**
+   * Factory for a {@link NodeResultCollector} with profile state wired in. Prefer this over
+   * instantiating directly so every execution path picks up profile=true uniformly.
+   */
+  private NodeResultCollector newCollector() {
+    NodeResultCollector c =
+        new NodeResultCollector(
+            transportService, queryScheduler, veloxLifecycle.getTaskMaxRetries());
+    c.setProfileEnabled(profileAccumulator.get() != null);
+    return c;
+  }
+
+  /** Record a batch of fragment responses for later profile assembly. No-op if profile disabled. */
+  private void recordProfileResponses(List<ExecuteFragmentResponse> responses) {
+    List<ExecuteFragmentResponse> acc = profileAccumulator.get();
+    if (acc != null && responses != null) {
+      acc.addAll(responses);
     }
   }
 
@@ -258,14 +322,13 @@ public class VeloxExecutionEngine {
 
     // Default coordinator-centric path (mpp_enabled=false or non-join queries)
     QueryExecution execution = queryScheduler.schedule(fragments, ExecutionPolicy.PHASED);
-    NodeResultCollector collector =
-        new NodeResultCollector(
-            transportService, queryScheduler, veloxLifecycle.getTaskMaxRetries());
+    NodeResultCollector collector = newCollector();
     List<Stage> leafStages = execution.getLeafStages();
 
     // Phase 1: Dispatch all leaf stages to data nodes
     List<ExecuteFragmentResponse> leafResponses =
         collector.dispatchAndCollect(execution, leafStages);
+    recordProfileResponses(leafResponses);
 
     // Phase 2: Execute coordinator fragment if present
     if (coordinatorFragment == null || coordinatorFragment.getPlanRoot() == null) {
@@ -370,9 +433,7 @@ public class VeloxExecutionEngine {
                 List.of(0)));
 
     QueryExecution execution = queryScheduler.schedule(adjustedFragments, ExecutionPolicy.PHASED);
-    NodeResultCollector collector =
-        new NodeResultCollector(
-            transportService, queryScheduler, veloxLifecycle.getTaskMaxRetries());
+    NodeResultCollector collector = newCollector();
 
     // Phase 1: Dispatch build stage, collect results. If two-stage BLOOM is opted in, ask each
     // data node to produce a PARTIAL bloom over the build-side join key column alongside its
@@ -422,6 +483,7 @@ public class VeloxExecutionEngine {
     } else {
       buildResponses = collector.dispatchAndCollect(execution, buildStages);
     }
+    recordProfileResponses(buildResponses);
 
     // Convert build-side results to native serde for broadcast
     List<byte[]> broadcastData = new ArrayList<>();
@@ -480,6 +542,15 @@ public class VeloxExecutionEngine {
     List<ExecuteFragmentResponse> joinResponses =
         collector.dispatchAndCollectBroadcast(
             execution, broadcastStages, broadcastData, buildScanIndex, rfPayload, probePlanJson);
+    recordProfileResponses(joinResponses);
+    if (rfPayload != null && rfPayload.getKind() != null) {
+      recordProfileRf(
+          "rf="
+              + rfPayload.getKind().name()
+              + (rfPayload.getKind().name().equals("BLOOM") && rfPayload.getBloomBytes() != null
+                  ? " bloomBytes=" + rfPayload.getBloomBytes().length
+                  : ""));
+    }
 
     return buildQueryResponse(relNode.getRowType(), joinResponses);
   }
@@ -524,9 +595,7 @@ public class VeloxExecutionEngine {
     }
 
     QueryExecution execution = queryScheduler.schedule(adjustedFragments, ExecutionPolicy.PHASED);
-    NodeResultCollector collector =
-        new NodeResultCollector(
-            transportService, queryScheduler, veloxLifecycle.getTaskMaxRetries());
+    NodeResultCollector collector = newCollector();
 
     // Identify shuffle scan stages and the join worker stage
     List<Stage> shuffleScanStages = new ArrayList<>();
@@ -582,6 +651,7 @@ public class VeloxExecutionEngine {
     List<ExecuteFragmentResponse> scanResponses =
         collector.dispatchAndCollectShuffle(
             execution, shuffleScanStages, workerNodeIds, targetStageId);
+    recordProfileResponses(scanResponses);
     logger.info(
         "Shuffle scan phase complete: {} responses for query {}", scanResponses.size(), queryId);
 
@@ -595,6 +665,7 @@ public class VeloxExecutionEngine {
             targetStageId,
             leftSenderCount,
             rightSenderCount);
+    recordProfileResponses(joinResponses);
 
     return buildQueryResponse(relNode.getRowType(), joinResponses);
   }
