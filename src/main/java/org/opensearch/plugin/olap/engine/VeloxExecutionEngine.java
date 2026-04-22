@@ -41,6 +41,7 @@ import org.apache.calcite.rel.type.RelDataTypeField;
 import org.apache.calcite.sql.type.SqlTypeName;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.apache.lucene.util.BytesRef;
 import org.boostscale.velox4j.aggregate.Aggregate;
 import org.boostscale.velox4j.arrow.Arrow;
 import org.boostscale.velox4j.config.Config;
@@ -79,6 +80,8 @@ import org.boostscale.velox4j.type.VarCharType;
 import org.boostscale.velox4j.type.VarbinaryType;
 import org.opensearch.common.util.concurrent.FutureUtils;
 import org.opensearch.plugin.olap.common.QueryId;
+import org.opensearch.plugin.olap.execution.OlapBloomFilter;
+import org.opensearch.plugin.olap.execution.RuntimeFilterPayload;
 import org.opensearch.plugin.olap.execution.VeloxExecutor;
 import org.opensearch.plugin.olap.execution.VeloxLifecycleService;
 import org.opensearch.plugin.olap.plan.fragment.FragmentProperties;
@@ -371,13 +374,58 @@ public class VeloxExecutionEngine {
         new NodeResultCollector(
             transportService, queryScheduler, veloxLifecycle.getTaskMaxRetries());
 
-    // Phase 1: Dispatch build stage, collect results
+    // Phase 1: Dispatch build stage, collect results. If two-stage BLOOM is opted in, ask each
+    // data node to produce a PARTIAL bloom over the build-side join key column alongside its
+    // normal Arrow output, sized identically across all nodes (so the partials can be OR-merged
+    // at the coordinator).
     List<Stage> buildStages = execution.getLeafStages();
-    List<ExecuteFragmentResponse> buildResponses =
-        collector.dispatchAndCollect(execution, buildStages);
+
+    boolean rfEnabled = veloxLifecycle.isRuntimeFilterEnabled() && isInnerJoin(coordinatorFragment);
+    boolean twoStageBloom =
+        rfEnabled
+            && veloxLifecycle.isRuntimeFilterBloomEnabled()
+            && veloxLifecycle.isRuntimeFilterBloomTwoStage();
+
+    String buildJoinKeyName = null;
+    String probeFieldType = null;
+    String probeFieldName = null;
+    if (twoStageBloom) {
+      HashJoinNode joinNode = findHashJoinNode(coordinatorFragment.getPlanRoot());
+      if (joinNode != null) {
+        List<FieldAccessTypedExpr> buildKeys =
+            (buildScanIndex == 0) ? joinNode.getLeftKeys() : joinNode.getRightKeys();
+        if (!buildKeys.isEmpty()) {
+          buildJoinKeyName = buildKeys.get(0).getFieldName();
+          String rawProbeFieldName = extractProbeJoinKeyField(coordinatorFragment, buildScanIndex);
+          probeFieldName =
+              rawProbeFieldName == null ? null : rawProbeFieldName.replaceAll("\\d+$", "");
+          probeFieldType = extractProbeJoinKeyType(relNode, probeFieldName);
+        }
+      }
+      // Suppress PARTIAL bloom build if the field type isn't bloom-compatible.
+      if (probeFieldType == null || !OlapBloomFilter.isSupportedType(probeFieldType)) {
+        twoStageBloom = false;
+      }
+    }
+
+    List<ExecuteFragmentResponse> buildResponses;
+    if (twoStageBloom && buildJoinKeyName != null) {
+      int expectedInsertions = veloxLifecycle.getRuntimeFilterBloomMaxCardinality();
+      buildResponses =
+          collector.dispatchAndCollectWithPartialBloom(
+              execution, buildStages, buildJoinKeyName, probeFieldType, expectedInsertions);
+      logger.info(
+          "Two-stage BLOOM build requested for query {}: field={}, expectedInsertions={}",
+          queryId,
+          buildJoinKeyName,
+          expectedInsertions);
+    } else {
+      buildResponses = collector.dispatchAndCollect(execution, buildStages);
+    }
 
     // Convert build-side results to native serde for broadcast
     List<byte[]> broadcastData = new ArrayList<>();
+    List<byte[]> partialBloomBytesList = new ArrayList<>();
     for (ExecuteFragmentResponse resp : buildResponses) {
       if (resp.getStatus() != ExecuteFragmentResponse.Status.SUCCESS) continue;
       if (resp.hasNativeResults()) {
@@ -385,27 +433,29 @@ public class VeloxExecutionEngine {
       } else if (resp.getResultData() != null && resp.getResultData().length > 0) {
         broadcastData.addAll(arrowIpcToNativeBatches(resp.getResultData()));
       }
+      if (resp.hasPartialBloom()) {
+        partialBloomBytesList.add(resp.getPartialBloomBytes());
+      }
     }
     logger.info(
-        "Broadcast: collected {} build-side batches for query {}", broadcastData.size(), queryId);
+        "Broadcast: collected {} build-side batches, {} partial blooms for query {}",
+        broadcastData.size(),
+        partialBloomBytesList.size(),
+        queryId);
 
-    // Phase 1.5: Extract runtime filter from build-side data
-    String rfFieldName = null;
-    String rfFieldType = null;
-    List<String> rfValues = null;
-
-    if (veloxLifecycle.isRuntimeFilterEnabled()
-        && !broadcastData.isEmpty()
-        && isInnerJoin(coordinatorFragment)) {
-      rfValues = extractRuntimeFilter(coordinatorFragment, buildScanIndex, broadcastData, queryId);
-      if (rfValues != null) {
-        // Determine probe-side join key field name and type from the coordinator plan
-        rfFieldName = extractProbeJoinKeyField(coordinatorFragment, buildScanIndex);
-        rfFieldType = extractProbeJoinKeyType(relNode, rfFieldName);
-        if (rfFieldName == null || rfFieldType == null) {
-          rfValues = null; // can't build RF without field metadata
-        }
-      }
+    // Phase 1.5: Extract runtime filter from build-side data. extractRuntimeFilter chooses
+    // TERMS/BLOOM/NONE based on observed cardinality vs. the configured caps. When two-stage
+    // blooms were requested, the partial bytes are folded directly.
+    RuntimeFilterPayload rfPayload = RuntimeFilterPayload.none();
+    if (rfEnabled && !broadcastData.isEmpty()) {
+      rfPayload =
+          extractRuntimeFilter(
+              coordinatorFragment,
+              buildScanIndex,
+              broadcastData,
+              queryId,
+              relNode,
+              partialBloomBytesList);
     }
 
     // Extract probe-side pushdown from the probe leaf fragment's plan.
@@ -427,19 +477,9 @@ public class VeloxExecutionEngine {
       }
     }
 
-    final String finalRfFieldName = rfFieldName;
-    final String finalRfFieldType = rfFieldType;
-    final List<String> finalRfValues = rfValues;
     List<ExecuteFragmentResponse> joinResponses =
         collector.dispatchAndCollectBroadcast(
-            execution,
-            broadcastStages,
-            broadcastData,
-            buildScanIndex,
-            finalRfFieldName,
-            finalRfFieldType,
-            finalRfValues,
-            probePlanJson);
+            execution, broadcastStages, broadcastData, buildScanIndex, rfPayload, probePlanJson);
 
     return buildQueryResponse(relNode.getRowType(), joinResponses);
   }
@@ -1031,63 +1071,150 @@ public class VeloxExecutionEngine {
   // ---- Runtime Filter Helpers ----
 
   /**
-   * Extract distinct join key values from build-side Velox native batches for runtime filter.
-   * Returns a list of string-encoded values, or null if RF should be skipped (too many values or
-   * error).
+   * Extract a runtime filter from the build side of a broadcast join.
+   *
+   * <p>Chooses the RF kind by a cardinality ladder:
+   *
+   * <ul>
+   *   <li>≤ {@code runtime_filter_max_cardinality} → TERMS (distinct-value list, Lucene pushdown)
+   *   <li>(terms-cap, {@code runtime_filter_bloom_max_cardinality}] → BLOOM (bit-array, probe
+   *       feeder predicate)
+   *   <li>&gt; bloom-cap → NONE (abandon, same as pre-BLOOM behavior)
+   * </ul>
+   *
+   * <p>Two BLOOM construction paths:
+   *
+   * <ul>
+   *   <li><b>Single-stage</b> ({@code partialBloomBytesList} null/empty): the coordinator rebuilds
+   *       the bloom by iterating broadcast build rows in-process.
+   *   <li><b>Two-stage</b> ({@code partialBloomBytesList} non-empty): each data node has already
+   *       produced a PARTIAL bloom over its local build output with a coordinator-broadcast {@code
+   *       expectedInsertions}. The coordinator merges them via {@link OlapBloomFilter#merge}
+   *       (bitwise-OR) — cheaper in coordinator memory/CPU and prerequisite for BLOOM on shuffle
+   *       joins.
+   * </ul>
    */
-  private List<String> extractRuntimeFilter(
+  private RuntimeFilterPayload extractRuntimeFilter(
       PlanFragment coordinatorFragment,
       int buildScanIndex,
       List<byte[]> broadcastData,
-      QueryId queryId) {
+      QueryId queryId,
+      RelNode relNode,
+      List<byte[]> partialBloomBytesList) {
     try {
-      // Find the build-side join key column name from the HashJoinNode
       HashJoinNode joinNode = findHashJoinNode(coordinatorFragment.getPlanRoot());
-      if (joinNode == null) return null;
+      if (joinNode == null) return RuntimeFilterPayload.none();
 
       // buildScanIndex=0 means build is left, so build keys = leftKeys
       List<FieldAccessTypedExpr> buildKeys =
           (buildScanIndex == 0) ? joinNode.getLeftKeys() : joinNode.getRightKeys();
-      if (buildKeys.isEmpty()) return null;
+      if (buildKeys.isEmpty()) return RuntimeFilterPayload.none();
 
       // Use the first join key for RF (multi-key RF is future work)
       String buildKeyName = buildKeys.get(0).getFieldName();
 
-      // Deserialize build batches and extract distinct values
+      // Resolve the probe-side field name/type up-front. The join plan carries alias-suffixed
+      // names like "dept_id0" to disambiguate duplicate columns across the two sides; strip the
+      // trailing digits so (a) type lookup on the original RelNode matches, and (b) the field
+      // name pushed into Lucene on the probe side matches the real index mapping.
+      String rawProbeFieldName = extractProbeJoinKeyField(coordinatorFragment, buildScanIndex);
+      String probeFieldName =
+          rawProbeFieldName == null ? null : rawProbeFieldName.replaceAll("\\d+$", "");
+      String probeFieldType = extractProbeJoinKeyType(relNode, probeFieldName);
+
       Session session = veloxLifecycle.getSession();
+      int termsCap = veloxLifecycle.getRuntimeFilterMaxCardinality();
+      boolean bloomEnabled =
+          veloxLifecycle.isRuntimeFilterBloomEnabled()
+              && probeFieldType != null
+              && OlapBloomFilter.isSupportedType(probeFieldType);
+      int bloomCap = veloxLifecycle.getRuntimeFilterBloomMaxCardinality();
+
+      // Two-stage path: data nodes already built PARTIAL blooms with a coordinator-chosen
+      // expectedInsertions. Merge them via bitwise-OR and return a BLOOM payload directly —
+      // no need to iterate broadcast rows here.
+      if (bloomEnabled
+          && partialBloomBytesList != null
+          && !partialBloomBytesList.isEmpty()
+          && probeFieldName != null
+          && probeFieldType != null) {
+        List<OlapBloomFilter> partials = new ArrayList<>();
+        for (byte[] pb : partialBloomBytesList) {
+          if (pb == null || pb.length == 0) continue;
+          partials.add(OlapBloomFilter.fromBytes(pb));
+        }
+        if (!partials.isEmpty()) {
+          OlapBloomFilter merged = OlapBloomFilter.merge(partials);
+          byte[] bytes = merged.toBytes();
+          logger.info(
+              "RF extracted for query {}: field={}, kind=BLOOM (two-stage merged from {}"
+                  + " partials), {} bytes, setSizeBits={}, hashCount={}",
+              queryId,
+              buildKeyName,
+              partials.size(),
+              bytes.length,
+              merged.setSizeBits(),
+              merged.hashCount());
+          return RuntimeFilterPayload.bloom(probeFieldName, probeFieldType, bytes);
+        }
+      }
+
+      // Streaming build: while under the TERMS cap, keep a distinct-values set. On overflow
+      // (bloom enabled), initialize a bloom filter sized for bloomCap, replay seen values into
+      // it, and keep inserting. On overflow a second time (past bloomCap) abandon.
       Set<String> distinctValues = new LinkedHashSet<>();
-      int maxCardinality = veloxLifecycle.getRuntimeFilterMaxCardinality();
+      OlapBloomFilter bloom = null;
+      long bloomInserted = 0;
+      boolean bloomOverflow = false;
 
       for (byte[] batch : broadcastData) {
         BaseVector vec = session.baseVectorOps().deserializeOneFromBuf(batch);
         RowVector rowVec = vec.asRowVector();
         RowType rowType = (RowType) rowVec.getType();
 
-        // Find the column index for the build join key
         int keyColIndex = rowType.getNames().indexOf(buildKeyName);
         if (keyColIndex < 0) continue;
 
-        // Extract values from this batch
-        // RowVector columns are accessed by converting to Arrow and reading
-        // Simpler: serialize to JSON and parse (heavy), or use Velox accessors
-        // For now, use Arrow round-trip to read column values
         BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE);
         try {
           VectorSchemaRoot arrowRoot = Arrow.toArrowVectorSchemaRoot(allocator, rowVec);
           FieldVector fieldVec = arrowRoot.getVector(keyColIndex);
           for (int row = 0; row < arrowRoot.getRowCount(); row++) {
             Object val = fieldVec.getObject(row);
-            if (val != null) {
+            if (val == null) continue;
+
+            if (bloom == null) {
+              // TERMS accumulation phase.
               distinctValues.add(val.toString());
-            }
-            if (distinctValues.size() > maxCardinality) {
-              logger.info(
-                  "RF skipped for query {}: build cardinality {} exceeds max {}",
-                  queryId,
-                  distinctValues.size(),
-                  maxCardinality);
-              arrowRoot.close();
-              return null;
+              if (distinctValues.size() > termsCap) {
+                if (!bloomEnabled) {
+                  logger.info(
+                      "RF skipped for query {}: build cardinality {} exceeds terms cap {}"
+                          + " and BLOOM disabled/unsupported",
+                      queryId,
+                      distinctValues.size(),
+                      termsCap);
+                  arrowRoot.close();
+                  return RuntimeFilterPayload.none();
+                }
+                // Pivot to bloom: size for the full bloom cap, replay existing distinct values.
+                bloom = OlapBloomFilter.create(Math.max(bloomCap, distinctValues.size()));
+                for (String seen : distinctValues) {
+                  BytesRef enc = OlapBloomFilter.encodeKey(seen, probeFieldType);
+                  if (enc != null) bloom.add(enc);
+                }
+                bloomInserted = distinctValues.size();
+                distinctValues = null; // free memory
+              }
+            } else {
+              // BLOOM accumulation phase.
+              BytesRef enc = OlapBloomFilter.encodeKey(val, probeFieldType);
+              if (enc != null) bloom.add(enc);
+              bloomInserted++;
+              if (bloomInserted > bloomCap) {
+                bloomOverflow = true;
+                break;
+              }
             }
           }
           arrowRoot.close();
@@ -1098,20 +1225,49 @@ public class VeloxExecutionEngine {
             logger.debug("Arrow allocator close warning: {}", ex.getMessage());
           }
         }
+        if (bloomOverflow) break;
       }
 
-      if (distinctValues.isEmpty()) return null;
+      if (bloomOverflow) {
+        logger.info(
+            "RF skipped for query {}: build cardinality exceeds bloom cap {}", queryId, bloomCap);
+        return RuntimeFilterPayload.none();
+      }
+
+      if (bloom != null) {
+        byte[] bytes = bloom.toBytes();
+        logger.info(
+            "RF extracted for query {}: field={}, kind=BLOOM, ~{} values, {} bytes",
+            queryId,
+            buildKeyName,
+            bloomInserted,
+            bytes.length);
+        if (probeFieldName == null || probeFieldType == null) {
+          return RuntimeFilterPayload.none();
+        }
+        return RuntimeFilterPayload.bloom(probeFieldName, probeFieldType, bytes);
+      }
+
+      if (distinctValues == null || distinctValues.isEmpty()) {
+        return RuntimeFilterPayload.none();
+      }
 
       logger.info(
-          "RF extracted for query {}: field={}, {} distinct values",
+          "RF extracted for query {}: field={}, kind=TERMS, {} distinct values",
           queryId,
           buildKeyName,
           distinctValues.size());
-      return new ArrayList<>(distinctValues);
+      if (probeFieldName == null || probeFieldType == null) {
+        // Probe-side field metadata missing — log the extraction outcome but drop the RF, same
+        // as the pre-BLOOM behavior. The caller proceeds without a runtime filter.
+        return RuntimeFilterPayload.none();
+      }
+      return RuntimeFilterPayload.terms(
+          probeFieldName, probeFieldType, new ArrayList<>(distinctValues));
 
     } catch (Exception e) {
       logger.warn("Failed to extract runtime filter for query {}: {}", queryId, e.getMessage());
-      return null;
+      return RuntimeFilterPayload.none();
     }
   }
 
@@ -1128,12 +1284,20 @@ public class VeloxExecutionEngine {
     return probeKeys.get(0).getFieldName();
   }
 
-  /** Determine the OpenSearch field type for the RF field from the original RelNode. */
+  /**
+   * Determine the OpenSearch field type for the RF field by searching the entire RelNode tree — not
+   * just the outer rowType, which only exposes the final SELECT projection. Also accepts qualified
+   * names like {@code e.dept_id} by matching on the suffix after the last dot.
+   */
   private String extractProbeJoinKeyType(RelNode relNode, String fieldName) {
     if (fieldName == null) return null;
-    // Walk the RelNode tree to find the field's SQL type
-    for (RelDataTypeField field : relNode.getRowType().getFieldList()) {
-      if (field.getName().equals(fieldName)) {
+    return findFieldType(relNode, fieldName);
+  }
+
+  private String findFieldType(RelNode node, String fieldName) {
+    for (RelDataTypeField field : node.getRowType().getFieldList()) {
+      String fname = field.getName();
+      if (fname.equals(fieldName) || fname.endsWith("." + fieldName)) {
         switch (field.getType().getSqlTypeName()) {
           case INTEGER:
             return "integer";
@@ -1146,6 +1310,10 @@ public class VeloxExecutionEngine {
             return null;
         }
       }
+    }
+    for (RelNode input : node.getInputs()) {
+      String t = findFieldType(input, fieldName);
+      if (t != null) return t;
     }
     return null;
   }
@@ -1246,6 +1414,16 @@ public class VeloxExecutionEngine {
     }
     ExecutionEngine.Schema schema = new ExecutionEngine.Schema(columns);
 
+    // Collect the declared flat column names — any dot-containing name in the output schema is
+    // a flat column (e.g. a join-alias like "d.dept_name", or a user-projected dot-path) and must
+    // NOT be split into a nested struct by reconstructStructs. Only dot-paths that came from an
+    // OpenSearch object-field scan expansion (where the flat name is NOT in the output schema)
+    // should be reassembled into {parent: {child: value}}.
+    Set<String> flatOutputNames = new java.util.HashSet<>();
+    for (RelDataTypeField field : rowType.getFieldList()) {
+      flatOutputNames.add(field.getName());
+    }
+
     List<ExprValue> results = new ArrayList<>();
     for (ExecuteFragmentResponse response : responses) {
       if (response.getStatus() != ExecuteFragmentResponse.Status.SUCCESS) {
@@ -1253,14 +1431,14 @@ public class VeloxExecutionEngine {
       }
       byte[] arrowData = response.getResultData();
       if (arrowData != null && arrowData.length > 0) {
-        results.addAll(readArrowIpcToExprValues(arrowData));
+        results.addAll(readArrowIpcToExprValues(arrowData, flatOutputNames));
       }
     }
 
     return new ExecutionEngine.QueryResponse(schema, results, Cursor.None);
   }
 
-  private List<ExprValue> readArrowIpcToExprValues(byte[] arrowIpc) {
+  private List<ExprValue> readArrowIpcToExprValues(byte[] arrowIpc, Set<String> flatOutputNames) {
     List<ExprValue> rows = new ArrayList<>();
     BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE);
 
@@ -1278,9 +1456,12 @@ public class VeloxExecutionEngine {
             Object value = extractVectorValue(root.getVector(col), row);
             flatValues.put(name, value);
           }
-          // Reconstruct nested structs from flat dot-path columns.
-          // e.g., {cloud.region: "eu"} → {cloud: {region: "eu"}}
-          LinkedHashMap<String, Object> tupleValues = reconstructStructs(flatValues);
+          // Reconstruct nested structs from flat dot-path columns that are NOT in the output
+          // schema as flat names (i.e. came from OpenSearch object-field expansion). Columns
+          // whose name appears verbatim in the schema (e.g. join aliases like "d.dept_name")
+          // must stay flat.
+          LinkedHashMap<String, Object> tupleValues =
+              reconstructStructs(flatValues, flatOutputNames);
           rows.add(ExprValueUtils.tupleValue(tupleValues));
         }
       }
@@ -1324,13 +1505,23 @@ public class VeloxExecutionEngine {
    * Reconstruct nested struct objects from flat dot-path columns. Converts flat result columns like
    * {cloud.region: "eu", metrics.size: 100, message: "hi"} into nested structs: {cloud: {region:
    * "eu"}, metrics: {size: 100}, message: "hi"}.
+   *
+   * <p>Any key present in {@code flatOutputNames} is treated as a flat column (not wrapped). This
+   * distinguishes OpenSearch object-field expansions (which we want to re-nest) from join aliases
+   * and user-written dot-path projections (which must stay flat).
    */
   @SuppressWarnings("unchecked")
-  private LinkedHashMap<String, Object> reconstructStructs(LinkedHashMap<String, Object> flat) {
+  private LinkedHashMap<String, Object> reconstructStructs(
+      LinkedHashMap<String, Object> flat, Set<String> flatOutputNames) {
     LinkedHashMap<String, Object> result = new LinkedHashMap<>();
     for (Map.Entry<String, Object> entry : flat.entrySet()) {
       String key = entry.getKey();
       Object value = entry.getValue();
+      if (flatOutputNames != null && flatOutputNames.contains(key)) {
+        // Schema declares this column as flat — don't split on the dot.
+        result.put(key, value);
+        continue;
+      }
       if (key.contains(".")) {
         // Dot-path field: nest into parent struct
         String[] parts = key.split("\\.", 2);
@@ -1343,7 +1534,7 @@ public class VeloxExecutionEngine {
         if (child.contains(".")) {
           LinkedHashMap<String, Object> childFlat = new LinkedHashMap<>();
           childFlat.put(child, value);
-          LinkedHashMap<String, Object> childStruct = reconstructStructs(childFlat);
+          LinkedHashMap<String, Object> childStruct = reconstructStructs(childFlat, null);
           for (Map.Entry<String, Object> ce : childStruct.entrySet()) {
             Object existing = struct.get(ce.getKey());
             if (existing instanceof LinkedHashMap) {

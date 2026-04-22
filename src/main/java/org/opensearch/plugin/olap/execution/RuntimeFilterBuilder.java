@@ -54,6 +54,24 @@ public final class RuntimeFilterBuilder {
   }
 
   /**
+   * Build a Lucene pushdown query from a BLOOM runtime filter. Returns a {@link BloomFilterQuery}
+   * that iterates doc values for {@code fieldName} and keeps only docs passing {@link
+   * OlapBloomFilter#mightContain}.
+   */
+  public static Query buildBloom(String fieldName, String fieldType, OlapBloomFilter bloom) {
+    if (fieldName == null || bloom == null) return null;
+    switch (fieldType) {
+      case "keyword":
+      case "text":
+      case "integer":
+      case "long":
+        return new BloomFilterQuery(fieldName, fieldType, bloom);
+      default:
+        return null;
+    }
+  }
+
+  /**
    * Combine an existing pushdown query with a runtime filter query using AND.
    *
    * @return the combined query, or whichever is non-null, or null if both are null

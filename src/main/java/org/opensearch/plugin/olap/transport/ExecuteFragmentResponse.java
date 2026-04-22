@@ -34,6 +34,16 @@ public class ExecuteFragmentResponse extends ActionResponse implements ToXConten
   /** Velox native serialized partial results (preserves intermediate accumulator state). */
   private List<byte[]> nativeResultBatches;
 
+  /**
+   * Serialized partial BLOOM filter produced on this data node, built over the join-key column of
+   * the emitted RowVectors. Non-null only when the coordinator requested a PARTIAL bloom build via
+   * {@code ExecuteFragmentRequest.buildBloomFieldName}. All partial blooms in the same build share
+   * identical sizing parameters (the coordinator enforces this via {@code expectedInsertions}), so
+   * they can be merged at the coordinator via {@link
+   * org.opensearch.plugin.olap.execution.OlapBloomFilter#merge}.
+   */
+  private byte[] partialBloomBytes;
+
   private String errorMessage;
 
   public ExecuteFragmentResponse() {}
@@ -56,6 +66,9 @@ public class ExecuteFragmentResponse extends ActionResponse implements ToXConten
       }
     }
     this.errorMessage = in.readOptionalString();
+    // PARTIAL bloom bytes trailer: always a length-prefixed byte array, zero-length means none.
+    byte[] partial = in.readByteArray();
+    this.partialBloomBytes = partial.length == 0 ? null : partial;
   }
 
   public ExecuteFragmentResponse(Status status, long rowCount, byte[] resultData) {
@@ -102,7 +115,10 @@ public class ExecuteFragmentResponse extends ActionResponse implements ToXConten
       out.writeVInt(0);
     }
     out.writeOptionalString(errorMessage);
+    out.writeByteArray(partialBloomBytes == null ? EMPTY_BYTES : partialBloomBytes);
   }
+
+  private static final byte[] EMPTY_BYTES = new byte[0];
 
   @Override
   public XContentBuilder toXContent(XContentBuilder builder, Params params) throws IOException {
@@ -134,6 +150,18 @@ public class ExecuteFragmentResponse extends ActionResponse implements ToXConten
 
   public boolean hasNativeResults() {
     return nativeResultBatches != null && !nativeResultBatches.isEmpty();
+  }
+
+  public byte[] getPartialBloomBytes() {
+    return partialBloomBytes;
+  }
+
+  public boolean hasPartialBloom() {
+    return partialBloomBytes != null && partialBloomBytes.length > 0;
+  }
+
+  public void setPartialBloomBytes(byte[] partialBloomBytes) {
+    this.partialBloomBytes = partialBloomBytes;
   }
 
   public String getErrorMessage() {

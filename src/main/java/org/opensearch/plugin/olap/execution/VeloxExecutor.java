@@ -11,10 +11,12 @@ import java.util.List;
 import java.util.Map;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowStreamWriter;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.apache.lucene.util.BytesRef;
 import org.boostscale.velox4j.arrow.Arrow;
 import org.boostscale.velox4j.config.Config;
 import org.boostscale.velox4j.config.ConnectorConfig;
@@ -31,6 +33,7 @@ import org.boostscale.velox4j.query.Query;
 import org.boostscale.velox4j.query.SerialTask;
 import org.boostscale.velox4j.serde.Serde;
 import org.boostscale.velox4j.session.Session;
+import org.boostscale.velox4j.type.RowType;
 
 /**
  * Executes a Velox plan fragment via velox4j and returns results as Arrow IPC bytes.
@@ -208,6 +211,118 @@ public class VeloxExecutor {
       return results;
     } catch (Exception e) {
       throw new RuntimeException("Failed to execute dual-input Velox plan (native serde)", e);
+    }
+  }
+
+  /**
+   * Result of {@link #executeWithPartialBloom}: the normal Arrow IPC payload plus a serialized
+   * PARTIAL bloom built over one output column.
+   */
+  public static final class ExecuteWithBloomResult {
+    public final byte[] arrowIpc;
+    public final byte[] partialBloomBytes;
+
+    public ExecuteWithBloomResult(byte[] arrowIpc, byte[] partialBloomBytes) {
+      this.arrowIpc = arrowIpc;
+      this.partialBloomBytes = partialBloomBytes;
+    }
+  }
+
+  /**
+   * Execute a Velox plan and simultaneously build a PARTIAL {@link OlapBloomFilter} over the named
+   * output column. The bloom is sized with the coordinator-provided {@code expectedInsertions} and
+   * {@link OlapBloomFilter#DEFAULT_FPP}; every data node in the same two-stage build must pass the
+   * same {@code expectedInsertions} so the resulting filters share bit layout and can be merged via
+   * bitwise-OR at the coordinator.
+   *
+   * <p>The bloom is built by converting each output {@link RowVector} to an Arrow {@link
+   * VectorSchemaRoot} and calling {@link OlapBloomFilter#encodeKey(Object, String)} on the named
+   * column — same encoder used by the single-stage path, keeping build/probe consistent.
+   */
+  public ExecuteWithBloomResult executeWithPartialBloom(
+      String planJson,
+      String connectorId,
+      BlockingQueue queue,
+      String bloomFieldName,
+      String bloomFieldType,
+      int expectedInsertions) {
+    Queries queries = session.queryOps();
+
+    Query originalQuery = Serde.fromJson(planJson, Query.class);
+    ConnectorConfig connectorConfig = ConnectorConfig.create(Map.of(connectorId, Config.empty()));
+    Query query =
+        new Query(originalQuery.getPlan(), originalQuery.getQueryConfig(), connectorConfig);
+
+    SerialTask serialTask = queries.execute(query);
+
+    String scanNodeId = findTableScanNodeId(query.getPlan());
+    if (scanNodeId == null) {
+      throw new IllegalStateException("No TableScanNode found in plan");
+    }
+
+    ExternalStreamConnectorSplit split = new ExternalStreamConnectorSplit(connectorId, queue.id());
+    serialTask.addSplit(scanNodeId, split);
+    serialTask.noMoreSplits(scanNodeId);
+
+    OlapBloomFilter bloom = OlapBloomFilter.create(expectedInsertions);
+    CloseableIterator<RowVector> resultIterator = UpIterators.asJavaIterator(serialTask);
+    BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+    long inserted = 0;
+
+    try (ByteArrayOutputStream baos = new ByteArrayOutputStream()) {
+      ArrowStreamWriter writer = null;
+      boolean hasData = false;
+
+      while (resultIterator.hasNext()) {
+        RowVector resultBatch = resultIterator.next();
+        if (resultBatch == null) break;
+
+        VectorSchemaRoot arrowRoot = Arrow.toArrowVectorSchemaRoot(allocator, resultBatch);
+
+        RowType rowType = (RowType) resultBatch.getType();
+        int keyCol = rowType.getNames().indexOf(bloomFieldName);
+        if (keyCol >= 0) {
+          FieldVector fieldVec = arrowRoot.getVector(keyCol);
+          int rows = arrowRoot.getRowCount();
+          for (int r = 0; r < rows; r++) {
+            Object val = fieldVec.getObject(r);
+            if (val == null) continue;
+            BytesRef enc = OlapBloomFilter.encodeKey(val, bloomFieldType);
+            if (enc != null) {
+              bloom.add(enc);
+              inserted++;
+            }
+          }
+        }
+
+        if (writer == null) {
+          writer = new ArrowStreamWriter(arrowRoot, null, Channels.newChannel(baos));
+          writer.start();
+        }
+        writer.writeBatch();
+        hasData = true;
+        arrowRoot.close();
+      }
+
+      if (writer != null) {
+        writer.end();
+        writer.close();
+      }
+      resultIterator.close();
+
+      logger.info(
+          "PARTIAL bloom built: field={}, inserted={}, setSizeBits={}, hashCount={}",
+          bloomFieldName,
+          inserted,
+          bloom.setSizeBits(),
+          bloom.hashCount());
+
+      return new ExecuteWithBloomResult(
+          hasData ? baos.toByteArray() : new byte[0], bloom.toBytes());
+    } catch (Exception e) {
+      throw new RuntimeException("Failed to execute Velox plan with PARTIAL bloom build", e);
+    } finally {
+      allocator.close();
     }
   }
 

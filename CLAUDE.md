@@ -227,6 +227,20 @@ Metadata columns (`_id`, `_index`, `_score`, `_maxscore`, `_sort`, `_routing`) m
 ## Per-query session creation
 `VeloxLifecycleService.getSession()` creates a new `Session` per call (not a shared singleton). Each session gets its own memory pool namespace, preventing "Leaf child memory pool already exists" collisions between sequential queries. The `MemoryManager` is shared across sessions.
 
+## Runtime filter: TERMS, BLOOM, two-stage BLOOM
+`VeloxExecutionEngine.extractRuntimeFilter()` picks an `RfKind` by cardinality ladder:
+- `≤ runtime_filter_max_cardinality` → TERMS (Lucene TermInSetQuery/PointInSetQuery via `RuntimeFilterBuilder`)
+- `(terms-cap, runtime_filter_bloom_max_cardinality]` → BLOOM (`OlapBloomFilter`, per-doc predicate in `LuceneArrowReader`)
+- otherwise → NONE (abandon)
+
+BLOOM has two build modes controlled by `plugins.velox.runtime_filter_bloom_two_stage` (default true):
+- **Two-stage** (default): each data node builds a PARTIAL bloom over its local shards during the build fragment (`VeloxExecutor.executeWithPartialBloom` writes Arrow IPC AND builds bloom in one iteration pass); coordinator merges via bitwise-OR (`OlapBloomFilter.merge` / `mergeInPlace`). The coordinator passes `runtime_filter_bloom_max_cardinality` as `expectedInsertions` to all nodes — **identical sizing across partials is the bit-alignment invariant**. Dispatched via `NodeResultCollector.dispatchAndCollectWithPartialBloom`; responses carry `partialBloomBytes`.
+- **Single-stage**: coordinator rebuilds bloom from broadcast build rows (fallback path; also the v1 implementation).
+
+Wire format additions on `ExecuteFragmentRequest`: `buildBloomFieldName/Type/ExpectedInsertions` trailer. On `ExecuteFragmentResponse`: length-prefixed `partialBloomBytes` trailer (zero-length = none).
+
+BLOOM is pushed down as a Lucene `BloomFilterQuery` (via `RuntimeFilterBuilder.buildBloom`), same layer as TERMS. The Query's Weight/Scorer walks doc values for the RF field and matches docs passing `bloom.mightContain`. **Missing-field semantics**: a segment without the RF field (or a doc without a value) yields zero matches — stricter than the earlier feeder-layer predicate, which passed missing docs through. Correctness is preserved because the hash-join above re-verifies keys: a doc without the join key cannot match the join anyway.
+
 ## Known issues / TODOs
 - **OpenSearch doc values types**: OpenSearch stores all numeric types as `SORTED_NUMERIC` (not `NUMERIC`) and keyword/text as `SORTED_SET` (not `SORTED`). `LuceneArrowReader.mapToDocValueType()` handles this.
 - **Arrow Text → String**: Arrow Utf8 vectors return `org.apache.arrow.vector.util.Text` objects. Must convert to `String` before passing to `ExprValueUtils.tupleValue()` in `VeloxExecutionEngine.readArrowIpcToExprValues()`.

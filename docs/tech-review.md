@@ -438,7 +438,7 @@ Our design extends the SQL plugin rather than rewriting it, while adopting key R
 - **ClusterCopyShuttle** — decouples from the SQL plugin's planner, stripping pushdown context to prevent rule leaks (solves a real integration challenge the RFC doesn't address)
 - **Distributed execution** — Presto-inspired Stage/Task model with shard routing, same as RFC
 - **Pluggable engine** — `canVectorize()` extension point validated with Velox; other engines can follow the same pattern
-- Parallel reads, task retries, and runtime filters are already implemented, with the infrastructure supporting further incremental improvements (BLOOM RF, adaptive execution, join reorder)
+- Parallel reads, task retries, and runtime filters (TERMS + BLOOM, with two-stage PARTIAL/FINAL distributed build) are already implemented, with the infrastructure supporting further incremental improvements (adaptive execution, etc.)
 
 ---
 
@@ -457,6 +457,8 @@ Our design extends the SQL plugin rather than rewriting it, while adopting key R
 - Segment-level parallel reads: each Lucene segment read by a separate thread, configurable via `plugins.velox.segment_parallelism` (default 4, dynamic)
 - Fault tolerance with task retry: per-task retry with error classification (node/shard/transient), bad resource tracking, and replica failover via `plugins.velox.task_max_retries` (default 2, dynamic)
 - Runtime Filter (TERMS): extracts build-side join key values and pushes as Lucene TermInSetQuery/PointInSetQuery to probe scan, skipping non-matching docs at the index level. Configurable via `plugins.velox.runtime_filter_enabled` and `runtime_filter_max_cardinality` (both dynamic).
+- Runtime Filter (BLOOM): probabilistic variant for high-cardinality join keys. When build-side distinct values exceed `runtime_filter_max_cardinality` but stay within `runtime_filter_bloom_max_cardinality`, falls back to a bloom filter pushed as a Lucene `BloomFilterQuery` (same layer as TERMS) — Weight/Scorer walks doc values and matches via `bloom.mightContain`. False positives are tolerated since the hash-join re-verifies keys. Missing-field docs produce no match (stricter than the earlier feeder predicate; correctness held by hash-join re-verification). Configurable via `plugins.velox.runtime_filter_bloom_enabled` and `runtime_filter_bloom_max_cardinality` (both dynamic).
+- Two-stage BLOOM build (PARTIAL + FINAL): each data node builds a PARTIAL bloom over its local shards; the coordinator merges them via bitwise-OR into a FINAL bloom. Identical `(expectedInsertions, fpp)` sizing across nodes guarantees bit alignment. Controlled by `plugins.velox.runtime_filter_bloom_two_stage` (default true, dynamic). Cuts coordinator memory/CPU for huge builds; falls back to single-stage rebuild from broadcast data when disabled.
 - Two-stage TopN: Sort+Limit queries split into partial sort+limit on data nodes (top-K per shard) + final sort+limit on coordinator, reducing data transfer from O(N) to O(K × shards)
 - Window functions: eventstats (COUNT, SUM, AVG, MIN, MAX with PARTITION BY) via Velox WindowNode. ProjectToWindowRule decomposes RexOver → LogicalWindow → PhysicalWindow → WindowNode.
 - CBO statistics: query-time row count + data size collection from IndicesStatsResponse. Feeds into CostEstimator for row-count-based build side selection. Configurable via `plugins.velox.cbo_statistics_mode` (RUNTIME/NONE, default RUNTIME, dynamic).
@@ -489,7 +491,7 @@ Gaps identified by comparison with [RFC #4812](https://github.com/opensearch-pro
 | ~~**High**~~ | ~~CBO statistics~~ | ~~RFC uses runtime statistics~~ | **Done** — table-level row count + size from IndicesStatsResponse; feeds CostEstimator for row-count-based build side selection; `cbo_statistics_mode` setting |
 | ~~**High**~~ | ~~Join reorder~~ | ~~RFC uses DP algorithm for bushy join reordering with statistics~~ | **Done** — Calcite `JoinToMultiJoinRule` + `MultiJoinOptimizeBushyRule` in HepPlanner; CBO row counts injected via `StatisticsTableScan`; `LoptOptimizeJoinRule` fallback for outer joins; coordinator-centric N-way join execution |
 | **Medium** | Cost-based join strategy (real stats) | RFC uses table cardinality + selectivity estimation | Row count available via CBO; column cardinality deferred (Lucene segment stats, Option B) |
-| **Medium** | Runtime Filter (BLOOM) | RFC supports probabilistic BLOOM variant for high-cardinality keys | Not implemented (depends on TERMS RF) |
+| ~~**Medium**~~ | ~~Runtime Filter (BLOOM)~~ | ~~RFC supports probabilistic BLOOM variant for high-cardinality keys~~ | **Done** — pushed as Lucene `BloomFilterQuery` (Weight/Scorer over doc values + `bloom.mightContain`) when build cardinality exceeds TERMS cap; configurable via `runtime_filter_bloom_enabled` + `runtime_filter_bloom_max_cardinality` |
 | ~~**Medium**~~ | ~~TopN optimization~~ | ~~RFC pushes ORDER BY + LIMIT as ranking subquery to data nodes~~ | **Done** — two-stage TopN splits Sort+Limit into partial (data nodes) + final (coordinator); subquery push deferred |
 
 #### Phase 3 — Advanced Distributed Execution
@@ -498,7 +500,7 @@ Gaps identified by comparison with [RFC #4812](https://github.com/opensearch-pro
 |----------|------|-----------|---------------|
 | **Medium** | Co-Routing / ES_ROUTING_SHUFFLE | RFC enables shard-local joins when both sides share routing key — no shuffle needed | Not implemented; all joins require data movement |
 | **Medium** | Adaptive query execution | RFC replans at runtime based on intermediate result sizes | All decisions at plan time |
-| **Medium** | Two-stage Runtime Filter construction | RFC builds PARTIAL RF locally, merges into FINAL RF globally for distributed builds | Not implemented (depends on TERMS RF) |
+| ~~**Medium**~~ | ~~Two-stage Runtime Filter construction~~ | ~~RFC builds PARTIAL RF locally, merges into FINAL RF globally for distributed builds~~ | **Done (BLOOM)** — data nodes build PARTIAL bloom; coordinator merges via bitwise-OR into FINAL bloom; `runtime_filter_bloom_two_stage` setting. TERMS two-stage deferred (coordinator rebuild is cheap at TERMS caps). |
 | **Low** | Convention.enforce() for distribution | RFC uses trait-driven exchange insertion via Calcite's automatic enforcement | Explicit PhysicalExchange insertion in rules (works but verbose) |
 
 #### Phase 4 — Operator & Feature Completeness
