@@ -270,8 +270,11 @@ COUNT, SUM, AVG, MIN, MAX (with DISTINCT support)
 | `plugins.velox.shuffle_partitions` | `0` | Number of hash shuffle partitions. 0 = auto (uses number of data nodes). **Dynamic.** |
 | `plugins.velox.segment_parallelism` | `4` | Number of parallel threads for reading Lucene segments within a shard. Set to 1 to disable. **Dynamic.** |
 | `plugins.velox.task_max_retries` | `2` | Max retry attempts per failed task. Retries use replica shards on different nodes when available. Set to 0 to disable. **Dynamic.** |
-| `plugins.velox.runtime_filter_enabled` | `true` | Enable runtime filter pushdown for broadcast joins. Extracts build-side join key values and pushes as Lucene TermsQuery to probe scan. **Dynamic.** |
-| `plugins.velox.runtime_filter_max_cardinality` | `10000` | Max distinct values for runtime filter. If build-side cardinality exceeds this, RF is skipped. **Dynamic.** |
+| `plugins.velox.runtime_filter_enabled` | `true` | Enable runtime filter pushdown for broadcast joins. Extracts build-side join key values and pushes as a Lucene `TermInSetQuery` / `PointInSetQuery` (TERMS) or `BloomFilterQuery` (BLOOM) to the probe scan. **Dynamic.** |
+| `plugins.velox.runtime_filter_max_cardinality` | `10000` | Max distinct values for TERMS runtime filter. If build-side cardinality exceeds this, BLOOM is tried (subject to bloom cap below), or RF is skipped. **Dynamic.** |
+| `plugins.velox.runtime_filter_bloom_enabled` | `true` | Enable BLOOM variant of runtime filter for high-cardinality join keys (above the TERMS cap). Applied as a Lucene `BloomFilterQuery` — walks doc values and skips docs that fail `bloom.mightContain`. **Dynamic.** |
+| `plugins.velox.runtime_filter_bloom_max_cardinality` | `10000000` | Max distinct values for BLOOM runtime filter. Beyond this cap, RF is skipped entirely. Also used as `expectedInsertions` for sizing partial blooms in two-stage mode. **Dynamic.** |
+| `plugins.velox.runtime_filter_bloom_two_stage` | `true` | Two-stage BLOOM build: each data node builds a PARTIAL bloom over local shards, coordinator merges via bitwise-OR into a FINAL bloom. Identical `expectedInsertions` across partials guarantees bit alignment. When false, coordinator rebuilds the bloom from broadcast build rows. **Dynamic.** |
 | `plugins.velox.cbo_statistics_mode` | `RUNTIME` | CBO statistics mode. `RUNTIME` collects row counts from IndicesStatsResponse before optimization for accurate build side selection. `NONE` skips (uses shard-count heuristic). **Dynamic.** |
 
 ## Dependencies
@@ -347,6 +350,90 @@ Test suites (107 integration tests total):
 - **CboStatisticsIT** (4 tests) — CBO join, comparison, aggregation, logging
 
 **Note:** Integration tests require the Velox native libraries (`libvelox.so`) to be compatible with the host OS. The Maven-published `velox4j` jar bundles libraries built on CentOS 7. If the host is incompatible, Velox will fail to initialize and the OLAP plugin will disable itself — queries will fall back to the default SQL engine and the tests will fail. See [Multi-Node Testing (Docker)](#multi-node-testing-docker) for an alternative.
+
+## Query Profiling
+
+The OLAP plugin plugs into the SQL plugin's PPL `profile=true` flow (see the SQL plugin's [endpoint docs](../search-plugins-sql/docs/user/ppl/interfaces/endpoint.md#profile-experimental)). When the profile flag is set, each data node records per-task Lucene scan counters and the coordinator assembles them into a plan tree under `profile.plan`. The main use case is answering "did my runtime filter actually narrow the Lucene scan?" — without profiling, the only visible signal is total query latency.
+
+### Enable profiling for a query
+
+```bash
+curl -sS -H 'Content-Type: application/json' \
+  -X POST localhost:9200/_plugins/_ppl \
+  -d '{
+        "profile": true,
+        "query": "source = employees | inner join left=e right=d ON e.dept_id = d.dept_id departments | fields e.name, d.dept_name"
+      }'
+```
+
+### Profile output
+
+The standard SQL-plugin `profile` block (see `summary` + `phases`) is augmented with a plan subtree reflecting Velox/OLAP execution:
+
+```json
+"profile": {
+  "summary": {"total_time_ms": 412.0},
+  "phases": {"analyze": {...}, "optimize": {...}, "execute": {...}, "format": {...}},
+  "plan": {
+    "node": "VeloxQuery rf=BLOOM bloomBytes=512 docsRead=20000 docsMatched=240 rows=120",
+    "time_ms": 380.0,
+    "rows": 0,
+    "children": [
+      {
+        "node": "Fragment[0] rf=NONE docsRead=0 docsMatched=0 rows=3 (2 tasks)",
+        "time_ms": 25.0,
+        "children": [
+          {"node": "Task frag=0 part=0 node=data-1 rf=NONE docsRead=0 docsMatched=0 rows=2", "time_ms": 12.0},
+          {"node": "Task frag=0 part=1 node=data-2 rf=NONE docsRead=0 docsMatched=0 rows=1", "time_ms": 13.0}
+        ]
+      },
+      {
+        "node": "Fragment[1] rf=BLOOM docsRead=20000 docsMatched=240 rows=120 (2 tasks)",
+        "time_ms": 355.0,
+        "children": [
+          {"node": "Task frag=1 part=0 node=data-1 rf=BLOOM docsRead=10000 docsMatched=120 rows=60", "time_ms": 180.0},
+          {"node": "Task frag=1 part=1 node=data-2 rf=BLOOM docsRead=10000 docsMatched=120 rows=60", "time_ms": 175.0}
+        ]
+      }
+    ]
+  }
+}
+```
+
+**Counter meanings (probe-side leaf tasks only):**
+- `docsRead` — number of live docs the Lucene scorer iterated over. This is the universe the runtime filter acted on.
+- `docsMatched` — number of docs the scorer admitted and emitted into the Arrow bridge.
+- `rows` — rows emitted by the Velox fragment's final operator (may differ from `docsMatched` due to joins/aggregations).
+- `rf` — runtime filter kind applied on this task (`NONE` / `TERMS` / `BLOOM`).
+
+The gap between `docsRead` and `docsMatched` is the observable effect of the runtime filter at the Lucene level. Tasks with `rf=NONE` (e.g., build-side leaves, coordinator stages) naturally report `docsRead=0` when they don't read from Lucene.
+
+### Verifying BLOOM runtime filter effectiveness
+
+Run the same query twice, once baseline and once with BLOOM forced, then diff `docsMatched` for the probe-side tasks:
+
+```bash
+# Baseline: no runtime filter
+curl -sS ... -d '{"persistent":{"plugins.velox.runtime_filter_enabled": false}}'  # PUT _cluster/settings
+# Run query with profile=true, note baseline docsMatched
+
+# Force BLOOM: set TERMS cap below build-side cardinality so BLOOM kicks in
+curl -sS ... -d '{"persistent":{
+  "plugins.velox.runtime_filter_enabled": true,
+  "plugins.velox.runtime_filter_bloom_enabled": true,
+  "plugins.velox.runtime_filter_max_cardinality": "1",
+  "plugins.velox.runtime_filter_bloom_max_cardinality": "100000"
+}}'
+# Re-run same query with profile=true, compare docsMatched — should be lower
+```
+
+If the BLOOM run's `docsMatched` sum is lower than the baseline, the Lucene pushdown is active. If it matches baseline, BLOOM either wasn't applied (check the root node's `rf=` suffix) or the filter isn't selective for your data.
+
+### Notes
+
+- Profiling is only emitted for successful queries (same as the SQL plugin's profile).
+- Per-fragment `time_ms` is the **sum** of task times, not wall-clock — parallelism across tasks is not subtracted out. This matches the SQL plugin's convention where child times may exceed the parent.
+- Profiling adds a per-task wire-format trailer (~60 bytes) and skips all counter work when `profile=true` is absent from the request, so the overhead is negligible for non-profiled queries.
 
 ## Installation
 

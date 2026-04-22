@@ -88,6 +88,13 @@ public class ExecuteFragmentRequest extends ActionRequest {
    */
   private int buildBloomExpectedInsertions;
 
+  /**
+   * When true, the data node records per-task counters ({@link
+   * org.opensearch.plugin.olap.profile.OlapTaskProfile}) and attaches them to the response. Set by
+   * the coordinator when the PPL request carries {@code profile=true}.
+   */
+  private boolean profileEnabled;
+
   // --- Shuffle scan fields ---
   /** Target node IDs for each shuffle partition. Null if not a shuffle scan. */
   private List<String> shuffleTargetNodeIds;
@@ -201,6 +208,9 @@ public class ExecuteFragmentRequest extends ActionRequest {
       this.buildBloomFieldType = in.readString();
       this.buildBloomExpectedInsertions = in.readVInt();
     }
+
+    // Profile toggle trailer. Cluster-wide version-homogeneous via a single plugin deploy.
+    this.profileEnabled = in.readBoolean();
   }
 
   /** Constructor for normal scan requests (backward compatible). */
@@ -296,6 +306,9 @@ public class ExecuteFragmentRequest extends ActionRequest {
       out.writeString(buildBloomFieldType);
       out.writeVInt(buildBloomExpectedInsertions);
     }
+
+    // Profile toggle trailer.
+    out.writeBoolean(profileEnabled);
   }
 
   private static final byte[] EMPTY_BYTES = new byte[0];
@@ -426,6 +439,14 @@ public class ExecuteFragmentRequest extends ActionRequest {
     this.buildBloomFieldName = fieldName;
     this.buildBloomFieldType = fieldType;
     this.buildBloomExpectedInsertions = expectedInsertions;
+  }
+
+  public boolean isProfileEnabled() {
+    return profileEnabled;
+  }
+
+  public void setProfileEnabled(boolean profileEnabled) {
+    this.profileEnabled = profileEnabled;
   }
 
   public List<String> getShuffleTargetNodeIds() {

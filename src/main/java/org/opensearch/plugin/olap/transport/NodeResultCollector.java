@@ -52,6 +52,7 @@ public class NodeResultCollector {
   private final TransportService transportService;
   private final QueryScheduler scheduler;
   private final int maxRetries;
+  private volatile boolean profileEnabled;
 
   public NodeResultCollector(TransportService transportService, QueryScheduler scheduler) {
     this(transportService, scheduler, 0);
@@ -62,6 +63,20 @@ public class NodeResultCollector {
     this.transportService = transportService;
     this.scheduler = scheduler;
     this.maxRetries = maxRetries;
+  }
+
+  /**
+   * When true, every outgoing {@link ExecuteFragmentRequest} is stamped with {@code
+   * profileEnabled=true} so data nodes produce per-task profiles. Set once per query by {@link
+   * org.opensearch.plugin.olap.engine.VeloxExecutionEngine} from the PPL request's {@code
+   * profile=true} flag.
+   */
+  public void setProfileEnabled(boolean profileEnabled) {
+    this.profileEnabled = profileEnabled;
+  }
+
+  public boolean isProfileEnabled() {
+    return profileEnabled;
   }
 
   /** Dispatch all tasks for a query execution and collect results. */
@@ -286,6 +301,7 @@ public class NodeResultCollector {
       int retriesLeft) {
 
     ExecuteFragmentRequest request = requestFactory.create(task);
+    request.setProfileEnabled(profileEnabled);
 
     transportService.sendRequest(
         task.getTargetNode(),
