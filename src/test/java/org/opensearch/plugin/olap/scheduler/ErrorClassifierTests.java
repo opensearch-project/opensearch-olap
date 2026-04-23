@@ -73,4 +73,29 @@ public class ErrorClassifierTests extends OpenSearchTestCase {
         ErrorCategory.RETRYABLE_NODE,
         ErrorClassifier.classify("ConnectTransportException: node-1 not reachable"));
   }
+
+  public void testResultTooLargeIsResourceExceeded() {
+    assertEquals(
+        ErrorCategory.RESOURCE_EXCEEDED,
+        ErrorClassifier.classify("ResultTooLargeException: plugins.velox.max_result_bytes cap"));
+  }
+
+  public void testMaxResultBytesKeywordIsResourceExceeded() {
+    assertEquals(
+        ErrorCategory.RESOURCE_EXCEEDED,
+        ErrorClassifier.classify(
+            "Aggregate response exceeded plugins.velox.coordinator_inflight_bytes"));
+  }
+
+  public void testBackpressureTimeoutIsRetryableTransient() {
+    assertEquals(
+        ErrorCategory.RETRYABLE_TRANSIENT,
+        ErrorClassifier.classify("BackpressureTimeoutException: drain timed out"));
+  }
+
+  public void testShuffleBufferFullIsRetryableTransient() {
+    assertEquals(
+        ErrorCategory.RETRYABLE_TRANSIENT,
+        ErrorClassifier.classify("shuffle buffer full on data-1 after retries"));
+  }
 }

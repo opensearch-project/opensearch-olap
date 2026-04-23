@@ -144,6 +144,27 @@ public class VeloxExecutionEngine {
     this.statisticsCollector = statisticsCollector;
   }
 
+  /** Coordinator-side Arrow allocator cap, driven by {@code coordinator_allocator_bytes}. */
+  private long coordinatorAllocatorLimit() {
+    return veloxLifecycle == null ? Long.MAX_VALUE : veloxLifecycle.getCoordinatorAllocatorBytes();
+  }
+
+  /** Soft watermark for the coordinator FINAL-agg feed queue. */
+  private long coordinatorQueueWatermark() {
+    if (veloxLifecycle == null) {
+      return Long.MAX_VALUE;
+    }
+    return veloxLifecycle.softWatermark(veloxLifecycle.getCoordinatorQueueBytes());
+  }
+
+  private long backpressureWaitNanos() {
+    if (veloxLifecycle == null) {
+      return -1L;
+    }
+    return java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(
+        veloxLifecycle.getBackpressureWaitMs());
+  }
+
   /**
    * Explain the Velox physical plan for a query. Runs PhysicalOptimizer + VeloxPlanGenerator and
    * returns the Velox native plan tree for each fragment via {@code PlanNode.toFormatString()}.
@@ -261,7 +282,10 @@ public class VeloxExecutionEngine {
   private NodeResultCollector newCollector() {
     NodeResultCollector c =
         new NodeResultCollector(
-            transportService, queryScheduler, veloxLifecycle.getTaskMaxRetries());
+            transportService,
+            queryScheduler,
+            veloxLifecycle.getTaskMaxRetries(),
+            veloxLifecycle.getCoordinatorInflightBytes());
     c.setProfileEnabled(profileAccumulator.get() != null);
     return c;
   }
@@ -731,19 +755,26 @@ public class VeloxExecutionEngine {
 
     // Start feeder threads for all inputs
     List<Thread> feeders = new ArrayList<>();
+    java.util.concurrent.atomic.AtomicReference<Throwable> feederError =
+        new java.util.concurrent.atomic.AtomicReference<>();
     for (int i = 0; i < numInputs; i++) {
       Thread feeder =
-          createFeederThread(session, inputGroups.get(i), queues.get(i), "olap-join-feeder-" + i);
+          createFeederThread(
+              session, inputGroups.get(i), queues.get(i), "olap-join-feeder-" + i, feederError);
       feeder.start();
       feeders.add(feeder);
     }
 
     // Collect results with timeout
-    BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+    BufferAllocator allocator = new RootAllocator(coordinatorAllocatorLimit());
     try {
       byte[] resultData = collectResultsWithTimeout(session, serialTask, allocator, 60);
       for (Thread feeder : feeders) {
         feeder.join(5_000);
+      }
+      Throwable fe = feederError.get();
+      if (fe != null) {
+        throw new RuntimeException("Coordinator join feeder failed", fe);
       }
       return List.of(ExecuteFragmentResponse.success(0, resultData));
     } catch (Exception e) {
@@ -765,7 +796,7 @@ public class VeloxExecutionEngine {
     String connectorId = "connector-external-stream";
 
     BlockingQueue queue = session.externalStreamOps().newBlockingQueue();
-    BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+    BufferAllocator allocator = new RootAllocator(coordinatorAllocatorLimit());
 
     try {
       Type intermediateType = null;
@@ -802,6 +833,8 @@ public class VeloxExecutionEngine {
           "exchange_scan", new ExternalStreamConnectorSplit(connectorId, queue.id()));
       serialTask.noMoreSplits("exchange_scan");
 
+      java.util.concurrent.atomic.AtomicReference<Throwable> feederError =
+          new java.util.concurrent.atomic.AtomicReference<>();
       Thread feederThread =
           new Thread(
               () -> {
@@ -819,7 +852,10 @@ public class VeloxExecutionEngine {
                   logger.info("Coordinator feeder: pushed {} native batches", batchCount);
                   queue.noMoreInput();
                 } catch (Throwable e) {
+                  // See createFeederThread — capture the error so the main thread can fail the
+                  // query instead of returning silently truncated results.
                   logger.error("Error feeding partial results to coordinator fragment", e);
+                  feederError.compareAndSet(null, e);
                   queue.noMoreInput();
                 }
               },
@@ -829,6 +865,10 @@ public class VeloxExecutionEngine {
 
       byte[] resultData = collectResultsWithTimeout(session, serialTask, allocator, 30);
       feederThread.join(5_000);
+      Throwable fe = feederError.get();
+      if (fe != null) {
+        throw new RuntimeException("Coordinator fragment feeder failed", fe);
+      }
       return List.of(ExecuteFragmentResponse.success(0, resultData));
 
     } catch (Exception e) {
@@ -917,7 +957,7 @@ public class VeloxExecutionEngine {
 
   private List<byte[]> arrowIpcToNativeBatches(byte[] arrowIpc) {
     Session session = veloxLifecycle.getSession();
-    BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+    BufferAllocator allocator = new RootAllocator(coordinatorAllocatorLimit());
     List<byte[]> nativeBatches = new ArrayList<>();
 
     try (ArrowStreamReader reader =
@@ -945,7 +985,8 @@ public class VeloxExecutionEngine {
       Session session,
       List<ExecuteFragmentResponse> responses,
       BlockingQueue queue,
-      String threadName) {
+      String threadName,
+      java.util.concurrent.atomic.AtomicReference<Throwable> errorRef) {
     Thread thread =
         new Thread(
             () -> {
@@ -963,7 +1004,13 @@ public class VeloxExecutionEngine {
                 }
                 queue.noMoreInput();
               } catch (Throwable e) {
+                // Capture the first error so the main thread can fail the query rather than
+                // silently treat the truncated input as end-of-stream. We still call
+                // noMoreInput() to unblock Velox so it surfaces the error instead of hanging.
                 logger.error("Feeder error in {}", threadName, e);
+                if (errorRef != null) {
+                  errorRef.compareAndSet(null, e);
+                }
                 queue.noMoreInput();
               }
             },
@@ -973,14 +1020,32 @@ public class VeloxExecutionEngine {
   }
 
   private void feedArrowIpcToQueue(Session session, byte[] arrowIpc, BlockingQueue queue) {
-    BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+    BufferAllocator allocator = new RootAllocator(coordinatorAllocatorLimit());
+    final long watermark = coordinatorQueueWatermark();
+    final long waitNanos = backpressureWaitNanos();
     try (ArrowStreamReader reader =
         new ArrowStreamReader(new ByteArrayInputStream(arrowIpc), allocator)) {
       while (reader.loadNextBatch()) {
+        // Pause the feeder before admitting the next batch if the coordinator allocator is past
+        // its soft watermark. Without this, repeated queue.put() calls materialize more RowVectors
+        // than the FINAL aggregation can consume, because velox4j's BlockingQueue has no native
+        // size probe.
+        if (watermark < Long.MAX_VALUE) {
+          try {
+            org.opensearch.plugin.olap.execution.Backpressure.awaitBelow(
+                allocator, watermark, waitNanos, null);
+          } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            throw new org.opensearch.plugin.olap.execution.BackpressureTimeoutException(
+                "Interrupted while draining coordinator queue", ie);
+          }
+        }
         VectorSchemaRoot root = reader.getVectorSchemaRoot();
         RowVector rv = session.arrowOps().fromArrowVectorSchemaRoot(allocator, root);
         queue.put(rv);
       }
+    } catch (org.opensearch.plugin.olap.execution.BackpressureTimeoutException e) {
+      throw e;
     } catch (Exception e) {
       logger.error("Error feeding Arrow IPC to queue", e);
     } finally {
@@ -1246,7 +1311,7 @@ public class VeloxExecutionEngine {
         int keyColIndex = rowType.getNames().indexOf(buildKeyName);
         if (keyColIndex < 0) continue;
 
-        BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+        BufferAllocator allocator = new RootAllocator(coordinatorAllocatorLimit());
         try {
           VectorSchemaRoot arrowRoot = Arrow.toArrowVectorSchemaRoot(allocator, rowVec);
           FieldVector fieldVec = arrowRoot.getVector(keyColIndex);
@@ -1511,7 +1576,7 @@ public class VeloxExecutionEngine {
 
   private List<ExprValue> readArrowIpcToExprValues(byte[] arrowIpc, Set<String> flatOutputNames) {
     List<ExprValue> rows = new ArrayList<>();
-    BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+    BufferAllocator allocator = new RootAllocator(coordinatorAllocatorLimit());
 
     try (ArrowStreamReader reader =
         new ArrowStreamReader(new ByteArrayInputStream(arrowIpc), allocator)) {

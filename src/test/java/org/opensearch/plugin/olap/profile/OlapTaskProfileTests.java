@@ -50,4 +50,32 @@ public class OlapTaskProfileTests extends OpenSearchTestCase {
     out.writeByte((byte) 99);
     expectThrows(IOException.class, () -> new OlapTaskProfile(out.bytes().streamInput()));
   }
+
+  public void testBackpressureFieldsRoundTrip() throws IOException {
+    OlapTaskProfile original =
+        new OlapTaskProfile(
+            /* fragmentId */ 2,
+            /* partitionId */ 0,
+            /* nodeId */ "data-2",
+            /* durationNanos */ 1_000_000L,
+            /* docsRead */ 5_000L,
+            /* docsMatched */ 4_000L,
+            /* rowsEmitted */ 4_000L,
+            /* rfKind */ "TERMS",
+            /* rfBloomBytes */ 0,
+            /* peakArrowBytes */ 128 * 1024L,
+            /* backpressureWaitNanos */ 750_000L,
+            /* resultBytes */ 2 * 1024 * 1024L,
+            /* shuffleRejectCount */ 3L);
+
+    BytesStreamOutput out = new BytesStreamOutput();
+    original.writeTo(out);
+
+    OlapTaskProfile decoded = new OlapTaskProfile(out.bytes().streamInput());
+    assertEquals(original, decoded);
+    assertEquals(128 * 1024L, decoded.getPeakArrowBytes());
+    assertEquals(750_000L, decoded.getBackpressureWaitNanos());
+    assertEquals(2 * 1024 * 1024L, decoded.getResultBytes());
+    assertEquals(3L, decoded.getShuffleRejectCount());
+  }
 }

@@ -16,6 +16,8 @@ import org.opensearch.transport.TransportException;
  *   <li>RETRYABLE_NODE — node unreachable, retry on a different node
  *   <li>RETRYABLE_SHARD — shard unavailable on this node, retry on replica
  *   <li>RETRYABLE_TRANSIENT — timeout or temporary error, retry on same node
+ *   <li>RESOURCE_EXCEEDED — user query is over a configured resource cap (result size, aggregate
+ *       response size). Non-retryable: retrying produces the same result.
  *   <li>FATAL — logic error, unsupported operation, don't retry
  * </ul>
  */
@@ -25,6 +27,7 @@ public final class ErrorClassifier {
     RETRYABLE_NODE,
     RETRYABLE_SHARD,
     RETRYABLE_TRANSIENT,
+    RESOURCE_EXCEEDED,
     FATAL
   }
 
@@ -53,6 +56,13 @@ public final class ErrorClassifier {
   private static ErrorCategory classifyMessage(String msg) {
     String lower = msg.toLowerCase(Locale.ROOT);
 
+    // Resource caps hit — do not retry, the input data will produce the same failure.
+    if (lower.contains("resulttoolargeexception")
+        || lower.contains("plugins.velox.max_result_bytes")
+        || lower.contains("plugins.velox.coordinator_inflight_bytes")) {
+      return ErrorCategory.RESOURCE_EXCEEDED;
+    }
+
     // Node-level failures
     if (lower.contains("connecttransportexception")
         || lower.contains("nodenotconnectedexception")
@@ -75,7 +85,10 @@ public final class ErrorClassifier {
         || lower.contains("timed out")
         || lower.contains("circuit_breaking_exception")
         || lower.contains("rejected execution")
-        || lower.contains("too_many_requests")) {
+        || lower.contains("too_many_requests")
+        || lower.contains("backpressuretimeoutexception")
+        || lower.contains("arrow allocator exceeded per-fragment cap")
+        || lower.contains("shuffle buffer full")) {
       return ErrorCategory.RETRYABLE_TRANSIENT;
     }
 

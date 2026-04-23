@@ -44,7 +44,20 @@ public class TransportShuffleDataAction
           shuffleManager.getOrCreateBuffer(request.getQueryId(), request.getTargetStageId());
 
       if (request.getData() != null) {
-        buffer.addData(request.getSide(), request.getData());
+        boolean accepted = buffer.tryAddData(request.getSide(), request.getData());
+        if (!accepted) {
+          // Reject with backpressure signal — transport handlers must not block, so the sender
+          // retries with exponential backoff rather than waiting here.
+          logger.debug(
+              "Shuffle buffer full: query={}, stage={}, side={}, current={} cap={}",
+              request.getQueryId(),
+              request.getTargetStageId(),
+              request.getSide(),
+              buffer.getCurrentBytes(),
+              buffer.getMaxBytes());
+          listener.onResponse(ShuffleDataResponse.backpressureReject());
+          return;
+        }
       }
 
       if (request.isLast()) {

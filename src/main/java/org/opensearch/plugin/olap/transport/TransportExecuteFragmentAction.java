@@ -152,9 +152,12 @@ public class TransportExecuteFragmentAction
         queryId,
         shardIds.size());
 
-    VeloxExecutor executor = new VeloxExecutor(veloxLifecycle.getSession());
-    ExternalStreamBridge bridge = new ExternalStreamBridge(veloxLifecycle.getSession());
-    LuceneArrowReader reader = new LuceneArrowReader(indicesService, bridge.getAllocator());
+    VeloxExecutor executor = new VeloxExecutor(veloxLifecycle.getSession(), veloxLifecycle);
+    ExternalStreamBridge bridge =
+        new ExternalStreamBridge(
+            veloxLifecycle.getSession(), veloxLifecycle.getPerFragmentArrowBytes());
+    LuceneArrowReader reader =
+        new LuceneArrowReader(indicesService, bridge.getAllocator(), veloxLifecycle);
 
     final LuceneArrowReader.ScanStats scanStats =
         request.isProfileEnabled() ? new LuceneArrowReader.ScanStats() : null;
@@ -232,7 +235,7 @@ public class TransportExecuteFragmentAction
         response = ExecuteFragmentResponse.success(bridge.getRowCount(), resultData);
       }
 
-      attachTaskProfile(request, response, scanStats, startNanos);
+      attachTaskProfile(request, response, scanStats, startNanos, bridge);
       return response;
 
     } catch (Exception e) {
@@ -253,6 +256,15 @@ public class TransportExecuteFragmentAction
       ExecuteFragmentResponse response,
       LuceneArrowReader.ScanStats scanStats,
       long startNanos) {
+    attachTaskProfile(request, response, scanStats, startNanos, null);
+  }
+
+  private void attachTaskProfile(
+      ExecuteFragmentRequest request,
+      ExecuteFragmentResponse response,
+      LuceneArrowReader.ScanStats scanStats,
+      long startNanos,
+      ExternalStreamBridge bridge) {
     if (!request.isProfileEnabled()
         || response.getStatus() != ExecuteFragmentResponse.Status.SUCCESS) {
       return;
@@ -270,6 +282,17 @@ public class TransportExecuteFragmentAction
     long duration = System.nanoTime() - startNanos;
     long docsRead = scanStats == null ? 0 : scanStats.getDocsRead();
     long docsMatched = scanStats == null ? 0 : scanStats.getDocsMatched();
+    long bpWait = scanStats == null ? 0L : scanStats.getBackpressureWaitNanos();
+    long peakArrow = bridge == null ? 0L : bridge.getPeakBytesInFlight();
+    long resultBytes = 0L;
+    if (response.getResultData() != null) {
+      resultBytes += response.getResultData().length;
+    }
+    if (response.hasNativeResults()) {
+      for (byte[] b : response.getNativeResultBatches()) {
+        if (b != null) resultBytes += b.length;
+      }
+    }
     String nodeId = clusterService.localNode() == null ? "" : clusterService.localNode().getId();
     response.setTaskProfile(
         new OlapTaskProfile(
@@ -281,7 +304,11 @@ public class TransportExecuteFragmentAction
             docsMatched,
             response.getRowCount(),
             rfKind,
-            bloomBytes));
+            bloomBytes,
+            peakArrow,
+            bpWait,
+            resultBytes,
+            /* shuffleRejectCount */ 0L));
   }
 
   // ---- Broadcast Join Execution ----
@@ -321,8 +348,10 @@ public class TransportExecuteFragmentAction
     String buildScanId = scanIds.get(buildIdx);
 
     // Create probe-side bridge (reads from local shards)
-    ExternalStreamBridge probeBridge = new ExternalStreamBridge(session);
-    LuceneArrowReader reader = new LuceneArrowReader(indicesService, probeBridge.getAllocator());
+    ExternalStreamBridge probeBridge =
+        new ExternalStreamBridge(session, veloxLifecycle.getPerFragmentArrowBytes());
+    LuceneArrowReader reader =
+        new LuceneArrowReader(indicesService, probeBridge.getAllocator(), veloxLifecycle);
 
     // Create build-side queue (fed from broadcast data)
     ExternalStreams.BlockingQueue buildQueue = session.externalStreamOps().newBlockingQueue();
@@ -454,7 +483,7 @@ public class TransportExecuteFragmentAction
         response = ExecuteFragmentResponse.success(probeBridge.getRowCount(), resultData);
       }
 
-      attachTaskProfile(request, response, scanStats, startNanos);
+      attachTaskProfile(request, response, scanStats, startNanos, probeBridge);
       return response;
 
     } catch (Exception e) {
@@ -481,9 +510,11 @@ public class TransportExecuteFragmentAction
         request.getShuffleNumPartitions());
 
     Session session = veloxLifecycle.getSession();
-    VeloxExecutor executor = new VeloxExecutor(session);
-    ExternalStreamBridge bridge = new ExternalStreamBridge(session);
-    LuceneArrowReader reader = new LuceneArrowReader(indicesService, bridge.getAllocator());
+    VeloxExecutor executor = new VeloxExecutor(session, veloxLifecycle);
+    ExternalStreamBridge bridge =
+        new ExternalStreamBridge(session, veloxLifecycle.getPerFragmentArrowBytes());
+    LuceneArrowReader reader =
+        new LuceneArrowReader(indicesService, bridge.getAllocator(), veloxLifecycle);
 
     final LuceneArrowReader.ScanStats scanStats =
         request.isProfileEnabled() ? new LuceneArrowReader.ScanStats() : null;
@@ -569,7 +600,7 @@ public class TransportExecuteFragmentAction
       logger.info("Shuffle scan complete: {} rows sent for query {}", totalRows, queryId);
 
       ExecuteFragmentResponse resp = ExecuteFragmentResponse.success(totalRows, new byte[0]);
-      attachTaskProfile(request, resp, scanStats, startNanos);
+      attachTaskProfile(request, resp, scanStats, startNanos, bridge);
       return resp;
 
     } catch (Exception e) {
@@ -705,6 +736,9 @@ public class TransportExecuteFragmentAction
 
   // ---- Shuffle Data Sending ----
 
+  private static final int SHUFFLE_BACKPRESSURE_MAX_RETRIES = 5;
+  private static final long SHUFFLE_BACKPRESSURE_INITIAL_BACKOFF_MS = 100;
+
   private void sendShuffleData(
       DiscoveryNode target,
       String queryId,
@@ -715,32 +749,70 @@ public class TransportExecuteFragmentAction
     ShuffleDataRequest shuffleRequest =
         new ShuffleDataRequest(queryId, targetStageId, side, data, isLast);
 
-    transportService.sendRequest(
-        target,
-        ShuffleDataAction.NAME,
-        shuffleRequest,
-        new TransportResponseHandler<ShuffleDataResponse>() {
-          @Override
-          public ShuffleDataResponse read(StreamInput in) throws IOException {
-            return new ShuffleDataResponse(in);
-          }
+    for (int attempt = 0; attempt <= SHUFFLE_BACKPRESSURE_MAX_RETRIES; attempt++) {
+      java.util.concurrent.CompletableFuture<ShuffleDataResponse> future =
+          new java.util.concurrent.CompletableFuture<>();
+      transportService.sendRequest(
+          target,
+          ShuffleDataAction.NAME,
+          shuffleRequest,
+          new TransportResponseHandler<ShuffleDataResponse>() {
+            @Override
+            public ShuffleDataResponse read(StreamInput in) throws IOException {
+              return new ShuffleDataResponse(in);
+            }
 
-          @Override
-          public void handleResponse(ShuffleDataResponse response) {
-            // Shuffle data acknowledged
-          }
+            @Override
+            public void handleResponse(ShuffleDataResponse response) {
+              future.complete(response);
+            }
 
-          @Override
-          public void handleException(TransportException exp) {
-            logger.error(
-                "Failed to send shuffle data to {}: {}", target.getName(), exp.getMessage());
-          }
+            @Override
+            public void handleException(TransportException exp) {
+              future.completeExceptionally(exp);
+            }
 
-          @Override
-          public String executor() {
-            return ThreadPool.Names.SEARCH;
-          }
-        });
+            @Override
+            public String executor() {
+              // Run on the transport receive thread — handleResponse only completes the future
+              // with no I/O, so there's no need to hop to SEARCH. Using SEARCH here deadlocks
+              // the sender: doExecute() already runs on SEARCH and blocks in future.get below,
+              // so under fanout the SEARCH pool can fill with blocked senders and leave no
+              // thread to run handleResponse, causing spurious 60s timeouts.
+              return ThreadPool.Names.SAME;
+            }
+          });
+
+      ShuffleDataResponse resp;
+      try {
+        resp = future.get(60, java.util.concurrent.TimeUnit.SECONDS);
+      } catch (Exception e) {
+        logger.error(
+            "Failed to send shuffle data to {} (attempt {}): {}",
+            target.getName(),
+            attempt + 1,
+            e.getMessage());
+        return;
+      }
+
+      if (!resp.isBackpressure()) {
+        return;
+      }
+
+      if (attempt == SHUFFLE_BACKPRESSURE_MAX_RETRIES) {
+        logger.error(
+            "Shuffle buffer full on {} after {} retries, giving up", target.getName(), attempt + 1);
+        throw new RuntimeException("shuffle buffer full on " + target.getName() + " after retries");
+      }
+
+      long backoff = SHUFFLE_BACKPRESSURE_INITIAL_BACKOFF_MS * (1L << attempt);
+      try {
+        Thread.sleep(backoff);
+      } catch (InterruptedException ie) {
+        Thread.currentThread().interrupt();
+        throw new RuntimeException("interrupted during shuffle backpressure backoff", ie);
+      }
+    }
   }
 
   // ---- Plan Introspection Helpers ----

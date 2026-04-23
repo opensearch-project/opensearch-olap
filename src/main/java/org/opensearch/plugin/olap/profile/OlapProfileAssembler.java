@@ -104,52 +104,86 @@ public final class OlapProfileAssembler {
     String rfKind = "NONE";
     long fragDocsRead = 0;
     long fragDocsMatched = 0;
+    long fragPeakArrow = 0;
+    long fragBpWait = 0;
+    long fragResultBytes = 0;
+    long fragShuffleRejects = 0;
     for (OlapTaskProfile tp : tasks) {
       taskNodes.add(buildTaskNode(tp));
       fragTime += tp.getDurationNanos();
       fragRows += tp.getRowsEmitted();
       fragDocsRead += tp.getDocsRead();
       fragDocsMatched += tp.getDocsMatched();
+      fragPeakArrow = Math.max(fragPeakArrow, tp.getPeakArrowBytes());
+      fragBpWait += tp.getBackpressureWaitNanos();
+      fragResultBytes += tp.getResultBytes();
+      fragShuffleRejects += tp.getShuffleRejectCount();
       if (!"NONE".equals(tp.getRfKind())) {
         rfKind = tp.getRfKind();
       }
     }
-    String label =
-        "Fragment["
-            + fragmentId
-            + "] rf="
-            + rfKind
-            + " docsRead="
-            + fragDocsRead
-            + " docsMatched="
-            + fragDocsMatched
-            + " rows="
-            + fragRows
-            + " ("
-            + tasks.size()
-            + " tasks)";
-    ProfilePlanNode node = new ProfilePlanNode(label, taskNodes);
+    StringBuilder label =
+        new StringBuilder()
+            .append("Fragment[")
+            .append(fragmentId)
+            .append("] rf=")
+            .append(rfKind)
+            .append(" docsRead=")
+            .append(fragDocsRead)
+            .append(" docsMatched=")
+            .append(fragDocsMatched)
+            .append(" rows=")
+            .append(fragRows);
+    if (fragPeakArrow > 0 || fragBpWait > 0) {
+      label
+          .append(" peakArrowBytes=")
+          .append(fragPeakArrow)
+          .append(" backpressureWaitNanos=")
+          .append(fragBpWait);
+    }
+    if (fragResultBytes > 0) {
+      label.append(" resultBytes=").append(fragResultBytes);
+    }
+    if (fragShuffleRejects > 0) {
+      label.append(" shuffleRejectCount=").append(fragShuffleRejects);
+    }
+    label.append(" (").append(tasks.size()).append(" tasks)");
+    ProfilePlanNode node = new ProfilePlanNode(label.toString(), taskNodes);
     node.metrics().addTimeNanos(fragTime);
     return node;
   }
 
   private static ProfilePlanNode buildTaskNode(OlapTaskProfile tp) {
-    String label =
-        "Task frag="
-            + tp.getFragmentId()
-            + " part="
-            + tp.getPartitionId()
-            + " node="
-            + tp.getNodeId()
-            + " rf="
-            + tp.getRfKind()
-            + " docsRead="
-            + tp.getDocsRead()
-            + " docsMatched="
-            + tp.getDocsMatched()
-            + " rows="
-            + tp.getRowsEmitted();
-    ProfilePlanNode node = new ProfilePlanNode(label, Collections.emptyList());
+    StringBuilder label =
+        new StringBuilder()
+            .append("Task frag=")
+            .append(tp.getFragmentId())
+            .append(" part=")
+            .append(tp.getPartitionId())
+            .append(" node=")
+            .append(tp.getNodeId())
+            .append(" rf=")
+            .append(tp.getRfKind())
+            .append(" docsRead=")
+            .append(tp.getDocsRead())
+            .append(" docsMatched=")
+            .append(tp.getDocsMatched())
+            .append(" rows=")
+            .append(tp.getRowsEmitted());
+    if (tp.getPeakArrowBytes() > 0 || tp.getBackpressureWaitNanos() > 0) {
+      label
+          .append(" peakArrowBytes=")
+          .append(tp.getPeakArrowBytes())
+          .append(" backpressureWaitNanos=")
+          .append(tp.getBackpressureWaitNanos());
+    }
+    if (tp.getResultBytes() > 0) {
+      label.append(" resultBytes=").append(tp.getResultBytes());
+    }
+    if (tp.getShuffleRejectCount() > 0) {
+      label.append(" shuffleRejectCount=").append(tp.getShuffleRejectCount());
+    }
+    ProfilePlanNode node = new ProfilePlanNode(label.toString(), Collections.emptyList());
     node.metrics().addTimeNanos(tp.getDurationNanos());
     return node;
   }

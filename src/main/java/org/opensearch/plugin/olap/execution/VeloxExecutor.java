@@ -51,9 +51,23 @@ public class VeloxExecutor {
   private static final Logger logger = LogManager.getLogger(VeloxExecutor.class);
 
   private final Session session;
+  private final VeloxLifecycleService lifecycle;
 
   public VeloxExecutor(Session session) {
+    this(session, null);
+  }
+
+  public VeloxExecutor(Session session, VeloxLifecycleService lifecycle) {
     this.session = session;
+    this.lifecycle = lifecycle;
+  }
+
+  private long resultAllocatorLimit() {
+    return lifecycle == null ? Long.MAX_VALUE : lifecycle.getResultAllocatorBytes();
+  }
+
+  private long maxResultBytes() {
+    return lifecycle == null ? Long.MAX_VALUE : lifecycle.getMaxResultBytes();
   }
 
   /**
@@ -115,16 +129,33 @@ public class VeloxExecutor {
 
     CloseableIterator<RowVector> resultIterator = UpIterators.asJavaIterator(serialTask);
     List<byte[]> results = new ArrayList<>();
+    long totalBytes = 0;
+    final long resultCap = maxResultBytes();
 
     try {
       while (resultIterator.hasNext()) {
         RowVector resultBatch = resultIterator.next();
         if (resultBatch == null) break;
-        results.add(BaseVectors.serializeOneToBuf(resultBatch));
+        byte[] serialized = BaseVectors.serializeOneToBuf(resultBatch);
+        totalBytes += serialized.length;
+        if (totalBytes > resultCap) {
+          resultIterator.close();
+          throw new ResultTooLargeException(
+              "Fragment native result exceeded plugins.velox.max_result_bytes cap ("
+                  + resultCap
+                  + "): accumulated "
+                  + totalBytes
+                  + " bytes across "
+                  + (results.size() + 1)
+                  + " batches");
+        }
+        results.add(serialized);
       }
       resultIterator.close();
       logger.debug("Velox native execution complete, {} batches", results.size());
       return results;
+    } catch (ResultTooLargeException e) {
+      throw e;
     } catch (Exception e) {
       throw new RuntimeException("Failed to execute Velox plan (native serde)", e);
     }
@@ -266,8 +297,9 @@ public class VeloxExecutor {
 
     OlapBloomFilter bloom = OlapBloomFilter.create(expectedInsertions);
     CloseableIterator<RowVector> resultIterator = UpIterators.asJavaIterator(serialTask);
-    BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+    BufferAllocator allocator = new RootAllocator(resultAllocatorLimit());
     long inserted = 0;
+    final long resultCap = maxResultBytes();
 
     try (ByteArrayOutputStream baos = new ByteArrayOutputStream()) {
       ArrowStreamWriter writer = null;
@@ -302,6 +334,14 @@ public class VeloxExecutor {
         writer.writeBatch();
         hasData = true;
         arrowRoot.close();
+        if (baos.size() > resultCap) {
+          throw new ResultTooLargeException(
+              "PARTIAL bloom fragment Arrow IPC exceeded plugins.velox.max_result_bytes cap ("
+                  + resultCap
+                  + "): current size "
+                  + baos.size()
+                  + " bytes");
+        }
       }
 
       if (writer != null) {
@@ -319,6 +359,8 @@ public class VeloxExecutor {
 
       return new ExecuteWithBloomResult(
           hasData ? baos.toByteArray() : new byte[0], bloom.toBytes());
+    } catch (ResultTooLargeException e) {
+      throw e;
     } catch (Exception e) {
       throw new RuntimeException("Failed to execute Velox plan with PARTIAL bloom build", e);
     } finally {
@@ -358,7 +400,8 @@ public class VeloxExecutor {
   /** Collect all result batches from a serial task as Arrow IPC bytes. */
   private byte[] collectArrowIpc(SerialTask serialTask) {
     CloseableIterator<RowVector> resultIterator = UpIterators.asJavaIterator(serialTask);
-    BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+    BufferAllocator allocator = new RootAllocator(resultAllocatorLimit());
+    final long resultCap = maxResultBytes();
 
     try (ByteArrayOutputStream baos = new ByteArrayOutputStream()) {
       ArrowStreamWriter writer = null;
@@ -376,6 +419,14 @@ public class VeloxExecutor {
         writer.writeBatch();
         hasData = true;
         arrowRoot.close();
+        if (baos.size() > resultCap) {
+          throw new ResultTooLargeException(
+              "Fragment Arrow IPC result exceeded plugins.velox.max_result_bytes cap ("
+                  + resultCap
+                  + "): current size "
+                  + baos.size()
+                  + " bytes");
+        }
       }
 
       if (writer != null) {
@@ -387,6 +438,8 @@ public class VeloxExecutor {
       logger.debug("Velox execution complete, result size={} bytes", baos.size());
       return hasData ? baos.toByteArray() : new byte[0];
 
+    } catch (ResultTooLargeException e) {
+      throw e;
     } catch (Exception e) {
       throw new RuntimeException("Failed to execute Velox plan or serialize results", e);
     } finally {

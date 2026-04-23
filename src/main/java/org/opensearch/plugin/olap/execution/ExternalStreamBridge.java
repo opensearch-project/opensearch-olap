@@ -8,6 +8,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
 import org.apache.arrow.memory.BufferAllocator;
+import org.apache.arrow.memory.OutOfMemoryException;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.logging.log4j.LogManager;
@@ -40,14 +41,25 @@ public class ExternalStreamBridge implements AutoCloseable {
 
   private final Session session;
   private final BufferAllocator allocator;
+  private final long allocatorLimitBytes;
   private BlockingQueue queue;
   private String connectorId;
   private final AtomicLong rowCount = new AtomicLong(0);
+  private final AtomicLong peakBytesInFlight = new AtomicLong(0);
   private List<String> requestedFields = new ArrayList<>();
 
+  /**
+   * Create an unbounded bridge. Retained for tests; production code should use the overload that
+   * takes an explicit byte limit so the Arrow allocator cannot grow without bound.
+   */
   public ExternalStreamBridge(Session session) {
+    this(session, Long.MAX_VALUE);
+  }
+
+  public ExternalStreamBridge(Session session, long allocatorLimitBytes) {
     this.session = session;
-    this.allocator = new RootAllocator(Long.MAX_VALUE);
+    this.allocatorLimitBytes = allocatorLimitBytes;
+    this.allocator = new RootAllocator(allocatorLimitBytes);
   }
 
   /** Open the bridge, creating the native BlockingQueue. */
@@ -70,12 +82,33 @@ public class ExternalStreamBridge implements AutoCloseable {
     }
 
     Arrow arrowOps = session.arrowOps();
-    // Convert Arrow VectorSchemaRoot → Velox RowVector via Arrow C Data Interface
-    RowVector rowVector = arrowOps.fromArrowVectorSchemaRoot(allocator, arrowBatch);
+    RowVector rowVector;
+    try {
+      // Convert Arrow VectorSchemaRoot → Velox RowVector via Arrow C Data Interface
+      rowVector = arrowOps.fromArrowVectorSchemaRoot(allocator, arrowBatch);
+    } catch (OutOfMemoryException oom) {
+      // Arrow refused the allocation because the hard cap was hit. Surface as a transient
+      // backpressure signal so task retry can pick it up.
+      throw new BackpressureTimeoutException(
+          "Arrow allocator exceeded per-fragment cap "
+              + allocatorLimitBytes
+              + " bytes (live="
+              + allocator.getAllocatedMemory()
+              + ")",
+          oom);
+    }
     queue.put(rowVector);
 
     long batchRows = arrowBatch.getRowCount();
     rowCount.addAndGet(batchRows);
+
+    // Record peak Java-side Arrow memory for profile reporting.
+    long current = allocator.getAllocatedMemory();
+    long prev;
+    do {
+      prev = peakBytesInFlight.get();
+      if (current <= prev) break;
+    } while (!peakBytesInFlight.compareAndSet(prev, current));
 
     // Close the Arrow batch after conversion (data now owned by Velox)
     arrowBatch.close();
@@ -119,6 +152,18 @@ public class ExternalStreamBridge implements AutoCloseable {
 
   public BufferAllocator getAllocator() {
     return allocator;
+  }
+
+  public long getAllocatorLimitBytes() {
+    return allocatorLimitBytes;
+  }
+
+  public long getBytesInFlight() {
+    return allocator.getAllocatedMemory();
+  }
+
+  public long getPeakBytesInFlight() {
+    return peakBytesInFlight.get();
   }
 
   public List<String> getRequestedFields() {

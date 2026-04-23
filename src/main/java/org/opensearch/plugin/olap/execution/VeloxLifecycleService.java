@@ -15,6 +15,8 @@ import org.boostscale.velox4j.memory.MemoryManager;
 import org.boostscale.velox4j.session.Session;
 import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.core.common.unit.ByteSizeUnit;
+import org.opensearch.core.common.unit.ByteSizeValue;
 
 /**
  * Manages the lifecycle of the Velox native engine within the OpenSearch process.
@@ -184,6 +186,119 @@ public class VeloxLifecycleService implements Closeable {
           Setting.Property.NodeScope,
           Setting.Property.Dynamic);
 
+  // ---- Backpressure / flow control settings ----
+
+  /**
+   * Hard cap on the Arrow allocator used by {@code ExternalStreamBridge} per fragment. Bounds the
+   * Java-side Arrow memory held between Lucene reads and Velox consumption. Also drives the feeder
+   * soft-watermark gate in {@code LuceneArrowReader}.
+   */
+  public static final Setting<ByteSizeValue> PER_FRAGMENT_ARROW_BYTES =
+      Setting.byteSizeSetting(
+          "plugins.velox.per_fragment_arrow_bytes",
+          new ByteSizeValue(256, ByteSizeUnit.MB),
+          new ByteSizeValue(16, ByteSizeUnit.MB),
+          new ByteSizeValue(Long.MAX_VALUE, ByteSizeUnit.BYTES),
+          Setting.Property.NodeScope,
+          Setting.Property.Dynamic);
+
+  /** Hard cap on the Arrow allocator used by {@code VeloxExecutor} for result serialization. */
+  public static final Setting<ByteSizeValue> RESULT_ALLOCATOR_BYTES =
+      Setting.byteSizeSetting(
+          "plugins.velox.result_allocator_bytes",
+          new ByteSizeValue(512, ByteSizeUnit.MB),
+          new ByteSizeValue(32, ByteSizeUnit.MB),
+          new ByteSizeValue(Long.MAX_VALUE, ByteSizeUnit.BYTES),
+          Setting.Property.NodeScope,
+          Setting.Property.Dynamic);
+
+  /**
+   * Maximum serialized size of a single fragment result (Arrow IPC or native). When exceeded the
+   * fragment fails with {@code ResultTooLargeException} (non-retryable) instead of risking OOM.
+   */
+  public static final Setting<ByteSizeValue> MAX_RESULT_BYTES =
+      Setting.byteSizeSetting(
+          "plugins.velox.max_result_bytes",
+          new ByteSizeValue(1, ByteSizeUnit.GB),
+          new ByteSizeValue(64, ByteSizeUnit.MB),
+          new ByteSizeValue(Long.MAX_VALUE, ByteSizeUnit.BYTES),
+          Setting.Property.NodeScope,
+          Setting.Property.Dynamic);
+
+  /**
+   * Hard cap on Arrow allocators used by the coordinator path in {@code VeloxExecutionEngine}
+   * (FINAL-agg feed, broadcast build, intermediate result deserialization).
+   */
+  public static final Setting<ByteSizeValue> COORDINATOR_ALLOCATOR_BYTES =
+      Setting.byteSizeSetting(
+          "plugins.velox.coordinator_allocator_bytes",
+          new ByteSizeValue(1, ByteSizeUnit.GB),
+          new ByteSizeValue(128, ByteSizeUnit.MB),
+          new ByteSizeValue(Long.MAX_VALUE, ByteSizeUnit.BYTES),
+          Setting.Property.NodeScope,
+          Setting.Property.Dynamic);
+
+  /**
+   * Soft watermark for the FINAL-aggregation feed queue on the coordinator. When the
+   * coordinator-side Arrow allocator exceeds this, feeders park until it drains.
+   */
+  public static final Setting<ByteSizeValue> COORDINATOR_QUEUE_BYTES =
+      Setting.byteSizeSetting(
+          "plugins.velox.coordinator_queue_bytes",
+          new ByteSizeValue(256, ByteSizeUnit.MB),
+          new ByteSizeValue(32, ByteSizeUnit.MB),
+          new ByteSizeValue(Long.MAX_VALUE, ByteSizeUnit.BYTES),
+          Setting.Property.NodeScope,
+          Setting.Property.Dynamic);
+
+  /**
+   * Aggregate cap on all fragment responses accumulated by {@code NodeResultCollector} during a
+   * single query. Prevents coordinator heap exhaustion when many large fragments arrive together.
+   */
+  public static final Setting<ByteSizeValue> COORDINATOR_INFLIGHT_BYTES =
+      Setting.byteSizeSetting(
+          "plugins.velox.coordinator_inflight_bytes",
+          new ByteSizeValue(2, ByteSizeUnit.GB),
+          new ByteSizeValue(256, ByteSizeUnit.MB),
+          new ByteSizeValue(Long.MAX_VALUE, ByteSizeUnit.BYTES),
+          Setting.Property.NodeScope,
+          Setting.Property.Dynamic);
+
+  /**
+   * Per-partition shuffle buffer cap. Senders that would push over this threshold receive a
+   * backpressure response and retry with exponential backoff.
+   */
+  public static final Setting<ByteSizeValue> SHUFFLE_BUFFER_BYTES =
+      Setting.byteSizeSetting(
+          "plugins.velox.shuffle_buffer_bytes",
+          new ByteSizeValue(512, ByteSizeUnit.MB),
+          new ByteSizeValue(64, ByteSizeUnit.MB),
+          new ByteSizeValue(Long.MAX_VALUE, ByteSizeUnit.BYTES),
+          Setting.Property.NodeScope,
+          Setting.Property.Dynamic);
+
+  /** Maximum time a producer will wait for a downstream buffer to drain before giving up. */
+  public static final Setting<Integer> BACKPRESSURE_WAIT_MS =
+      Setting.intSetting(
+          "plugins.velox.backpressure_wait_ms",
+          30_000,
+          1_000,
+          Setting.Property.NodeScope,
+          Setting.Property.Dynamic);
+
+  /**
+   * Soft watermark as a percentage of the hard cap at which producers start parking. Values below
+   * 100 give some headroom between "pause" and "fail".
+   */
+  public static final Setting<Integer> BACKPRESSURE_WATERMARK_PCT =
+      Setting.intSetting(
+          "plugins.velox.backpressure_watermark_pct",
+          80,
+          50,
+          100,
+          Setting.Property.NodeScope,
+          Setting.Property.Dynamic);
+
   private volatile boolean enabled;
   private volatile boolean forceVectorize;
   private volatile boolean mppEnabled;
@@ -197,6 +312,15 @@ public class VeloxLifecycleService implements Closeable {
   private volatile int runtimeFilterBloomMaxCardinality;
   private volatile boolean runtimeFilterBloomTwoStage;
   private volatile String cboStatisticsMode;
+  private volatile long perFragmentArrowBytes;
+  private volatile long resultAllocatorBytes;
+  private volatile long maxResultBytes;
+  private volatile long coordinatorAllocatorBytes;
+  private volatile long coordinatorQueueBytes;
+  private volatile long coordinatorInflightBytes;
+  private volatile long shuffleBufferBytes;
+  private volatile int backpressureWaitMs;
+  private volatile int backpressureWatermarkPct;
   private volatile MemoryManager memoryManager;
   private volatile Session session;
   private volatile boolean initialized = false;
@@ -215,6 +339,15 @@ public class VeloxLifecycleService implements Closeable {
     this.runtimeFilterBloomMaxCardinality = RUNTIME_FILTER_BLOOM_MAX_CARDINALITY.get(settings);
     this.runtimeFilterBloomTwoStage = RUNTIME_FILTER_BLOOM_TWO_STAGE.get(settings);
     this.cboStatisticsMode = CBO_STATISTICS_MODE.get(settings);
+    this.perFragmentArrowBytes = PER_FRAGMENT_ARROW_BYTES.get(settings).getBytes();
+    this.resultAllocatorBytes = RESULT_ALLOCATOR_BYTES.get(settings).getBytes();
+    this.maxResultBytes = MAX_RESULT_BYTES.get(settings).getBytes();
+    this.coordinatorAllocatorBytes = COORDINATOR_ALLOCATOR_BYTES.get(settings).getBytes();
+    this.coordinatorQueueBytes = COORDINATOR_QUEUE_BYTES.get(settings).getBytes();
+    this.coordinatorInflightBytes = COORDINATOR_INFLIGHT_BYTES.get(settings).getBytes();
+    this.shuffleBufferBytes = SHUFFLE_BUFFER_BYTES.get(settings).getBytes();
+    this.backpressureWaitMs = BACKPRESSURE_WAIT_MS.get(settings);
+    this.backpressureWatermarkPct = BACKPRESSURE_WATERMARK_PCT.get(settings);
 
     if (enabled) {
       try {
@@ -388,6 +521,83 @@ public class VeloxLifecycleService implements Closeable {
     return "RUNTIME".equalsIgnoreCase(cboStatisticsMode);
   }
 
+  public long getPerFragmentArrowBytes() {
+    return perFragmentArrowBytes;
+  }
+
+  public void setPerFragmentArrowBytes(ByteSizeValue value) {
+    this.perFragmentArrowBytes = value.getBytes();
+  }
+
+  public long getResultAllocatorBytes() {
+    return resultAllocatorBytes;
+  }
+
+  public void setResultAllocatorBytes(ByteSizeValue value) {
+    this.resultAllocatorBytes = value.getBytes();
+  }
+
+  public long getMaxResultBytes() {
+    return maxResultBytes;
+  }
+
+  public void setMaxResultBytes(ByteSizeValue value) {
+    this.maxResultBytes = value.getBytes();
+  }
+
+  public long getCoordinatorAllocatorBytes() {
+    return coordinatorAllocatorBytes;
+  }
+
+  public void setCoordinatorAllocatorBytes(ByteSizeValue value) {
+    this.coordinatorAllocatorBytes = value.getBytes();
+  }
+
+  public long getCoordinatorQueueBytes() {
+    return coordinatorQueueBytes;
+  }
+
+  public void setCoordinatorQueueBytes(ByteSizeValue value) {
+    this.coordinatorQueueBytes = value.getBytes();
+  }
+
+  public long getCoordinatorInflightBytes() {
+    return coordinatorInflightBytes;
+  }
+
+  public void setCoordinatorInflightBytes(ByteSizeValue value) {
+    this.coordinatorInflightBytes = value.getBytes();
+  }
+
+  public long getShuffleBufferBytes() {
+    return shuffleBufferBytes;
+  }
+
+  public void setShuffleBufferBytes(ByteSizeValue value) {
+    this.shuffleBufferBytes = value.getBytes();
+  }
+
+  public int getBackpressureWaitMs() {
+    return backpressureWaitMs;
+  }
+
+  public void setBackpressureWaitMs(int backpressureWaitMs) {
+    this.backpressureWaitMs = backpressureWaitMs;
+  }
+
+  public int getBackpressureWatermarkPct() {
+    return backpressureWatermarkPct;
+  }
+
+  public void setBackpressureWatermarkPct(int backpressureWatermarkPct) {
+    this.backpressureWatermarkPct = backpressureWatermarkPct;
+  }
+
+  /** Soft watermark derived from a hard cap + {@link #getBackpressureWatermarkPct()}. */
+  public long softWatermark(long hardCapBytes) {
+    return Math.max(1L, hardCapBytes * backpressureWatermarkPct / 100L);
+  }
+
   public static List<Setting<?>> getSettings() {
     return List.of(
         OLAP_ENABLED,
@@ -404,7 +614,16 @@ public class VeloxLifecycleService implements Closeable {
         RUNTIME_FILTER_BLOOM_MAX_CARDINALITY,
         RUNTIME_FILTER_BLOOM_TWO_STAGE,
         CBO_STATISTICS_MODE,
-        FORCE_VECTORIZE);
+        FORCE_VECTORIZE,
+        PER_FRAGMENT_ARROW_BYTES,
+        RESULT_ALLOCATOR_BYTES,
+        MAX_RESULT_BYTES,
+        COORDINATOR_ALLOCATOR_BYTES,
+        COORDINATOR_QUEUE_BYTES,
+        COORDINATOR_INFLIGHT_BYTES,
+        SHUFFLE_BUFFER_BYTES,
+        BACKPRESSURE_WAIT_MS,
+        BACKPRESSURE_WATERMARK_PCT);
   }
 
   @Override
