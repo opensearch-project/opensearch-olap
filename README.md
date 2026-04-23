@@ -277,6 +277,22 @@ COUNT, SUM, AVG, MIN, MAX (with DISTINCT support)
 | `plugins.velox.runtime_filter_bloom_two_stage` | `true` | Two-stage BLOOM build: each data node builds a PARTIAL bloom over local shards, coordinator merges via bitwise-OR into a FINAL bloom. Identical `expectedInsertions` across partials guarantees bit alignment. When false, coordinator rebuilds the bloom from broadcast build rows. **Dynamic.** |
 | `plugins.velox.cbo_statistics_mode` | `RUNTIME` | CBO statistics mode. `RUNTIME` collects row counts from IndicesStatsResponse before optimization for accurate build side selection. `NONE` skips (uses shard-count heuristic). **Dynamic.** |
 
+### Backpressure / memory bounds
+
+All allocator and buffer caps are dynamic. See [Backpressure](#backpressure) below for what each bound protects.
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `plugins.velox.per_fragment_arrow_bytes` | `256mb` | Hard cap on the Arrow allocator feeding Velox on data nodes. Soft watermark gates the feeder before each Arrow batch. **Dynamic.** |
+| `plugins.velox.result_allocator_bytes` | `512mb` | Hard cap on the Arrow allocator used by `VeloxExecutor` to serialize results. **Dynamic.** |
+| `plugins.velox.max_result_bytes` | `1gb` | Max serialized size of a single fragment result (Arrow IPC or Velox native). Overflow → `ResultTooLargeException` (non-retryable). **Dynamic.** |
+| `plugins.velox.coordinator_allocator_bytes` | `1gb` | Hard cap on coordinator-side Arrow allocators (FINAL-agg feed, broadcast build, partial-result deserialization). **Dynamic.** |
+| `plugins.velox.coordinator_queue_bytes` | `256mb` | Soft watermark for the FINAL-aggregation feed queue on the coordinator. Feeders park until drained. **Dynamic.** |
+| `plugins.velox.coordinator_inflight_bytes` | `2gb` | Aggregate cap across all fragment responses for a single query. Overflow → query fails fast with `ResultTooLargeException`. **Dynamic.** |
+| `plugins.velox.shuffle_buffer_bytes` | `512mb` | Per-partition shuffle buffer cap. Sends over the cap receive `backpressure=true`; sender exponentially backs off and retries (5 attempts). **Dynamic.** |
+| `plugins.velox.backpressure_wait_ms` | `30000` | Max time a producer will wait on the soft-watermark gate before giving up with `BackpressureTimeoutException` (retryable transient). **Dynamic.** |
+| `plugins.velox.backpressure_watermark_pct` | `80` | Soft watermark as a percentage of the matching hard cap. Values below 100 give headroom between "pause producer" and "fail". **Dynamic.** |
+
 ## Dependencies
 
 | Dependency | Version | Scope | Purpose |
@@ -405,6 +421,10 @@ The standard SQL-plugin `profile` block (see `summary` + `phases`) is augmented 
 - `docsMatched` — number of docs the scorer admitted and emitted into the Arrow bridge.
 - `rows` — rows emitted by the Velox fragment's final operator (may differ from `docsMatched` due to joins/aggregations).
 - `rf` — runtime filter kind applied on this task (`NONE` / `TERMS` / `BLOOM`).
+- `peakArrowBytes` (only shown when > 0) — peak Java-side Arrow allocator memory during the task. Useful for right-sizing `per_fragment_arrow_bytes`.
+- `backpressureWaitNanos` (only shown when > 0) — total time this task's feeder was parked waiting for the downstream allocator to drain. A non-zero value means a bound was engaged; sustained values across tasks indicate the caps are tight for the workload.
+- `resultBytes` (only shown when > 0) — serialized result size produced by this task. Compare against `max_result_bytes`.
+- `shuffleRejectCount` (only shown when > 0) — number of times a shuffle send was rejected with backpressure and retried.
 
 The gap between `docsRead` and `docsMatched` is the observable effect of the runtime filter at the Lucene level. Tasks with `rf=NONE` (e.g., build-side leaves, coordinator stages) naturally report `docsRead=0` when they don't read from Lucene.
 
@@ -434,6 +454,42 @@ If the BLOOM run's `docsMatched` sum is lower than the baseline, the Lucene push
 - Profiling is only emitted for successful queries (same as the SQL plugin's profile).
 - Per-fragment `time_ms` is the **sum** of task times, not wall-clock — parallelism across tasks is not subtracted out. This matches the SQL plugin's convention where child times may exceed the parent.
 - Profiling adds a per-task wire-format trailer (~60 bytes) and skips all counter work when `profile=true` is absent from the request, so the overhead is negligible for non-profiled queries.
+
+## Backpressure
+
+The plugin bounds memory at every producer/consumer boundary so a single heavy query cannot OOM the node. All knobs are dynamic — tune them without a restart. See the [Backpressure / memory bounds](#backpressure--memory-bounds) config table for the full list.
+
+**Boundaries and what they protect**:
+
+| Where | Setting | What happens when full |
+|---|---|---|
+| Data-node feeder (Lucene → Arrow → Velox) | `per_fragment_arrow_bytes` | Feeder parks on soft watermark; if still over after `backpressure_wait_ms`, fragment fails `RETRYABLE_TRANSIENT` |
+| Data-node result serialization | `result_allocator_bytes`, `max_result_bytes` | Oversized single result → `ResultTooLargeException` (non-retryable — the user query needs to reduce its output) |
+| Coordinator FINAL aggregation | `coordinator_allocator_bytes`, `coordinator_queue_bytes` | Feeder parks on soft watermark until the FINAL agg drains |
+| Coordinator response accumulation | `coordinator_inflight_bytes` | Query-wide aggregate cap; crossing it cancels remaining fragments and fails the query |
+| Per-partition shuffle buffer | `shuffle_buffer_bytes` | Receiver rejects with `backpressure=true`; sender exponentially backs off (100ms → 3.2s, 5 retries) |
+
+**How to tell if a query is hitting backpressure**:
+
+Run the query with `"profile": true` and look for non-zero `backpressureWaitNanos` or `shuffleRejectCount` in the profile tree. If you see them, the node was healthy but the caps were tight. If a query fails with `ResultTooLargeException`, the cap was exceeded — either raise `max_result_bytes`/`coordinator_inflight_bytes` or narrow the query.
+
+**Example: shrink the feeder cap to test backpressure**:
+
+```bash
+curl -sS -H 'Content-Type: application/json' -X PUT localhost:9200/_cluster/settings -d '{
+  "persistent": {
+    "plugins.velox.per_fragment_arrow_bytes": "32mb",
+    "plugins.velox.backpressure_watermark_pct": 50
+  }
+}'
+# Run a large aggregation with profile=true — backpressureWaitNanos will be > 0
+# on tasks where the feeder had to pause.
+```
+
+**Design intent**:
+- Hard caps trigger *typed exceptions*, not OOM. The error classifier routes them to `RETRYABLE_TRANSIENT` (temporary pressure — retry) or `RESOURCE_EXCEEDED` (user-query-too-large — don't retry).
+- Transport handlers never block. Shuffle backpressure is propagated via a response flag; the sender retries. Blocking transport threads would starve OpenSearch itself.
+- Defaults are conservative. For heap-constrained deployments, scale all `*_bytes` settings down in proportion; for large fanout, raise `coordinator_inflight_bytes` toward `num_fragments × max_result_bytes`.
 
 ## Installation
 

@@ -89,8 +89,11 @@ Use simple class name + import in coding as much as possible, except there is ob
 ./gradlew integTest                # Integration tests (requires running OpenSearch cluster)
 ./gradlew spotlessApply            # Auto-format code (always run after Java code changes)
 ./gradlew test --tests "*.VeloxExprConverterTests"  # Run a specific test class
+./gradlew build -x integTest       # Fast pre-commit check (~45s): spotlessCheck + jacoco + unit tests, no cluster
 ```
 Integration test logs are at `build/testclusters/integTest-0/logs/integTest.log`. `./gradlew integTest --rerun-tasks` wipes the log — capture it between runs if diffing behavior. Native JVM crashes leave `hs_err_pid*.log` in `build/testclusters/integTest-0/distro/.../logs/`.
+
+**Byte-valued settings**: Use `Setting.byteSizeSetting(key, defaultBSV, minBSV, maxBSV, NodeScope, Dynamic)` with `ByteSizeValue`/`ByteSizeUnit`. The setter accepts `ByteSizeValue` and caches `.getBytes()` into a `volatile long`. See `PER_FRAGMENT_ARROW_BYTES` in `VeloxLifecycleService`.
 
 **JDK 21 / JDK 25 compile classpath**: Project targets JDK 21 bytecode (`sourceCompatibility = VERSION_21`) but also compiles cleanly under JDK 25. JDK 25's javac is stricter about missing annotation class files — it fails hard where JDK 21 merely warned. Four `compileOnly` entries in `build.gradle` supply the annotations/helper classes referenced by Calcite/Arrow/SQL-plugin bytecode: `org.checkerframework:checker-qual`, `org.apiguardian:apiguardian-api`, `com.fasterxml.jackson.core:jackson-annotations`, `org.apache.calcite:calcite-linq4j`. If a new JDK version surfaces another `CompletionFailure: class file for X not found`, add that library as a `compileOnly` entry in the same block.
 
@@ -123,6 +126,7 @@ The SQL plugin uses custom Calcite RelNode subclasses, not always the standard `
 - **DATE/TIME constants**: velox4j has no `DateValue`/`TimeValue` variants. Use `ConstantTypedExpr.create(new DateType(), new IntegerValue(days))` and `ConstantTypedExpr.create(new BigIntType(), new BigIntValue(millis))`. The Velox return type is carried on `ConstantTypedExpr`, not derived from the variant — typing the constant as `IntegerType` breaks binding against a `DateType` column.
 - **PARTIAL/FINAL aggregation exchange**: Arrow IPC does NOT preserve Velox's intermediate accumulator state (e.g., avg's `{sum, count}`). The coordinator exchange must use Velox native serialization (`BaseVectors.serializeToBuf/deserializeFromBuf`) — added to velox4j as a custom extension. Without this, the FINAL aggregation hangs because it can't interpret Arrow-deserialized data as valid intermediate state.
 - **ExternalStream empty assignments**: `ExternalStreamConnector` enforces `columnHandles.empty()` in C++. `TableScanNode` for ExternalStream must have empty assignments list — the schema is defined solely by `outputType`.
+- **BlockingQueue API is minimal**: `ExternalStreams.BlockingQueue` exposes only `put(RowVector)` and `noMoreInput()` — no `size()`, no drain callback. `put()` blocks only *after* the RowVector has already been allocated, so it's a poor fit for bounding Java-side Arrow memory. For byte-level backpressure use `BufferAllocator.getAllocatedMemory()` as the gauge — Velox takes ownership via `fromArrowVectorSchemaRoot()`, so Java-side live bytes drop as Velox consumes. See `execution/Backpressure.java`.
 - **velox4j source**: `../velox4j`
 
 ## Distributed aggregation execution flow
@@ -253,6 +257,16 @@ The plugin participates in the SQL plugin's PPL `{"profile":true}` flow (see `..
 **User verification** for "did Lucene BLOOM narrow the scan?": run the same query twice with `profile=true`, once with `runtime_filter_enabled=false` (baseline) and once forced to BLOOM via low TERMS cap. Compare `docsMatched` across the leaf-task nodes — BLOOM should narrow. See `ProfileBloomNarrowsScanIT` for the encoded assertion.
 
 Wire format: `ExecuteFragmentRequest.profileEnabled` (boolean trailer), `ExecuteFragmentResponse.taskProfile` (optional `OlapTaskProfile` block, tagged by leading bool).
+
+**Wire format evolution**: The plugin ships with the OpenSearch release, so both peers always speak the same `WIRE_VERSION`. Bump the constant whenever the layout changes — no cross-version decode branches needed. v2 added `peakArrowBytes`, `backpressureWaitNanos`, `resultBytes`, `shuffleRejectCount` for backpressure observability.
+
+## Backpressure / flow control
+All Arrow allocators are bounded (no more `RootAllocator(Long.MAX_VALUE)`). Bounds come from `plugins.velox.*_bytes` settings on `VeloxLifecycleService`; the gauge at every boundary is `BufferAllocator.getAllocatedMemory()`. Producers call `Backpressure.awaitBelow(allocator, softWatermark, timeoutNanos, scanStats.backpressureWaitNanos)` before allocating the next Arrow batch — `LuceneArrowReader` does this around every `bridge.feedBatch()`, `VeloxExecutionEngine.feedArrowIpcToQueue()` does it around every `queue.put()`.
+
+Failure semantics:
+- Arrow allocator refuses → `ExternalStreamBridge.feedBatch` rethrows as `BackpressureTimeoutException` → `RETRYABLE_TRANSIENT`
+- `max_result_bytes` or `coordinator_inflight_bytes` exceeded → `ResultTooLargeException` → new `RESOURCE_EXCEEDED` category, non-retryable
+- Shuffle per-partition cap exceeded → `ShuffleBuffer.tryAddData` rejects; response carries `backpressure=true`; sender exponentially backs off (5 retries: 100ms → 3.2s) then fails. Transport handlers must NOT block — always reject with a retry signal.
 
 ## Known issues / TODOs
 - **OpenSearch doc values types**: OpenSearch stores all numeric types as `SORTED_NUMERIC` (not `NUMERIC`) and keyword/text as `SORTED_SET` (not `SORTED`). `LuceneArrowReader.mapToDocValueType()` handles this.

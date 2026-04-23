@@ -13,6 +13,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -25,6 +26,7 @@ import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.plugin.olap.common.QueryId;
 import org.opensearch.plugin.olap.execution.OlapBloomFilter;
+import org.opensearch.plugin.olap.execution.ResultTooLargeException;
 import org.opensearch.plugin.olap.execution.RuntimeFilterPayload;
 import org.opensearch.plugin.olap.scheduler.BadResourceTracker;
 import org.opensearch.plugin.olap.scheduler.ErrorClassifier;
@@ -52,17 +54,51 @@ public class NodeResultCollector {
   private final TransportService transportService;
   private final QueryScheduler scheduler;
   private final int maxRetries;
+  private final long inflightCapBytes;
   private volatile boolean profileEnabled;
 
   public NodeResultCollector(TransportService transportService, QueryScheduler scheduler) {
-    this(transportService, scheduler, 0);
+    this(transportService, scheduler, 0, Long.MAX_VALUE);
   }
 
   public NodeResultCollector(
       TransportService transportService, QueryScheduler scheduler, int maxRetries) {
+    this(transportService, scheduler, maxRetries, Long.MAX_VALUE);
+  }
+
+  /**
+   * @param inflightCapBytes aggregate cap on {@code resultData + nativeResultBatches} bytes
+   *     accumulated across all fragments of a single query. Exceeding this fails the query with
+   *     {@link ResultTooLargeException}. Use {@link Long#MAX_VALUE} to disable.
+   */
+  public NodeResultCollector(
+      TransportService transportService,
+      QueryScheduler scheduler,
+      int maxRetries,
+      long inflightCapBytes) {
     this.transportService = transportService;
     this.scheduler = scheduler;
     this.maxRetries = maxRetries;
+    this.inflightCapBytes = inflightCapBytes;
+  }
+
+  /** Estimate the memory footprint of a single fragment response. */
+  private static long responseBytes(ExecuteFragmentResponse response) {
+    long total = 0;
+    byte[] data = response.getResultData();
+    if (data != null) {
+      total += data.length;
+    }
+    if (response.hasNativeResults()) {
+      for (byte[] b : response.getNativeResultBatches()) {
+        if (b != null) total += b.length;
+      }
+    }
+    byte[] bloom = response.getPartialBloomBytes();
+    if (bloom != null) {
+      total += bloom.length;
+    }
+    return total;
   }
 
   /**
@@ -257,6 +293,7 @@ public class NodeResultCollector {
     List<ExecuteFragmentResponse> responses =
         new ArrayList<>(Collections.nCopies(tasks.size(), null));
     AtomicReference<Exception> firstError = new AtomicReference<>();
+    AtomicLong inflightBytes = new AtomicLong(0);
     BadResourceTracker tracker = new BadResourceTracker();
 
     for (int i = 0; i < tasks.size(); i++) {
@@ -269,6 +306,7 @@ public class NodeResultCollector {
           requestFactory,
           tracker,
           firstError,
+          inflightBytes,
           maxRetries);
     }
 
@@ -298,6 +336,7 @@ public class NodeResultCollector {
       RequestFactory requestFactory,
       BadResourceTracker tracker,
       AtomicReference<Exception> firstError,
+      AtomicLong inflightBytes,
       int retriesLeft) {
 
     ExecuteFragmentRequest request = requestFactory.create(task);
@@ -316,6 +355,26 @@ public class NodeResultCollector {
           @Override
           public void handleResponse(ExecuteFragmentResponse response) {
             if (response.getStatus() == ExecuteFragmentResponse.Status.SUCCESS) {
+              long added = responseBytes(response);
+              long total = inflightBytes.addAndGet(added);
+              if (total > inflightCapBytes) {
+                ResultTooLargeException resourceError =
+                    new ResultTooLargeException(
+                        "Aggregate fragment response size "
+                            + total
+                            + " exceeded plugins.velox.coordinator_inflight_bytes cap "
+                            + inflightCapBytes);
+                logger.warn(
+                    "Cancelling query {}: aggregate response bytes {} exceeded cap {}",
+                    queryId,
+                    total,
+                    inflightCapBytes);
+                firstError.compareAndSet(null, resourceError);
+                scheduler.onTaskFailed(queryId, task.getTaskId(), resourceError.getMessage());
+                // Still countDown so latch completes for the remaining responses.
+                latch.countDown();
+                return;
+              }
               responses.set(index, response);
               scheduler.onTaskCompleted(queryId, task.getTaskId());
               latch.countDown();
@@ -324,7 +383,9 @@ public class NodeResultCollector {
 
             // Task failed — classify and decide retry
             ErrorCategory category = ErrorClassifier.classify(response.getErrorMessage());
-            if (retriesLeft > 0 && category != ErrorCategory.FATAL) {
+            if (retriesLeft > 0
+                && category != ErrorCategory.FATAL
+                && category != ErrorCategory.RESOURCE_EXCEEDED) {
               logger.warn(
                   "Task {} failed ({}), retrying ({} left): {}",
                   task.getTaskId(),
@@ -342,6 +403,7 @@ public class NodeResultCollector {
                     requestFactory,
                     tracker,
                     firstError,
+                    inflightBytes,
                     retriesLeft - 1);
                 return;
               }
@@ -359,7 +421,9 @@ public class NodeResultCollector {
           public void handleException(TransportException exp) {
             // Transport exception — node likely unreachable
             ErrorCategory category = ErrorClassifier.classify(exp);
-            if (retriesLeft > 0 && category != ErrorCategory.FATAL) {
+            if (retriesLeft > 0
+                && category != ErrorCategory.FATAL
+                && category != ErrorCategory.RESOURCE_EXCEEDED) {
               logger.warn(
                   "Transport error for task {} ({}), retrying ({} left): {}",
                   task.getTaskId(),
@@ -377,6 +441,7 @@ public class NodeResultCollector {
                     requestFactory,
                     tracker,
                     firstError,
+                    inflightBytes,
                     retriesLeft - 1);
                 return;
               }

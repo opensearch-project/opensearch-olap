@@ -61,10 +61,45 @@ public class LuceneArrowReader {
 
   private final IndicesService indicesService;
   private final BufferAllocator allocator;
+  private final VeloxLifecycleService lifecycle;
 
   public LuceneArrowReader(IndicesService indicesService, BufferAllocator allocator) {
+    this(indicesService, allocator, null);
+  }
+
+  public LuceneArrowReader(
+      IndicesService indicesService, BufferAllocator allocator, VeloxLifecycleService lifecycle) {
     this.indicesService = indicesService;
     this.allocator = allocator;
+    this.lifecycle = lifecycle;
+  }
+
+  /**
+   * Park until the bridge's Arrow allocator drops below the soft watermark. Called before each
+   * batch allocation so producers pause <em>before</em> paying the allocation cost. Skipped when no
+   * lifecycle is configured (tests constructing the reader directly).
+   */
+  private void awaitBridgeCapacity(ExternalStreamBridge bridge, ScanStats stats) {
+    if (lifecycle == null) {
+      return;
+    }
+    long hardCap = bridge.getAllocatorLimitBytes();
+    if (hardCap >= Long.MAX_VALUE / 2) {
+      // Unbounded allocator — gating is meaningless.
+      return;
+    }
+    long watermark = lifecycle.softWatermark(hardCap);
+    long timeoutNanos = TimeUnit.MILLISECONDS.toNanos(lifecycle.getBackpressureWaitMs());
+    try {
+      Backpressure.awaitBelow(
+          bridge.getAllocator(),
+          watermark,
+          timeoutNanos,
+          stats == null ? null : stats.backpressureWaitNanos);
+    } catch (InterruptedException ie) {
+      Thread.currentThread().interrupt();
+      throw new BackpressureTimeoutException("Interrupted while awaiting backpressure drain", ie);
+    }
   }
 
   /**
@@ -82,6 +117,7 @@ public class LuceneArrowReader {
   public static final class ScanStats {
     private final LongAdder docsRead = new LongAdder();
     private final LongAdder docsMatched = new LongAdder();
+    final LongAdder backpressureWaitNanos = new LongAdder();
 
     public void addDocsRead(long n) {
       docsRead.add(n);
@@ -97,6 +133,10 @@ public class LuceneArrowReader {
 
     public long getDocsMatched() {
       return docsMatched.sum();
+    }
+
+    public long getBackpressureWaitNanos() {
+      return backpressureWaitNanos.sum();
     }
   }
 
@@ -315,6 +355,7 @@ public class LuceneArrowReader {
       stats.addDocsMatched(maxDoc);
     }
     for (int startDoc = 0; startDoc < maxDoc; startDoc += BATCH_SIZE) {
+      awaitBridgeCapacity(bridge, stats);
       int endDoc = Math.min(startDoc + BATCH_SIZE, maxDoc);
       VectorSchemaRoot batch = batchBuilder.buildBatch(leafCtx.reader(), startDoc, endDoc);
       bridge.feedBatch(batch);
@@ -356,6 +397,7 @@ public class LuceneArrowReader {
       batch[count++] = docId;
       emitted++;
       if (count == BATCH_SIZE) {
+        awaitBridgeCapacity(bridge, stats);
         VectorSchemaRoot arrowBatch = batchBuilder.buildBatch(leafCtx.reader(), batch, count);
         bridge.feedBatch(arrowBatch);
         count = 0;
@@ -363,6 +405,7 @@ public class LuceneArrowReader {
     }
 
     if (count > 0) {
+      awaitBridgeCapacity(bridge, stats);
       VectorSchemaRoot arrowBatch = batchBuilder.buildBatch(leafCtx.reader(), batch, count);
       bridge.feedBatch(arrowBatch);
     }

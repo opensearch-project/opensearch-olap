@@ -32,6 +32,7 @@ The OpenSearch OLAP plugin adds a vectorized, columnar execution engine to OpenS
 - Two-stage TopN, window functions (eventstats), fault tolerance with task retry
 - Segment-level parallel reads, predicate pushdown to Lucene, per-query session isolation
 - Plan explain via PPL `explain` command (Velox plan tree output)
+- End-to-end backpressure: bounded Arrow allocators, per-fragment and aggregate result caps, shuffle-buffer flow control with retryable rejection
 - Graceful degradation — if Velox is unavailable, queries fall back to the default engine transparently
 
 ---
@@ -371,6 +372,45 @@ Data Node (per fragment):
 | `olap_feeder` (custom, scaling 1→N CPUs) | Reads Lucene doc values into Arrow batches |
 | Transport threads (built-in) | Inter-node fragment dispatch |
 
+### 4.7 Backpressure and Memory Bounds
+
+Every Java-side Arrow allocator is bounded, every result buffer has a hard cap, and every boundary propagates pressure upstream before the producer has paid the allocation cost. This replaces an earlier "unbounded `RootAllocator(Long.MAX_VALUE)`" path that could OOM under concurrent load.
+
+```
+          producer                                consumer
+  ┌──────────────────────┐                ┌──────────────────────┐
+  │ LuceneArrowReader    │                │ Velox SerialTask      │
+  │                      │                │                       │
+  │ awaitBelow(allocator │ ──── gate ───▶ │ consumes via          │
+  │   softWatermark, ...)│                │ fromArrowVectorSchema │
+  │                      │                │ Root() — releases the │
+  │ then feedBatch()     │                │ Java-side buffers     │
+  └──────────────────────┘                └──────────────────────┘
+          │                                           │
+          └──────── gauge: allocator.getAllocatedMemory() ◀─┘
+```
+
+The gauge is `BufferAllocator.getAllocatedMemory()`. Velox takes ownership of Arrow buffers via the C Data Interface on `fromArrowVectorSchemaRoot()`, so Java-side live bytes drop as Velox consumes. This avoids having to instrument velox4j's native `BlockingQueue` (which has no `size()` or drain callback).
+
+**Per-boundary bounds** (all dynamic settings on `plugins.velox.*`):
+
+| Boundary | Setting | Hard action on overflow |
+|---|---|---|
+| Feeder Arrow allocator | `per_fragment_arrow_bytes` | `BackpressureTimeoutException` → `RETRYABLE_TRANSIENT` |
+| Velox result allocator | `result_allocator_bytes` | `BackpressureTimeoutException` → `RETRYABLE_TRANSIENT` |
+| Per-fragment serialized result | `max_result_bytes` | `ResultTooLargeException` → `RESOURCE_EXCEEDED` (non-retryable) |
+| Coordinator FINAL-agg feed queue | `coordinator_queue_bytes` | Feeder parks on gate; timeout → retryable |
+| Coordinator allocators | `coordinator_allocator_bytes` | Arrow OOM → retryable transient |
+| Aggregate response bytes at coordinator | `coordinator_inflight_bytes` | `ResultTooLargeException` → non-retryable |
+| Per-partition shuffle buffer | `shuffle_buffer_bytes` | Reject with `backpressure=true` → sender exponential backoff (5 retries: 100ms → 3.2s) |
+
+**Soft watermark**: `backpressure_watermark_pct` (default 80) — producers park when `allocator.getAllocatedMemory() > watermark`, with a timeout of `backpressure_wait_ms` (default 30s).
+
+**Design choices worth calling out**:
+- *Transport handlers never block*. `TransportShuffleDataAction` rejects with a backpressure flag rather than parking a transport thread; the sender retries with backoff. Blocking transport threads starves OpenSearch itself.
+- *Explicit failures over OOM*. When a hard cap is crossed, the plugin throws a typed exception that classifies to the right retry category (`RETRYABLE_TRANSIENT` for transient pressure, `RESOURCE_EXCEEDED` for user-query-too-large) rather than letting the JVM crash.
+- *Observable*. Every leaf-task profile carries `peakArrowBytes`, `backpressureWaitNanos`, `resultBytes`, and `shuffleRejectCount`; the coordinator sums them into `profile.plan` so users can see whether a query actually hit the limits.
+
 ---
 
 ## 5. Key Design Decisions
@@ -465,7 +505,8 @@ Our design extends the SQL plugin rather than rewriting it, while adopting key R
 - Join reorder: Calcite-based bushy join reordering using CBO row counts. `JoinToMultiJoinRule` flattens binary join trees into N-ary `MultiJoin`, `MultiJoinOptimizeBushyRule` produces optimal bushy tree using greedy heuristic. `LoptOptimizeJoinRule` handles outer join cases. CBO row counts injected via `StatisticsTableScan` into Calcite's cost model. Coordinator-centric execution supports N-way joins (3+ tables). MPP multi-way falls back to coordinator-centric with TODO for staged execution.
 - PPL UDF → Velox function mapping: 89 of 195 PPL functions mapped to Velox Presto-style names (46% coverage). Math (90%), trig (100%), string (64%), conditional (64%), date extraction (34%). `canVectorize()` checks function support and field types — unsupported functions/types cause query-level fallback. See `docs/velox-function-support.md` for the full matrix.
 - Plan explain: PPL `explain` command outputs Velox plan tree via `PlanNode.toFormatString()`, showing operator pipeline, column projections, and filter expressions.
-- PPL profile integration: participates in the SQL plugin's `{"profile":true}` flow. Each data node records `docsRead`/`docsMatched`/`rowsEmitted` + RF kind per task (`OlapTaskProfile`); coordinator assembles into a `ProfilePlanNode` tree via `OlapProfileAssembler` and registers it on `QueryProfiling.current()`. Surfaces as `profile.plan` in the PPL response — lets users verify whether a BLOOM runtime filter actually narrowed the Lucene scan by comparing `docsMatched` against the RF-disabled baseline.
+- PPL profile integration: participates in the SQL plugin's `{"profile":true}` flow. Each data node records `docsRead`/`docsMatched`/`rowsEmitted` + RF kind + backpressure counters (`peakArrowBytes`, `backpressureWaitNanos`, `resultBytes`, `shuffleRejectCount`) per task (`OlapTaskProfile` wire v2); coordinator assembles into a `ProfilePlanNode` tree via `OlapProfileAssembler` and registers it on `QueryProfiling.current()`. Surfaces as `profile.plan` in the PPL response — lets users verify whether a BLOOM runtime filter actually narrowed the Lucene scan by comparing `docsMatched` against the RF-disabled baseline, and whether a query hit any backpressure gates.
+- Backpressure / flow control: bounded Arrow allocators at every boundary (feeder, Velox result, coordinator, shuffle), driven by `Backpressure.awaitBelow(allocator, softWatermark, timeout)` using `BufferAllocator.getAllocatedMemory()` as the gauge. Hard caps on per-fragment result size (`max_result_bytes`) and aggregate response bytes (`coordinator_inflight_bytes`) fail fast as `RESOURCE_EXCEEDED` rather than risking OOM. Shuffle over-cap rejects with a `backpressure=true` response flag; sender exponentially backs off (5 retries: 100ms → 3.2s). See §4.7. Configurable via `plugins.velox.per_fragment_arrow_bytes` / `result_allocator_bytes` / `max_result_bytes` / `coordinator_allocator_bytes` / `coordinator_queue_bytes` / `coordinator_inflight_bytes` / `shuffle_buffer_bytes` / `backpressure_wait_ms` / `backpressure_watermark_pct` (all dynamic).
 - Big5 benchmark: 58 PPL queries from the SQL plugin's Big5 benchmark migrated. Currently all fall back to the default engine due to nested object fields (`MAP<VARCHAR, ANY>` type). Flat-schema queries with keyword/numeric/date fields execute through Velox.
 - Velox native TIMESTAMP: `@timestamp` and other date fields are carried as Velox `TimestampType` from scan to projection. Arrow feeder emits `Timestamp(MICROSECOND)`; `TimestampUdfRewriter` strips the SQL plugin's `timestamp()` coercion UDF so `@timestamp <op> 'yyyy-MM-dd HH:mm:ss'` compiles to a native `timestamp <op> timestamp` comparison. Unblocks Big5 range/sort queries without per-UDF BIGINT rewrites.
 - Per-query session creation (prevents memory pool collisions)
@@ -483,7 +524,7 @@ Gaps identified by comparison with [RFC #4812](https://github.com/opensearch-pro
 | ~~**Critical**~~ | ~~Runtime Filter (TERMS)~~ | ~~RFC shows 2min → 100ms for 2B×2K row joins~~ | **Done** — build-side join key values extracted and pushed as Lucene TermInSetQuery/PointInSetQuery to probe scan; configurable via `runtime_filter_enabled` + `runtime_filter_max_cardinality` |
 | ~~**High**~~ | ~~Segment-level parallel reads~~ | ~~RFC splits TableScan across Lucene segments with concurrent workers~~ | **Done** — `readShardIntoStreamParallel()` submits one task per segment; configurable via `segment_parallelism` |
 | ~~**High**~~ | ~~Fault tolerance + task retry~~ | ~~RFC has task-level retry, bad node tracking, shard replica failover~~ | **Done** — `ErrorClassifier` categorizes errors, `BadResourceTracker` excludes failed nodes/shards, `NodeResultCollector` retries with replica failover; configurable via `task_max_retries` |
-| **High** | Backpressure / flow control | RFC has sink buffer limits with reverse pressure propagation | Basic BlockingQueue back-pressure only |
+| ~~**High**~~ | ~~Backpressure / flow control~~ | ~~RFC has sink buffer limits with reverse pressure propagation~~ | **Done** — bounded Arrow allocators at every boundary (feeder, result, coordinator, shuffle); `Backpressure.awaitBelow()` gate driven by `allocator.getAllocatedMemory()`; per-fragment `max_result_bytes` + aggregate `coordinator_inflight_bytes` hard caps → new `RESOURCE_EXCEEDED` category; shuffle buffer over-cap → retryable rejection with sender exponential backoff. See §4.7. |
 
 #### Phase 2 — Query Optimization
 

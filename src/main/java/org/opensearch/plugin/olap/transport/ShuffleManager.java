@@ -11,6 +11,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -28,11 +29,26 @@ public class ShuffleManager {
   private static final Logger logger = LogManager.getLogger(ShuffleManager.class);
 
   private final ConcurrentHashMap<String, ShuffleBuffer> buffers = new ConcurrentHashMap<>();
+  private volatile long bufferMaxBytes = Long.MAX_VALUE;
+
+  public ShuffleManager() {}
+
+  /**
+   * Configure the per-partition byte cap for newly created buffers. Dynamic updates of {@code
+   * plugins.velox.shuffle_buffer_bytes} route through here.
+   */
+  public void setBufferMaxBytes(long bufferMaxBytes) {
+    this.bufferMaxBytes = bufferMaxBytes;
+  }
+
+  public long getBufferMaxBytes() {
+    return bufferMaxBytes;
+  }
 
   /** Get or create a shuffle buffer for the given query and target stage. */
   public ShuffleBuffer getOrCreateBuffer(String queryId, int targetStageId) {
     String key = queryId + ":" + targetStageId;
-    return buffers.computeIfAbsent(key, k -> new ShuffleBuffer());
+    return buffers.computeIfAbsent(key, k -> new ShuffleBuffer(bufferMaxBytes));
   }
 
   /** Get an existing buffer, or null if it doesn't exist. */
@@ -60,6 +76,17 @@ public class ShuffleManager {
     private volatile int expectedRightSenders = -1;
     private final CountDownLatch leftReady = new CountDownLatch(1);
     private final CountDownLatch rightReady = new CountDownLatch(1);
+    private final AtomicLong currentBytes = new AtomicLong(0);
+    private final AtomicLong rejectedCount = new AtomicLong(0);
+    private final long maxBytes;
+
+    public ShuffleBuffer() {
+      this(Long.MAX_VALUE);
+    }
+
+    public ShuffleBuffer(long maxBytes) {
+      this.maxBytes = maxBytes;
+    }
 
     public void setExpectedSenders(int leftSenders, int rightSenders) {
       this.expectedLeftSenders = leftSenders;
@@ -75,6 +102,52 @@ public class ShuffleManager {
       } else {
         rightData.add(data);
       }
+      if (data != null) {
+        currentBytes.addAndGet(data.length);
+      }
+    }
+
+    /**
+     * Accept data if the current buffer has room, else reject. The sender is expected to retry on
+     * rejection with exponential backoff.
+     *
+     * @return true if accepted, false if rejected because the per-partition cap was exceeded
+     */
+    public boolean tryAddData(String side, byte[] data) {
+      int size = data == null ? 0 : data.length;
+      long newTotal = currentBytes.addAndGet(size);
+      if (newTotal > maxBytes) {
+        currentBytes.addAndGet(-size);
+        rejectedCount.incrementAndGet();
+        return false;
+      }
+      if ("left".equals(side)) {
+        leftData.add(data);
+      } else {
+        rightData.add(data);
+      }
+      return true;
+    }
+
+    public long getCurrentBytes() {
+      return currentBytes.get();
+    }
+
+    public long getMaxBytes() {
+      return maxBytes;
+    }
+
+    public long getRejectedCount() {
+      return rejectedCount.get();
+    }
+
+    /**
+     * Release all accounted bytes. Called by the consumer when it has drained the partition data
+     * and the producers can safely flood new data for a follow-up stage on the same buffer
+     * (typically unused today, but cheap to support).
+     */
+    public void releaseData() {
+      currentBytes.set(0);
     }
 
     public void senderDone(String side) {

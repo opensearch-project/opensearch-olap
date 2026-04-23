@@ -130,4 +130,42 @@ public class ShuffleManagerTests extends OpenSearchTestCase {
     assertEquals(2, buffer.getLeftData().size());
     assertEquals(1, buffer.getRightData().size());
   }
+
+  public void testTryAddDataAcceptsUnderCap() {
+    ShuffleManager.ShuffleBuffer buffer = new ShuffleManager.ShuffleBuffer(100);
+    assertTrue(buffer.tryAddData("left", new byte[] {1, 2, 3}));
+    assertTrue(buffer.tryAddData("right", new byte[] {4, 5}));
+    assertEquals(5L, buffer.getCurrentBytes());
+    assertEquals(0L, buffer.getRejectedCount());
+    assertEquals(1, buffer.getLeftData().size());
+    assertEquals(1, buffer.getRightData().size());
+  }
+
+  public void testTryAddDataRejectsOverCap() {
+    ShuffleManager.ShuffleBuffer buffer = new ShuffleManager.ShuffleBuffer(10);
+    assertTrue(buffer.tryAddData("left", new byte[8]));
+    // Next add would push us to 16 > 10 — should reject and not mutate
+    assertFalse(buffer.tryAddData("left", new byte[8]));
+    assertEquals(8L, buffer.getCurrentBytes());
+    assertEquals(1L, buffer.getRejectedCount());
+    assertEquals(1, buffer.getLeftData().size());
+  }
+
+  public void testReleaseDataRestoresBudget() {
+    ShuffleManager.ShuffleBuffer buffer = new ShuffleManager.ShuffleBuffer(10);
+    assertTrue(buffer.tryAddData("left", new byte[10]));
+    assertFalse(buffer.tryAddData("left", new byte[1]));
+    buffer.releaseData();
+    assertEquals(0L, buffer.getCurrentBytes());
+    assertTrue(buffer.tryAddData("left", new byte[5]));
+  }
+
+  public void testManagerAppliesBufferMaxBytesToNewBuffers() {
+    ShuffleManager manager = new ShuffleManager();
+    manager.setBufferMaxBytes(64);
+    ShuffleManager.ShuffleBuffer buffer = manager.getOrCreateBuffer("q1", 0);
+    assertEquals(64L, buffer.getMaxBytes());
+    assertTrue(buffer.tryAddData("left", new byte[32]));
+    assertFalse(buffer.tryAddData("left", new byte[64]));
+  }
 }

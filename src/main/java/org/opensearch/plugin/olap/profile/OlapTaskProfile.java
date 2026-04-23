@@ -22,11 +22,15 @@ import org.opensearch.core.common.io.stream.Writeable;
  * <p>Counters are intentionally coarse-grained — enough to answer questions like "did the BLOOM RF
  * actually narrow the Lucene scan?" by comparing {@link #getDocsMatched()} across runs with RF
  * enabled vs disabled. Sub-operator-level timing belongs to a future iteration.
+ *
+ * <p>Wire format carries a leading version byte. The plugin ships with the OpenSearch release, so
+ * both peers always speak the same version — bump {@link #WIRE_VERSION} whenever the layout
+ * changes.
  */
 public final class OlapTaskProfile implements Writeable {
 
-  /** Serialization version. Bumped if the on-wire layout changes. */
-  static final byte WIRE_VERSION = 1;
+  /** Current serialization version. */
+  static final byte WIRE_VERSION = 2;
 
   private final int fragmentId;
   private final int partitionId;
@@ -37,6 +41,10 @@ public final class OlapTaskProfile implements Writeable {
   private final long rowsEmitted;
   private final String rfKind;
   private final int rfBloomBytes;
+  private final long peakArrowBytes;
+  private final long backpressureWaitNanos;
+  private final long resultBytes;
+  private final long shuffleRejectCount;
 
   public OlapTaskProfile(
       int fragmentId,
@@ -48,6 +56,36 @@ public final class OlapTaskProfile implements Writeable {
       long rowsEmitted,
       String rfKind,
       int rfBloomBytes) {
+    this(
+        fragmentId,
+        partitionId,
+        nodeId,
+        durationNanos,
+        docsRead,
+        docsMatched,
+        rowsEmitted,
+        rfKind,
+        rfBloomBytes,
+        0L,
+        0L,
+        0L,
+        0L);
+  }
+
+  public OlapTaskProfile(
+      int fragmentId,
+      int partitionId,
+      String nodeId,
+      long durationNanos,
+      long docsRead,
+      long docsMatched,
+      long rowsEmitted,
+      String rfKind,
+      int rfBloomBytes,
+      long peakArrowBytes,
+      long backpressureWaitNanos,
+      long resultBytes,
+      long shuffleRejectCount) {
     this.fragmentId = fragmentId;
     this.partitionId = partitionId;
     this.nodeId = nodeId == null ? "" : nodeId;
@@ -57,6 +95,10 @@ public final class OlapTaskProfile implements Writeable {
     this.rowsEmitted = rowsEmitted;
     this.rfKind = rfKind == null ? "NONE" : rfKind;
     this.rfBloomBytes = rfBloomBytes;
+    this.peakArrowBytes = peakArrowBytes;
+    this.backpressureWaitNanos = backpressureWaitNanos;
+    this.resultBytes = resultBytes;
+    this.shuffleRejectCount = shuffleRejectCount;
   }
 
   public OlapTaskProfile(StreamInput in) throws IOException {
@@ -73,6 +115,10 @@ public final class OlapTaskProfile implements Writeable {
     this.rowsEmitted = in.readVLong();
     this.rfKind = in.readString();
     this.rfBloomBytes = in.readVInt();
+    this.peakArrowBytes = in.readVLong();
+    this.backpressureWaitNanos = in.readVLong();
+    this.resultBytes = in.readVLong();
+    this.shuffleRejectCount = in.readVLong();
   }
 
   @Override
@@ -87,6 +133,10 @@ public final class OlapTaskProfile implements Writeable {
     out.writeVLong(rowsEmitted);
     out.writeString(rfKind);
     out.writeVInt(rfBloomBytes);
+    out.writeVLong(peakArrowBytes);
+    out.writeVLong(backpressureWaitNanos);
+    out.writeVLong(resultBytes);
+    out.writeVLong(shuffleRejectCount);
   }
 
   public int getFragmentId() {
@@ -125,6 +175,22 @@ public final class OlapTaskProfile implements Writeable {
     return rfBloomBytes;
   }
 
+  public long getPeakArrowBytes() {
+    return peakArrowBytes;
+  }
+
+  public long getBackpressureWaitNanos() {
+    return backpressureWaitNanos;
+  }
+
+  public long getResultBytes() {
+    return resultBytes;
+  }
+
+  public long getShuffleRejectCount() {
+    return shuffleRejectCount;
+  }
+
   @Override
   public boolean equals(Object o) {
     if (this == o) return true;
@@ -137,6 +203,10 @@ public final class OlapTaskProfile implements Writeable {
         && docsMatched == that.docsMatched
         && rowsEmitted == that.rowsEmitted
         && rfBloomBytes == that.rfBloomBytes
+        && peakArrowBytes == that.peakArrowBytes
+        && backpressureWaitNanos == that.backpressureWaitNanos
+        && resultBytes == that.resultBytes
+        && shuffleRejectCount == that.shuffleRejectCount
         && nodeId.equals(that.nodeId)
         && rfKind.equals(that.rfKind);
   }
@@ -152,7 +222,11 @@ public final class OlapTaskProfile implements Writeable {
         docsMatched,
         rowsEmitted,
         rfKind,
-        rfBloomBytes);
+        rfBloomBytes,
+        peakArrowBytes,
+        backpressureWaitNanos,
+        resultBytes,
+        shuffleRejectCount);
   }
 
   @Override
@@ -175,6 +249,14 @@ public final class OlapTaskProfile implements Writeable {
         + rfKind
         + ",bloomBytes="
         + rfBloomBytes
+        + ",peakArrow="
+        + peakArrowBytes
+        + ",bpWaitNs="
+        + backpressureWaitNanos
+        + ",resultBytes="
+        + resultBytes
+        + ",shuffleRejects="
+        + shuffleRejectCount
         + "}";
   }
 }

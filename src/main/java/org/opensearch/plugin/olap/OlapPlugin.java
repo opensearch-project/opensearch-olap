@@ -65,6 +65,7 @@ public class OlapPlugin extends Plugin implements ActionPlugin {
     this.veloxLifecycleService = new VeloxLifecycleService(environment.settings());
     this.queryScheduler = new QueryScheduler(clusterService, threadPool);
     this.shuffleManager = new ShuffleManager();
+    this.shuffleManager.setBufferMaxBytes(veloxLifecycleService.getShuffleBufferBytes());
 
     StatisticsCollector statisticsCollector = new StatisticsCollector(client, clusterService);
     this.veloxExecutionEngine =
@@ -128,6 +129,53 @@ public class OlapPlugin extends Plugin implements ActionPlugin {
         .getClusterSettings()
         .addSettingsUpdateConsumer(
             VeloxLifecycleService.FORCE_VECTORIZE, veloxLifecycleService::setForceVectorize);
+    clusterService
+        .getClusterSettings()
+        .addSettingsUpdateConsumer(
+            VeloxLifecycleService.PER_FRAGMENT_ARROW_BYTES,
+            veloxLifecycleService::setPerFragmentArrowBytes);
+    clusterService
+        .getClusterSettings()
+        .addSettingsUpdateConsumer(
+            VeloxLifecycleService.RESULT_ALLOCATOR_BYTES,
+            veloxLifecycleService::setResultAllocatorBytes);
+    clusterService
+        .getClusterSettings()
+        .addSettingsUpdateConsumer(
+            VeloxLifecycleService.MAX_RESULT_BYTES, veloxLifecycleService::setMaxResultBytes);
+    clusterService
+        .getClusterSettings()
+        .addSettingsUpdateConsumer(
+            VeloxLifecycleService.COORDINATOR_ALLOCATOR_BYTES,
+            veloxLifecycleService::setCoordinatorAllocatorBytes);
+    clusterService
+        .getClusterSettings()
+        .addSettingsUpdateConsumer(
+            VeloxLifecycleService.COORDINATOR_QUEUE_BYTES,
+            veloxLifecycleService::setCoordinatorQueueBytes);
+    clusterService
+        .getClusterSettings()
+        .addSettingsUpdateConsumer(
+            VeloxLifecycleService.COORDINATOR_INFLIGHT_BYTES,
+            veloxLifecycleService::setCoordinatorInflightBytes);
+    clusterService
+        .getClusterSettings()
+        .addSettingsUpdateConsumer(
+            VeloxLifecycleService.SHUFFLE_BUFFER_BYTES,
+            value -> {
+              veloxLifecycleService.setShuffleBufferBytes(value);
+              shuffleManager.setBufferMaxBytes(value.getBytes());
+            });
+    clusterService
+        .getClusterSettings()
+        .addSettingsUpdateConsumer(
+            VeloxLifecycleService.BACKPRESSURE_WAIT_MS,
+            veloxLifecycleService::setBackpressureWaitMs);
+    clusterService
+        .getClusterSettings()
+        .addSettingsUpdateConsumer(
+            VeloxLifecycleService.BACKPRESSURE_WATERMARK_PCT,
+            veloxLifecycleService::setBackpressureWatermarkPct);
 
     return Arrays.asList(
         veloxLifecycleService, queryScheduler, veloxExecutionEngine, shuffleManager);

@@ -26,5 +26,19 @@ public class ShuffleDataResponseTests extends OpenSearchTestCase {
     ShuffleDataResponse deserialized = new ShuffleDataResponse(in);
 
     assertTrue(deserialized.isSuccess());
+    assertFalse(deserialized.isBackpressure());
+  }
+
+  public void testBackpressureRoundTrip() throws IOException {
+    ShuffleDataResponse original = ShuffleDataResponse.backpressureReject();
+    assertFalse(original.isSuccess());
+    assertTrue(original.isBackpressure());
+
+    BytesStreamOutput out = new BytesStreamOutput();
+    original.writeTo(out);
+
+    ShuffleDataResponse deserialized = new ShuffleDataResponse(out.bytes().streamInput());
+    assertFalse(deserialized.isSuccess());
+    assertTrue(deserialized.isBackpressure());
   }
 }
