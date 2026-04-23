@@ -7,11 +7,13 @@ package org.opensearch.plugin.olap.scheduler;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
+import java.util.List;
 import java.util.Map;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.service.ClusterService;
+import org.opensearch.plugin.olap.execution.CoRoutedPairs;
 import org.opensearch.test.OpenSearchTestCase;
 
 public class CostEstimatorTests extends OpenSearchTestCase {
@@ -228,5 +230,64 @@ public class CostEstimatorTests extends OpenSearchTestCase {
     // min(MAX_VALUE, 1) = 1 <= 2, so broadcast (the existing small side)
     JoinStrategy strategy = estimator.selectJoinStrategy("missing", "existing");
     assertEquals(JoinStrategy.BROADCAST, strategy);
+  }
+
+  // ---- Co-Routing selection ----
+
+  public void testCoRoutingSelectedWhenEligible() {
+    // Both indexes 3 shards, registered as co-routed, same join key.
+    ClusterService cs = mockClusterService("orders", 3, "customers", 3);
+    CostEstimator estimator = new CostEstimator(cs, 2);
+    CoRoutedPairs pairs = CoRoutedPairs.parse(List.of("orders:customer_id,customers:customer_id"));
+
+    JoinStrategy s =
+        estimator.selectJoinStrategy(
+            "orders", "customers", "customer_id", "customer_id", true, pairs);
+    assertEquals(JoinStrategy.CO_ROUTING, s);
+  }
+
+  public void testCoRoutingFallsBackWhenShardCountsDiffer() {
+    // Both registered, but shards mismatch → fall back (to HASH_SHUFFLE here since 3 > 2)
+    ClusterService cs = mockClusterService("orders", 3, "customers", 4);
+    CostEstimator estimator = new CostEstimator(cs, 2);
+    CoRoutedPairs pairs = CoRoutedPairs.parse(List.of("orders:customer_id,customers:customer_id"));
+
+    JoinStrategy s =
+        estimator.selectJoinStrategy(
+            "orders", "customers", "customer_id", "customer_id", true, pairs);
+    assertEquals(JoinStrategy.HASH_SHUFFLE, s);
+  }
+
+  public void testCoRoutingNotSelectedWhenDisabled() {
+    ClusterService cs = mockClusterService("orders", 3, "customers", 3);
+    CostEstimator estimator = new CostEstimator(cs, 2);
+    CoRoutedPairs pairs = CoRoutedPairs.parse(List.of("orders:customer_id,customers:customer_id"));
+
+    // coRoutingEnabled=false → fall through even when the pair matches.
+    JoinStrategy s =
+        estimator.selectJoinStrategy(
+            "orders", "customers", "customer_id", "customer_id", false, pairs);
+    assertEquals(JoinStrategy.HASH_SHUFFLE, s);
+  }
+
+  public void testCoRoutingNotSelectedWhenPairNotRegistered() {
+    ClusterService cs = mockClusterService("orders", 3, "customers", 3);
+    CostEstimator estimator = new CostEstimator(cs, 2);
+
+    JoinStrategy s =
+        estimator.selectJoinStrategy(
+            "orders", "customers", "customer_id", "customer_id", true, CoRoutedPairs.EMPTY);
+    assertEquals(JoinStrategy.HASH_SHUFFLE, s);
+  }
+
+  public void testCoRoutingNotSelectedWithoutJoinKeys() {
+    ClusterService cs = mockClusterService("orders", 3, "customers", 3);
+    CostEstimator estimator = new CostEstimator(cs, 2);
+    CoRoutedPairs pairs = CoRoutedPairs.parse(List.of("orders:customer_id,customers:customer_id"));
+
+    // Missing left key → cannot match pair → fall back.
+    JoinStrategy s =
+        estimator.selectJoinStrategy("orders", "customers", null, "customer_id", true, pairs);
+    assertEquals(JoinStrategy.HASH_SHUFFLE, s);
   }
 }

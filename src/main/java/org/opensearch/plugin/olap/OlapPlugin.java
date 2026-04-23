@@ -176,6 +176,14 @@ public class OlapPlugin extends Plugin implements ActionPlugin {
         .addSettingsUpdateConsumer(
             VeloxLifecycleService.BACKPRESSURE_WATERMARK_PCT,
             veloxLifecycleService::setBackpressureWatermarkPct);
+    clusterService
+        .getClusterSettings()
+        .addSettingsUpdateConsumer(
+            VeloxLifecycleService.CO_ROUTING_ENABLED, veloxLifecycleService::setCoRoutingEnabled);
+    clusterService
+        .getClusterSettings()
+        .addSettingsUpdateConsumer(
+            VeloxLifecycleService.CO_ROUTED_PAIRS, veloxLifecycleService::setCoRoutedPairs);
 
     return Arrays.asList(
         veloxLifecycleService, queryScheduler, veloxExecutionEngine, shuffleManager);

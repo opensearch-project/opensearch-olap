@@ -276,6 +276,8 @@ COUNT, SUM, AVG, MIN, MAX (with DISTINCT support)
 | `plugins.velox.runtime_filter_bloom_max_cardinality` | `10000000` | Max distinct values for BLOOM runtime filter. Beyond this cap, RF is skipped entirely. Also used as `expectedInsertions` for sizing partial blooms in two-stage mode. **Dynamic.** |
 | `plugins.velox.runtime_filter_bloom_two_stage` | `true` | Two-stage BLOOM build: each data node builds a PARTIAL bloom over local shards, coordinator merges via bitwise-OR into a FINAL bloom. Identical `expectedInsertions` across partials guarantees bit alignment. When false, coordinator rebuilds the bloom from broadcast build rows. **Dynamic.** |
 | `plugins.velox.cbo_statistics_mode` | `RUNTIME` | CBO statistics mode. `RUNTIME` collects row counts from IndicesStatsResponse before optimization for accurate build side selection. `NONE` skips (uses shard-count heuristic). **Dynamic.** |
+| `plugins.velox.co_routing_enabled` | `false` | Enable Co-Routing join optimization. Binary equi-joins between registered co-routed pairs run shard-local with zero shuffle. Requires `mpp_enabled=true`. See the [Co-Routing](#co-routing-joins) section. **Dynamic.** |
+| `plugins.velox.co_routed_pairs` | `[]` | List of co-routed index pairs. Each entry is `"<indexA>:<keyA>,<indexB>:<keyB>"` — a user assertion that both indexes share `_routing` on the listed key and have identical `number_of_shards`. Joins matching a registered pair (in either order) are eligible for Co-Routing. **Dynamic.** |
 
 ### Backpressure / memory bounds
 
@@ -490,6 +492,44 @@ curl -sS -H 'Content-Type: application/json' -X PUT localhost:9200/_cluster/sett
 - Hard caps trigger *typed exceptions*, not OOM. The error classifier routes them to `RETRYABLE_TRANSIENT` (temporary pressure — retry) or `RESOURCE_EXCEEDED` (user-query-too-large — don't retry).
 - Transport handlers never block. Shuffle backpressure is propagated via a response flag; the sender retries. Blocking transport threads would starve OpenSearch itself.
 - Defaults are conservative. For heap-constrained deployments, scale all `*_bytes` settings down in proportion; for large fanout, raise `coordinator_inflight_bytes` toward `num_fragments × max_result_bytes`.
+
+## Co-Routing Joins
+
+When two indexes are indexed with the same `_routing` field and have identical `number_of_shards`, OpenSearch places rows with the same routing key on the same shard of both indexes. Co-Routing takes advantage of this: the join runs **shard-local on each node with zero shuffle and zero broadcast**. For large-table joins on co-located data this strictly dominates `BROADCAST` and `HASH_SHUFFLE`.
+
+**Enable it** (requires `mpp_enabled=true`):
+
+```bash
+curl -sS -H 'Content-Type: application/json' -X PUT localhost:9200/_cluster/settings -d '{
+  "persistent": {
+    "plugins.velox.mpp_enabled": true,
+    "plugins.velox.co_routing_enabled": true,
+    "plugins.velox.co_routed_pairs": [
+      "orders:customer_id,customers:customer_id",
+      "events:user_id,profiles:user_id"
+    ]
+  }
+}'
+```
+
+Each pair in `co_routed_pairs` is the user's explicit assertion that both indexes were indexed with `_routing` equal to the listed key field and share `number_of_shards`. A `customer_id` join between the two indexes then runs shard-local:
+
+```
+  Node A                                  Node B
+  orders shard 0 ⋈ customers shard 0      orders shard 1 ⋈ customers shard 1
+```
+
+**How the plan decides**:
+1. The query is a binary equi-join on a single key per side.
+2. `co_routing_enabled=true` and the `(leftIdx, leftKey, rightIdx, rightKey)` tuple is registered (either order).
+3. `number_of_shards` on both indexes matches.
+4. Shard alignment exists — for every shard index *i*, some node hosts active copies of both left[*i*] and right[*i*] (primary or replica).
+
+All four must hold or the plan falls back to `BROADCAST`/`HASH_SHUFFLE`/`COORDINATOR_CENTRIC`. Falls are logged at `INFO` level.
+
+**Safety note** — the plugin does not try to discover co-location from index mappings; `_routing` is supplied at index time and mappings don't declare it. The `co_routed_pairs` setting is therefore load-bearing: register a pair whose indexes were not actually co-routed and you get incorrect results. Only register pairs you control the indexing pipeline for.
+
+**Current scope (Phase A)**: binary joins only, single-column equi-join, routing partition size 1. Multi-way co-routed joins, distribution-trait-driven planning, and routing-partition-size > 1 are deferred to Phase B.
 
 ## Installation
 

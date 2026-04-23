@@ -330,9 +330,11 @@ public class VeloxExecutionEngine {
             leafFragments.size(),
             queryId);
       } else {
-        JoinStrategy strategy = selectJoinStrategy(leafFragments, statsMap);
+        JoinStrategy strategy = selectJoinStrategy(leafFragments, coordinatorFragment, statsMap);
         logger.info("MPP join strategy for query {}: {}", queryId, strategy);
         switch (strategy) {
+          case CO_ROUTING:
+            return executeCoRoutingFragments(relNode, leafFragments, coordinatorFragment, queryId);
           case BROADCAST:
             return executeBroadcastFragments(
                 relNode, leafFragments, coordinatorFragment, queryId, statsMap);
@@ -385,13 +387,147 @@ public class VeloxExecutionEngine {
 
   /** Select join strategy using CostEstimator based on leaf fragment source indices. */
   private JoinStrategy selectJoinStrategy(
-      List<PlanFragment> leafFragments, Map<String, TableStatistics> statsMap) {
+      List<PlanFragment> leafFragments,
+      PlanFragment coordinatorFragment,
+      Map<String, TableStatistics> statsMap) {
     String leftIndex = leafFragments.get(0).getProperties().getSourceIndex();
     String rightIndex = leafFragments.get(1).getProperties().getSourceIndex();
     CostEstimator estimator =
         new CostEstimator(
             queryScheduler.getClusterService(), veloxLifecycle.getBroadcastMaxShards(), statsMap);
-    return estimator.selectJoinStrategy(leftIndex, rightIndex);
+
+    // Pull the raw join key field names off the coordinator plan. We pass them verbatim to the
+    // matcher; it tries an exact lookup first and only falls back to stripping a trailing
+    // disambiguation suffix (e.g. "dept_id0" from the SQL plugin's join rename) when the exact
+    // name does not match. Legitimate field names with trailing digits ("sku2", "year2024") are
+    // therefore matched correctly instead of being silently rewritten.
+    String leftKey = null;
+    String rightKey = null;
+    if (coordinatorFragment != null) {
+      HashJoinNode joinNode = findHashJoinNode(coordinatorFragment.getPlanRoot());
+      if (joinNode != null
+          && !joinNode.getLeftKeys().isEmpty()
+          && !joinNode.getRightKeys().isEmpty()) {
+        leftKey = joinNode.getLeftKeys().get(0).getFieldName();
+        rightKey = joinNode.getRightKeys().get(0).getFieldName();
+      }
+    }
+
+    return estimator.selectJoinStrategy(
+        leftIndex,
+        rightIndex,
+        leftKey,
+        rightKey,
+        veloxLifecycle.isCoRoutingEnabled(),
+        veloxLifecycle.getCoRoutedPairs());
+  }
+
+  // ---- MPP Co-Routing Fragment Execution ----
+
+  /**
+   * Execute a Co-Routing join: shard {@code i} of the left index is joined with shard {@code i} of
+   * the right index on the node that hosts both copies. Zero shuffle, zero broadcast. Produces one
+   * task per aligned shard pair; results are concatenated.
+   *
+   * <p>Falls back to {@link #executeBroadcastFragments} if the shards cannot be aligned (e.g.
+   * allocation has drifted so no single node hosts both copies of some shard index).
+   */
+  private ExecutionEngine.QueryResponse executeCoRoutingFragments(
+      RelNode relNode,
+      List<PlanFragment> leafFragments,
+      PlanFragment coordinatorFragment,
+      QueryId queryId) {
+    String leftIndex = leafFragments.get(0).getProperties().getSourceIndex();
+    String rightIndex = leafFragments.get(1).getProperties().getSourceIndex();
+
+    org.opensearch.plugin.olap.scheduler.ShardRouter router =
+        new org.opensearch.plugin.olap.scheduler.ShardRouter();
+    List<org.opensearch.plugin.olap.scheduler.ShardRouter.CoRoutedShardPair> shardPairs =
+        router.routeCoRoutedPairs(
+            queryScheduler.getClusterService().state(), leftIndex, rightIndex);
+
+    if (shardPairs == null || shardPairs.isEmpty()) {
+      logger.warn(
+          "Co-Routing shard alignment failed for {}⋈{} — falling back to BROADCAST",
+          leftIndex,
+          rightIndex);
+      return executeBroadcastFragments(
+          relNode, leafFragments, coordinatorFragment, queryId, Map.of());
+    }
+
+    logger.info(
+        "Co-Routing join for query {}: {} shard pairs across {} ⋈ {}",
+        queryId,
+        shardPairs.size(),
+        leftIndex,
+        rightIndex);
+
+    // Build one task per shard pair. The plan is the coordinator fragment (two-scan HashJoin);
+    // each task scans the left + right local shard pair directly, no shuffle/broadcast needed.
+    PlanFragment coRoutingFragment =
+        new PlanFragment(
+            0,
+            coordinatorFragment.getPlanRoot(),
+            // sourceIndex on the fragment is informational; we carry per-task shard info in the
+            // request trailer so the data node handler scans both shards correctly.
+            org.opensearch.plugin.olap.plan.fragment.FragmentProperties.source(leftIndex),
+            Collections.emptyList());
+
+    List<TaskDescriptor> tasks = new ArrayList<>(shardPairs.size());
+    for (int i = 0; i < shardPairs.size(); i++) {
+      org.opensearch.plugin.olap.scheduler.ShardRouter.CoRoutedShardPair pair = shardPairs.get(i);
+      org.opensearch.plugin.olap.scheduler.StageId stageId =
+          new org.opensearch.plugin.olap.scheduler.StageId(queryId, 0);
+      org.opensearch.plugin.olap.scheduler.TaskId taskId =
+          new org.opensearch.plugin.olap.scheduler.TaskId(stageId, i);
+      // pinnedToNode=true: Co-Routing depends on both shards sharing a node. `prepareRetry` can
+      // only re-route based on left-side metadata, which would silently pick a node without a
+      // colocated right copy. Skip the reroute path for these tasks; same-node transient retry
+      // still works.
+      tasks.add(
+          new TaskDescriptor(
+              taskId,
+              coRoutingFragment,
+              pair.node,
+              java.util.List.of(pair.leftShard),
+              /* pinnedToNode */ true));
+    }
+
+    // Serialize the leaf-fragment plans so the data-node handler can extract per-side pushdown
+    // (FilterNode, etc.) that the coordinator's HashJoinNode plan does NOT carry. Without this,
+    // leaf-side filters are silently skipped and Co-Routing returns wrong rows. Same pattern as
+    // executeBroadcastFragments' probePlanJson, applied symmetrically to both sides.
+    String leftPlanJson = serializeLeafPlanJson(leafFragments.get(0));
+    String rightPlanJson = serializeLeafPlanJson(leafFragments.get(1));
+
+    NodeResultCollector collector = newCollector();
+    final int leftScanIndex = 0;
+    final String finalLeftPlanJson = leftPlanJson;
+    final String finalRightPlanJson = rightPlanJson;
+    List<ExecuteFragmentResponse> responses =
+        collector.dispatchAndCollectCoRouting(
+            queryId,
+            tasks,
+            (task, request) -> {
+              int idx = task.getTaskId().getPartitionId();
+              org.opensearch.plugin.olap.scheduler.ShardRouter.CoRoutedShardPair pair =
+                  shardPairs.get(idx);
+              request.setCoRoutingJoin(
+                  leftIndex, rightIndex, pair.leftShard, pair.rightShard, leftScanIndex);
+              request.setCoRoutingLeafPlans(finalLeftPlanJson, finalRightPlanJson);
+            });
+    recordProfileResponses(responses);
+
+    return buildQueryResponse(relNode.getRowType(), responses);
+  }
+
+  /** Serialize a leaf fragment's plan tree to JSON for the data-node handler, or null if absent. */
+  private String serializeLeafPlanJson(PlanFragment leaf) {
+    if (leaf == null || leaf.getPlanRoot() == null) {
+      return null;
+    }
+    Query query = new Query(leaf.getPlanRoot(), Config.empty(), ConnectorConfig.empty());
+    return Serde.toJson(query);
   }
 
   // ---- MPP Broadcast Fragment Execution ----
@@ -1049,7 +1185,17 @@ public class VeloxExecutionEngine {
     } catch (Exception e) {
       logger.error("Error feeding Arrow IPC to queue", e);
     } finally {
-      allocator.close();
+      // Same pattern as arrowIpcToNativeBatches / executeCoordinatorJoin: the Arrow C Data
+      // Interface may hold a small number of buffer references after Velox takes ownership
+      // (~100–400 bytes). Velox manages the underlying memory; the leftover Arrow-side
+      // bookkeeping is benign. Swallow the IllegalStateException from close() so this feeder
+      // thread doesn't bubble the "Memory was leaked" counter as a real failure into the
+      // feederError channel used by executeCoordinatorFragment / executeCoordinatorJoin.
+      try {
+        allocator.close();
+      } catch (IllegalStateException ex) {
+        logger.debug("Arrow allocator close warning: {}", ex.getMessage());
+      }
     }
   }
 

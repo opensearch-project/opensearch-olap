@@ -119,7 +119,9 @@ public class TransportExecuteFragmentAction
             () -> {
               try {
                 ExecuteFragmentResponse response;
-                if (request.hasBroadcastData()) {
+                if (request.isCoRoutingJoin()) {
+                  response = executeCoRoutingJoinFragment(request);
+                } else if (request.hasBroadcastData()) {
                   response = executeBroadcastJoinFragment(request);
                 } else if (request.isShuffleScan()) {
                   response = executeShuffleScanFragment(request);
@@ -491,6 +493,183 @@ public class TransportExecuteFragmentAction
       return ExecuteFragmentResponse.failure(e.getMessage());
     } finally {
       probeBridge.close();
+    }
+  }
+
+  // ---- Co-Routing Join Execution (MPP Phase A) ----
+
+  /**
+   * Execute a Co-Routing join fragment: two indexes that are known to be co-routed by the same key
+   * feed one shard pair of local data into the plan's {@code HashJoinNode}, zero-shuffle. The
+   * invariant is that shard {@code i} of both indexes lives on this node and holds exactly the rows
+   * that share a given routing key.
+   *
+   * <p>Structurally identical to {@link #executeBroadcastJoinFragment} except both sides scan local
+   * shards rather than one side receiving a broadcast payload.
+   */
+  private ExecuteFragmentResponse executeCoRoutingJoinFragment(ExecuteFragmentRequest request) {
+    String queryId = request.getQueryId();
+    logger.info(
+        "Executing co-routing join fragment {} for query {}: left={}:{} right={}:{}",
+        request.getFragmentId(),
+        queryId,
+        request.getCoRoutingLeftIndex(),
+        request.getCoRoutingLeftShardId(),
+        request.getCoRoutingRightIndex(),
+        request.getCoRoutingRightShardId());
+
+    Session session = veloxLifecycle.getSession();
+    VeloxExecutor executor = new VeloxExecutor(session, veloxLifecycle);
+    String connectorId = "connector-external-stream";
+
+    final LuceneArrowReader.ScanStats scanStats =
+        request.isProfileEnabled() ? new LuceneArrowReader.ScanStats() : null;
+    final long startNanos = System.nanoTime();
+
+    Query query = Serde.fromJson(request.getPlanFragmentJson(), Query.class);
+    List<String> scanIds = executor.findAllTableScanNodeIds(query.getPlan());
+    if (scanIds.size() < 2) {
+      return ExecuteFragmentResponse.failure(
+          "Co-Routing join plan must have 2 TableScanNodes, found " + scanIds.size());
+    }
+    int leftIdx = request.getCoRoutingLeftScanIndex();
+    int rightIdx = (leftIdx == 0) ? 1 : 0;
+    String leftScanId = scanIds.get(leftIdx);
+    String rightScanId = scanIds.get(rightIdx);
+
+    ExternalStreamBridge leftBridge =
+        new ExternalStreamBridge(session, veloxLifecycle.getPerFragmentArrowBytes());
+    ExternalStreamBridge rightBridge =
+        new ExternalStreamBridge(session, veloxLifecycle.getPerFragmentArrowBytes());
+    LuceneArrowReader leftReader =
+        new LuceneArrowReader(indicesService, leftBridge.getAllocator(), veloxLifecycle);
+    LuceneArrowReader rightReader =
+        new LuceneArrowReader(indicesService, rightBridge.getAllocator(), veloxLifecycle);
+
+    try {
+      leftBridge.open();
+      rightBridge.open();
+
+      List<String> leftFields = extractScanFieldsFromNode(query.getPlan(), leftScanId);
+      if (leftFields.isEmpty()) {
+        leftFields = extractScanFields(request.getPlanFragmentJson());
+      }
+      List<String> rightFields = extractScanFieldsFromNode(query.getPlan(), rightScanId);
+      if (rightFields.isEmpty()) {
+        rightFields = extractScanFields(request.getPlanFragmentJson());
+      }
+      leftBridge.setRequestedFields(leftFields);
+      rightBridge.setRequestedFields(rightFields);
+
+      final ShardId leftShardId = request.getCoRoutingLeftShardId();
+      final ShardId rightShardId = request.getCoRoutingRightShardId();
+      final String leftIndex = request.getCoRoutingLeftIndex();
+      final String rightIndex = request.getCoRoutingRightIndex();
+
+      // Apply per-side pushdown from the leaf-fragment plans (FilterNode etc.). The coordinator
+      // plan only has the two bare TableScanNodes; without this, leaf-side filters are silently
+      // dropped — same issue the broadcast path already handled via probePlanJson, applied
+      // symmetrically to both scans here.
+      final org.apache.lucene.search.Query leftPushdown =
+          extractPushdownIfPresent(request.getCoRoutingLeftPlanJson());
+      final org.apache.lucene.search.Query rightPushdown =
+          extractPushdownIfPresent(request.getCoRoutingRightPlanJson());
+
+      Thread leftFeeder =
+          new Thread(
+              () -> {
+                try {
+                  if (veloxLifecycle.getSegmentParallelism() > 1) {
+                    leftReader.readShardIntoStreamParallel(
+                        leftShardId,
+                        leftIndex,
+                        leftBridge,
+                        leftPushdown,
+                        segmentExecutor,
+                        scanStats);
+                  } else {
+                    leftReader.readShardIntoStream(
+                        leftShardId, leftIndex, leftBridge, leftPushdown, scanStats);
+                  }
+                  leftBridge.noMoreInput();
+                } catch (Throwable e) {
+                  logger.error("Co-routing left feeder error for query {}", queryId, e);
+                  leftBridge.abort(
+                      e instanceof Exception ? (Exception) e : new RuntimeException(e));
+                }
+              },
+              "olap-coroute-left-" + queryId);
+      leftFeeder.setDaemon(true);
+      leftFeeder.start();
+
+      Thread rightFeeder =
+          new Thread(
+              () -> {
+                try {
+                  if (veloxLifecycle.getSegmentParallelism() > 1) {
+                    rightReader.readShardIntoStreamParallel(
+                        rightShardId,
+                        rightIndex,
+                        rightBridge,
+                        rightPushdown,
+                        segmentExecutor,
+                        scanStats);
+                  } else {
+                    rightReader.readShardIntoStream(
+                        rightShardId, rightIndex, rightBridge, rightPushdown, scanStats);
+                  }
+                  rightBridge.noMoreInput();
+                } catch (Throwable e) {
+                  logger.error("Co-routing right feeder error for query {}", queryId, e);
+                  rightBridge.abort(
+                      e instanceof Exception ? (Exception) e : new RuntimeException(e));
+                }
+              },
+              "olap-coroute-right-" + queryId);
+      rightFeeder.setDaemon(true);
+      rightFeeder.start();
+
+      boolean isPartialAgg = request.getPlanFragmentJson().contains("\"step\":\"PARTIAL\"");
+      ExecuteFragmentResponse response;
+      if (isPartialAgg) {
+        List<byte[]> nativeBatches =
+            executor.executeDualInputNative(
+                request.getPlanFragmentJson(),
+                connectorId,
+                leftBridge.getQueue(),
+                leftScanId,
+                rightBridge.getQueue(),
+                rightScanId);
+        leftFeeder.join(30_000);
+        rightFeeder.join(30_000);
+        response =
+            ExecuteFragmentResponse.successNative(
+                leftBridge.getRowCount() + rightBridge.getRowCount(), nativeBatches);
+      } else {
+        byte[] resultData =
+            executor.executeDualInput(
+                request.getPlanFragmentJson(),
+                connectorId,
+                leftBridge.getQueue(),
+                leftScanId,
+                rightBridge.getQueue(),
+                rightScanId);
+        leftFeeder.join(30_000);
+        rightFeeder.join(30_000);
+        response =
+            ExecuteFragmentResponse.success(
+                leftBridge.getRowCount() + rightBridge.getRowCount(), resultData);
+      }
+
+      attachTaskProfile(request, response, scanStats, startNanos, leftBridge);
+      return response;
+
+    } catch (Exception e) {
+      logger.error("Co-routing join execution failed for query {}", queryId, e);
+      return ExecuteFragmentResponse.failure(e.getMessage());
+    } finally {
+      leftBridge.close();
+      rightBridge.close();
     }
   }
 
@@ -925,6 +1104,14 @@ public class TransportExecuteFragmentAction
           "Failed to extract pushdown query, falling back to full scan: {}", e.getMessage());
       return null;
     }
+  }
+
+  /** Same as {@link #extractPushdownQuery} but tolerates a null plan JSON (no leaf-side plan). */
+  private org.apache.lucene.search.Query extractPushdownIfPresent(String planJson) {
+    if (planJson == null || planJson.isEmpty()) {
+      return null;
+    }
+    return extractPushdownQuery(planJson);
   }
 
   private FilterNode findFilterNode(PlanNode node) {

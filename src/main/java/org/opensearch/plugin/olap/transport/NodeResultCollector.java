@@ -255,6 +255,25 @@ public class NodeResultCollector {
         });
   }
 
+  /**
+   * Dispatch Co-Routing join tasks: one per shard pair. Each task is prebuilt with its own
+   * left/right ShardId + left/right index name via {@link ExecuteFragmentRequest#setCoRoutingJoin}
+   * before dispatch. The {@code requestCustomizer} supplies those per-task details.
+   */
+  public List<ExecuteFragmentResponse> dispatchAndCollectCoRouting(
+      org.opensearch.plugin.olap.common.QueryId queryId,
+      List<TaskDescriptor> tasks,
+      java.util.function.BiConsumer<TaskDescriptor, ExecuteFragmentRequest> requestCustomizer) {
+    return dispatchTasks(
+        queryId,
+        tasks,
+        task -> {
+          ExecuteFragmentRequest request = createNormalRequest(queryId, task);
+          requestCustomizer.accept(task, request);
+          return request;
+        });
+  }
+
   /** Dispatch shuffle join tasks: each task reads from ShuffleManager buffer. */
   public List<ExecuteFragmentResponse> dispatchAndCollectShuffleJoin(
       QueryExecution execution,
@@ -464,8 +483,10 @@ public class NodeResultCollector {
   /**
    * Prepare a retry by marking bad resources and finding an alternative node. Returns a new
    * TaskDescriptor targeting a different node, or null if no alternative is available.
+   *
+   * <p>Visible for tests — keep package-private.
    */
-  private TaskDescriptor prepareRetry(
+  TaskDescriptor prepareRetry(
       TaskDescriptor failed, ErrorCategory category, BadResourceTracker tracker) {
     String failedNodeId = failed.getTargetNode().getId();
 
@@ -483,6 +504,19 @@ public class NodeResultCollector {
         return failed;
       default:
         return null;
+    }
+
+    // Pinned tasks (e.g. Co-Routing — both shards must be colocated) cannot be rerouted: the
+    // retry logic below uses only the primary source index + shardIds, which is insufficient to
+    // preserve colocation with the secondary shard. Fail the task so the caller sees a clean
+    // error rather than a node without the right shard.
+    if (failed.isPinnedToNode()) {
+      logger.info(
+          "Task {} is pinned to {} (colocated-shard requirement) — skipping reroute for {}",
+          failed.getTaskId(),
+          failed.getTargetNode().getName(),
+          category);
+      return null;
     }
 
     // Find alternative routing excluding bad resources

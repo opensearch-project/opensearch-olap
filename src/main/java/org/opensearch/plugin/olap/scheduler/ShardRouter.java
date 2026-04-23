@@ -109,4 +109,101 @@ public class ShardRouter {
     }
     return !tracker.isShardBadOnNode(nodeId, shard.shardId());
   }
+
+  /**
+   * For a Co-Routing join, match up shard {@code i} of the left index with shard {@code i} of the
+   * right index on a node that hosts both copies. Returns one {@link CoRoutedShardPair} per shard
+   * index. Both indexes must have identical {@code number_of_shards}; if not, returns null so the
+   * caller can fall back to BROADCAST/HASH_SHUFFLE.
+   *
+   * <p>A pair is only emitted when a single node hosts <em>both</em> shard {@code i} copies — that
+   * is the invariant that lets us join locally with zero shuffle. If any shard index cannot be
+   * aligned on a common node (e.g. replicas diverged due to allocation), the whole join is declared
+   * misaligned and null is returned.
+   */
+  public List<CoRoutedShardPair> routeCoRoutedPairs(
+      ClusterState clusterState, String leftIndex, String rightIndex) {
+    IndexRoutingTable left = clusterState.getRoutingTable().index(leftIndex);
+    IndexRoutingTable right = clusterState.getRoutingTable().index(rightIndex);
+    if (left == null || right == null) {
+      return null;
+    }
+    int leftCount = left.shards().size();
+    int rightCount = right.shards().size();
+    if (leftCount != rightCount) {
+      return null;
+    }
+
+    List<CoRoutedShardPair> pairs = new ArrayList<>(leftCount);
+    for (int i = 0; i < leftCount; i++) {
+      IndexShardRoutingTable leftTable = left.shard(i);
+      IndexShardRoutingTable rightTable = right.shard(i);
+      ColocatedShard colocated = findColocatedShardCopy(clusterState, leftTable, rightTable);
+      if (colocated == null) {
+        return null;
+      }
+      pairs.add(
+          new CoRoutedShardPair(
+              colocated.node, colocated.leftShard.shardId(), colocated.rightShard.shardId()));
+    }
+    return pairs;
+  }
+
+  /**
+   * Find a node that hosts an active copy of both shards. Prefers the primary pair, then any active
+   * replica that's co-located.
+   */
+  private ColocatedShard findColocatedShardCopy(
+      ClusterState clusterState,
+      IndexShardRoutingTable leftTable,
+      IndexShardRoutingTable rightTable) {
+    ShardRouting leftPrimary = leftTable.primaryShard();
+    ShardRouting rightPrimary = rightTable.primaryShard();
+    if (leftPrimary != null
+        && rightPrimary != null
+        && leftPrimary.active()
+        && rightPrimary.active()
+        && leftPrimary.currentNodeId().equals(rightPrimary.currentNodeId())) {
+      DiscoveryNode node = clusterState.nodes().get(leftPrimary.currentNodeId());
+      if (node != null) {
+        return new ColocatedShard(node, leftPrimary, rightPrimary);
+      }
+    }
+    for (ShardRouting leftShard : leftTable.activeShards()) {
+      for (ShardRouting rightShard : rightTable.activeShards()) {
+        if (leftShard.currentNodeId().equals(rightShard.currentNodeId())) {
+          DiscoveryNode node = clusterState.nodes().get(leftShard.currentNodeId());
+          if (node != null) {
+            return new ColocatedShard(node, leftShard, rightShard);
+          }
+        }
+      }
+    }
+    return null;
+  }
+
+  private static final class ColocatedShard {
+    final DiscoveryNode node;
+    final ShardRouting leftShard;
+    final ShardRouting rightShard;
+
+    ColocatedShard(DiscoveryNode node, ShardRouting leftShard, ShardRouting rightShard) {
+      this.node = node;
+      this.leftShard = leftShard;
+      this.rightShard = rightShard;
+    }
+  }
+
+  /** One aligned shard pair for a Co-Routing join. */
+  public static final class CoRoutedShardPair {
+    public final DiscoveryNode node;
+    public final ShardId leftShard;
+    public final ShardId rightShard;
+
+    public CoRoutedShardPair(DiscoveryNode node, ShardId leftShard, ShardId rightShard) {
+      this.node = node;
+      this.leftShard = leftShard;
+      this.rightShard = rightShard;
+    }
+  }
 }
