@@ -9,15 +9,17 @@ import org.opensearch.test.OpenSearchTestCase;
 public class JoinStrategyTests extends OpenSearchTestCase {
 
   public void testEnumValues() {
-    assertEquals(3, JoinStrategy.values().length);
+    assertEquals(4, JoinStrategy.values().length);
     assertEquals(JoinStrategy.COORDINATOR_CENTRIC, JoinStrategy.valueOf("COORDINATOR_CENTRIC"));
+    assertEquals(JoinStrategy.CO_ROUTING, JoinStrategy.valueOf("CO_ROUTING"));
     assertEquals(JoinStrategy.BROADCAST, JoinStrategy.valueOf("BROADCAST"));
     assertEquals(JoinStrategy.HASH_SHUFFLE, JoinStrategy.valueOf("HASH_SHUFFLE"));
   }
 
   public void testOrdinalOrder() {
     assertEquals(0, JoinStrategy.COORDINATOR_CENTRIC.ordinal());
-    assertEquals(1, JoinStrategy.BROADCAST.ordinal());
-    assertEquals(2, JoinStrategy.HASH_SHUFFLE.ordinal());
+    assertEquals(1, JoinStrategy.CO_ROUTING.ordinal());
+    assertEquals(2, JoinStrategy.BROADCAST.ordinal());
+    assertEquals(3, JoinStrategy.HASH_SHUFFLE.ordinal());
   }
 }

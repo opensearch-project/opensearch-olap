@@ -23,16 +23,37 @@ public class TaskDescriptor {
   private final PlanFragment fragment;
   private final DiscoveryNode targetNode;
   private final List<ShardId> shardIds;
+  private final boolean pinnedToNode;
   private volatile TaskState state;
   private volatile String failureReason;
 
   public TaskDescriptor(
       TaskId taskId, PlanFragment fragment, DiscoveryNode targetNode, List<ShardId> shardIds) {
+    this(taskId, fragment, targetNode, shardIds, false);
+  }
+
+  /**
+   * @param pinnedToNode when true, the task requires colocation that a reroute cannot preserve
+   *     (e.g. Co-Routing — shard {@code i} of two indexes must live on the same node). The retry
+   *     path skips shard-level rerouting for pinned tasks; same-node transient retry is still
+   *     allowed.
+   */
+  public TaskDescriptor(
+      TaskId taskId,
+      PlanFragment fragment,
+      DiscoveryNode targetNode,
+      List<ShardId> shardIds,
+      boolean pinnedToNode) {
     this.taskId = Objects.requireNonNull(taskId);
     this.fragment = Objects.requireNonNull(fragment);
     this.targetNode = Objects.requireNonNull(targetNode);
     this.shardIds = Objects.requireNonNull(shardIds);
+    this.pinnedToNode = pinnedToNode;
     this.state = TaskState.PENDING;
+  }
+
+  public boolean isPinnedToNode() {
+    return pinnedToNode;
   }
 
   public TaskId getTaskId() {

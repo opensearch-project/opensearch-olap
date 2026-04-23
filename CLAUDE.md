@@ -81,6 +81,8 @@ SPI service file: `META-INF/services/org.opensearch.sql.executor.ExecutionEngine
 ## Coding
 Use simple class name + import in coding as much as possible, except there is obvious existence of class naming conflicts.
 
+When adding a variant to a public enum (e.g. `JoinStrategy`, `ErrorCategory`), grep for `.ordinal()` in tests — any `testOrdinalOrder`/`testEnumValues` assertions break deterministically and must be updated in the same PR.
+
 ## Build & Test
 ```bash
 ./gradlew build                    # Full build (compile + test + checks)
@@ -149,12 +151,17 @@ Key implementation details:
 - The feeder thread must start AFTER `serialTask.addSplit()` + `noMoreSplits()` to avoid race conditions
 
 ## MPP join support
-Three join strategies controlled by `plugins.velox.mpp_enabled` (default false, **dynamic** — can be toggled at runtime via cluster settings API):
+Four join strategies controlled by `plugins.velox.mpp_enabled` (default false, **dynamic** — can be toggled at runtime via cluster settings API):
 - **Coordinator-centric** (mpp_enabled=false): Both sides gathered to coordinator, join runs locally
+- **Co-Routing** (mpp_enabled=true, pair registered in `co_routed_pairs`, matching shard counts, shards co-located): shard-local join, zero shuffle. Scheduler emits one task per aligned shard pair via `ShardRouter.routeCoRoutedPairs`. Falls back to BROADCAST/HASH_SHUFFLE if alignment fails.
 - **Broadcast** (mpp_enabled=true, small build side): Small table broadcast to all probe nodes
 - **Hash shuffle** (mpp_enabled=true, both large): Both sides hash-partitioned by join key, shuffled P2P via `ShuffleDataAction`
 
 Cost estimator uses shard count heuristic (`plugins.velox.broadcast_max_shards`, default 2). `plugins.velox.shuffle_partitions` controls partition count (0 = auto, uses number of data nodes). All three settings are **dynamic** (`Setting.Property.Dynamic`).
+
+**Reuse OpenSearch routing hash** for any routing-aware partitioning (Co-Routing, future `ES_ROUTING_SHUFFLE`): `org.opensearch.cluster.routing.Murmur3HashFunction` and `OperationRouting.generateShardId(IndexMetadata, id, routing)` are the authoritative hash. Do NOT reimplement — any drift silently corrupts shard alignment and produces wrong join results without erroring.
+
+**Custom task placement for a new execution strategy**: build `TaskDescriptor`s directly (don't re-enter `QueryScheduler.schedule()` which assumes a Stage graph) and dispatch via a dedicated `NodeResultCollector.dispatchAndCollect*` overload taking a `BiConsumer<TaskDescriptor, ExecuteFragmentRequest>` that stamps strategy-specific request fields. See `executeCoRoutingFragments` + `dispatchAndCollectCoRouting` for the shape.
 
 ### MPP rule design (MppJoinRule, MppAggregateRule)
 MPP rules use the same explicit PhysicalExchange insertion pattern as the base rules:
@@ -178,6 +185,8 @@ This avoids `CannotPlanException` — the VolcanoPlanner can't decompose cross-c
 
 ### Join column name conflict
 Velox validates that left and right output types have no duplicate names. The SQL plugin's `CalciteRelNodeVisitor.visitJoin()` adds a rename Project above the join (e.g. `dept_id0` → `d.dept_id`). The converter inserts a `ProjectNode` around the right side to rename conflicting columns. The scan keeps original names (for `LuceneArrowReader`), and ExternalStream maps by position, so the rename is transparent.
+
+**Plan-node field-name normalization**: when reading join keys via `HashJoinNode.getLeftKeys()/getRightKeys()` to match against raw index field names, strip trailing digits with `.replaceAll("\\d+$", "")` — the SQL plugin's rename suffixes field names like `dept_id` → `dept_id0`. Pattern used by `VeloxExecutionEngine.extractProbeJoinKeyField` and `selectJoinStrategy`.
 
 ## Calcite physical planning framework (plan/physical/)
 Uses Calcite's Convention + VolcanoPlanner, wired into `VeloxExecutionEngine.execute()`:
@@ -258,7 +267,7 @@ The plugin participates in the SQL plugin's PPL `{"profile":true}` flow (see `..
 
 Wire format: `ExecuteFragmentRequest.profileEnabled` (boolean trailer), `ExecuteFragmentResponse.taskProfile` (optional `OlapTaskProfile` block, tagged by leading bool).
 
-**Wire format evolution**: The plugin ships with the OpenSearch release, so both peers always speak the same `WIRE_VERSION`. Bump the constant whenever the layout changes — no cross-version decode branches needed. v2 added `peakArrowBytes`, `backpressureWaitNanos`, `resultBytes`, `shuffleRejectCount` for backpressure observability.
+**Wire format evolution**: Plugin ships with the OpenSearch release, so both peers always speak the same `WIRE_VERSION`. Bump the constant on any layout change. **Do NOT add `StreamOutput.getVersion().onOrAfter(...)` gates** — they're meaningful for OpenSearch core but dead code here (every peer is on the same plugin build at the same time). Cross-version decode branches are not needed.
 
 ## Backpressure / flow control
 All Arrow allocators are bounded (no more `RootAllocator(Long.MAX_VALUE)`). Bounds come from `plugins.velox.*_bytes` settings on `VeloxLifecycleService`; the gauge at every boundary is `BufferAllocator.getAllocatedMemory()`. Producers call `Backpressure.awaitBelow(allocator, softWatermark, timeoutNanos, scanStats.backpressureWaitNanos)` before allocating the next Arrow batch — `LuceneArrowReader` does this around every `bridge.feedBatch()`, `VeloxExecutionEngine.feedArrowIpcToQueue()` does it around every `queue.put()`.

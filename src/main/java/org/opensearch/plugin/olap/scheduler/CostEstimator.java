@@ -9,6 +9,7 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.service.ClusterService;
+import org.opensearch.plugin.olap.execution.CoRoutedPairs;
 
 /**
  * Estimates index sizes and selects the optimal join strategy for MPP execution.
@@ -55,6 +56,31 @@ public class CostEstimator {
    * @return BROADCAST if the smaller side has few shards; HASH_SHUFFLE otherwise
    */
   public JoinStrategy selectJoinStrategy(String leftIndex, String rightIndex) {
+    return selectJoinStrategy(leftIndex, rightIndex, null, null, false, CoRoutedPairs.EMPTY);
+  }
+
+  /**
+   * Select the optimal join strategy, considering Co-Routing eligibility first.
+   *
+   * <p>Co-Routing is selected iff all of:
+   *
+   * <ul>
+   *   <li>{@code coRoutingEnabled=true}
+   *   <li>join keys are known on both sides (equi-join with exactly one key each)
+   *   <li>the {@code (leftIndex, leftKey, rightIndex, rightKey)} tuple is registered in {@code
+   *       coRoutedPairs} (in either order)
+   *   <li>both indexes have identical {@code number_of_shards}
+   * </ul>
+   *
+   * <p>Otherwise falls through to the standard BROADCAST / HASH_SHUFFLE selection.
+   */
+  public JoinStrategy selectJoinStrategy(
+      String leftIndex,
+      String rightIndex,
+      String leftKey,
+      String rightKey,
+      boolean coRoutingEnabled,
+      CoRoutedPairs coRoutedPairs) {
     int leftShards = getShardCount(leftIndex);
     int rightShards = getShardCount(rightIndex);
     int smallerShards = Math.min(leftShards, rightShards);
@@ -64,14 +90,38 @@ public class CostEstimator {
 
     logger.info(
         "Cost estimation: left={} ({} rows, {} shards), right={} ({} rows, {} shards),"
-            + " broadcastThreshold={}",
+            + " broadcastThreshold={}, coRoutingEnabled={}",
         leftIndex,
         leftRows,
         leftShards,
         rightIndex,
         rightRows,
         rightShards,
-        broadcastMaxShards);
+        broadcastMaxShards,
+        coRoutingEnabled);
+
+    if (coRoutingEnabled
+        && leftKey != null
+        && rightKey != null
+        && coRoutedPairs != null
+        && coRoutedPairs.matches(leftIndex, leftKey, rightIndex, rightKey)) {
+      if (leftShards == rightShards) {
+        logger.info(
+            "Co-Routing eligible: {}:{} ⋈ {}:{} (shards={})",
+            leftIndex,
+            leftKey,
+            rightIndex,
+            rightKey,
+            leftShards);
+        return JoinStrategy.CO_ROUTING;
+      }
+      logger.warn(
+          "Co-Routing pair registered but shard counts differ ({}={}, {}={}) — falling back",
+          leftIndex,
+          leftShards,
+          rightIndex,
+          rightShards);
+    }
 
     if (smallerShards <= broadcastMaxShards) {
       return JoinStrategy.BROADCAST;

@@ -242,4 +242,50 @@ public class ExecuteFragmentRequestTests extends OpenSearchTestCase {
 
     assertFalse(deserialized.isProfileEnabled());
   }
+
+  public void testSerializeDeserializeCoRoutingWithLeafPlans() throws IOException {
+    // P1 regression guard: co-routing requests must carry left/right leaf plan JSONs so the
+    // data-node handler can apply per-side pushdown. A round-trip asserts the wire format
+    // actually preserves both sides' plans.
+    ExecuteFragmentRequest original =
+        new ExecuteFragmentRequest("q-co", 0, 0, "{\"coord\":true}", List.of(), null);
+    ShardId leftShard = new ShardId(new Index("orders", "_na_"), 3);
+    ShardId rightShard = new ShardId(new Index("customers", "_na_"), 3);
+    original.setCoRoutingJoin("orders", "customers", leftShard, rightShard, 0);
+    original.setCoRoutingLeafPlans("{\"left_leaf\":\"filter\"}", "{\"right_leaf\":\"project\"}");
+
+    BytesStreamOutput out = new BytesStreamOutput();
+    original.writeTo(out);
+
+    StreamInput in = out.bytes().streamInput();
+    ExecuteFragmentRequest deserialized = new ExecuteFragmentRequest(in);
+
+    assertTrue(deserialized.isCoRoutingJoin());
+    assertEquals("orders", deserialized.getCoRoutingLeftIndex());
+    assertEquals("customers", deserialized.getCoRoutingRightIndex());
+    assertEquals(3, deserialized.getCoRoutingLeftShardId().id());
+    assertEquals(3, deserialized.getCoRoutingRightShardId().id());
+    assertEquals(0, deserialized.getCoRoutingLeftScanIndex());
+    assertEquals("{\"left_leaf\":\"filter\"}", deserialized.getCoRoutingLeftPlanJson());
+    assertEquals("{\"right_leaf\":\"project\"}", deserialized.getCoRoutingRightPlanJson());
+  }
+
+  public void testSerializeDeserializeCoRoutingLeafPlansOptional() throws IOException {
+    // Query with no leaf-side pushdown (full scan both sides) should still round-trip cleanly
+    // with null leaf plan JSONs.
+    ExecuteFragmentRequest original =
+        new ExecuteFragmentRequest("q-co-null", 0, 0, "{}", List.of(), null);
+    ShardId leftShard = new ShardId(new Index("a", "_na_"), 0);
+    ShardId rightShard = new ShardId(new Index("b", "_na_"), 0);
+    original.setCoRoutingJoin("a", "b", leftShard, rightShard, 0);
+    // Leaf plans deliberately unset.
+
+    BytesStreamOutput out = new BytesStreamOutput();
+    original.writeTo(out);
+
+    ExecuteFragmentRequest deserialized = new ExecuteFragmentRequest(out.bytes().streamInput());
+    assertTrue(deserialized.isCoRoutingJoin());
+    assertNull(deserialized.getCoRoutingLeftPlanJson());
+    assertNull(deserialized.getCoRoutingRightPlanJson());
+  }
 }

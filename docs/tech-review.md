@@ -26,7 +26,7 @@ The OpenSearch OLAP plugin adds a vectorized, columnar execution engine to OpenS
 - Co-works with the SQL plugin — no replacement, no fork
 - 6 minimal changes to the SQL plugin; zero changes to OpenSearch core
 - Calcite Convention-based physical planning (VolcanoPlanner + PhysicalConvention + ConverterRules)
-- Supports MPP execution: two-phase distributed aggregation, coordinator-centric/broadcast/shuffle joins
+- Supports MPP execution: two-phase distributed aggregation, coordinator-centric/broadcast/shuffle joins, Co-Routing for co-located indexes (zero-shuffle)
 - Runtime Filter pushdown (build-side join keys → Lucene TermInSetQuery on probe scan)
 - CBO statistics for row-count-based join build side selection
 - Two-stage TopN, window functions (eventstats), fault tolerance with task retry
@@ -512,6 +512,7 @@ Our design extends the SQL plugin rather than rewriting it, while adopting key R
 - Per-query session creation (prevents memory pool collisions)
 - Graceful degradation on unsupported platforms
 - Data types: boolean, integer, long, float, double, keyword, date, timestamp
+- Co-Routing joins (MPP Phase A): when two indexes are registered as co-routed (same `_routing` key + matching `number_of_shards`) via `plugins.velox.co_routed_pairs`, binary equi-joins run shard-local with zero shuffle and zero broadcast. Each aligned shard pair becomes one task on the node hosting both copies. Falls back to BROADCAST/HASH_SHUFFLE if shards cannot be aligned. Distribution-trait-driven planning (Phase B) deferred.
 
 ### What's Next
 
@@ -540,7 +541,7 @@ Gaps identified by comparison with [RFC #4812](https://github.com/opensearch-pro
 
 | Priority | Item | Gap vs RFC | Current State |
 |----------|------|-----------|---------------|
-| **Medium** | Co-Routing / ES_ROUTING_SHUFFLE | RFC enables shard-local joins when both sides share routing key — no shuffle needed | Not implemented; all joins require data movement |
+| **Medium** | Co-Routing / ES_ROUTING_SHUFFLE | RFC enables shard-local joins when both sides share routing key — no shuffle needed | **Phase A done** — opt-in via `co_routing_enabled` + `co_routed_pairs`. One task per aligned shard pair, zero shuffle, zero broadcast. Falls back to BROADCAST/HASH_SHUFFLE when shards mis-align. Distribution-trait refactor (Phase B) still deferred. |
 | **Medium** | Adaptive query execution | RFC replans at runtime based on intermediate result sizes | All decisions at plan time |
 | ~~**Medium**~~ | ~~Two-stage Runtime Filter construction~~ | ~~RFC builds PARTIAL RF locally, merges into FINAL RF globally for distributed builds~~ | **Done (BLOOM)** — data nodes build PARTIAL bloom; coordinator merges via bitwise-OR into FINAL bloom; `runtime_filter_bloom_two_stage` setting. TERMS two-stage deferred (coordinator rebuild is cheap at TERMS caps). |
 | **Low** | Convention.enforce() for distribution | RFC uses trait-driven exchange insertion via Calcite's automatic enforcement | Explicit PhysicalExchange insertion in rules (works but verbose) |

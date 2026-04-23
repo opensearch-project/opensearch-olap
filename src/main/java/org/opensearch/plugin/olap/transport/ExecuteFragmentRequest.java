@@ -124,6 +124,33 @@ public class ExecuteFragmentRequest extends ActionRequest {
   /** Expected number of right-side senders for this shuffle join. */
   private int expectedRightSenders;
 
+  // --- Co-Routing join fields ---
+  /**
+   * When true, this fragment is a Co-Routing join task. The data node scans one left shard and one
+   * right shard locally, feeding each into its own {@code ExternalStreamBridge}, and runs the
+   * plan's {@code HashJoinNode} with zero shuffle.
+   */
+  private boolean coRoutingJoin;
+
+  private String coRoutingLeftIndex;
+  private String coRoutingRightIndex;
+  private ShardId coRoutingLeftShardId;
+  private ShardId coRoutingRightShardId;
+
+  /** Index of the left scan in the coordinator join plan (the other is right). Default 0. */
+  private int coRoutingLeftScanIndex;
+
+  /**
+   * Leaf-fragment plan JSON for the left side. Carries any {@code FilterNode}/{@code ProjectNode}
+   * that the SQL plugin pushed down onto the left leaf scan — the coordinator's {@code
+   * HashJoinNode} only sees the two bare {@code TableScanNode}s and would otherwise skip those
+   * operators. Null means no leaf-side pushdown on the left.
+   */
+  private String coRoutingLeftPlanJson;
+
+  /** Symmetric to {@link #coRoutingLeftPlanJson}, for the right side. */
+  private String coRoutingRightPlanJson;
+
   public ExecuteFragmentRequest() {}
 
   public ExecuteFragmentRequest(StreamInput in) throws IOException {
@@ -211,6 +238,18 @@ public class ExecuteFragmentRequest extends ActionRequest {
 
     // Profile toggle trailer. Cluster-wide version-homogeneous via a single plugin deploy.
     this.profileEnabled = in.readBoolean();
+
+    // Co-Routing join trailer.
+    this.coRoutingJoin = in.readBoolean();
+    if (this.coRoutingJoin) {
+      this.coRoutingLeftIndex = in.readString();
+      this.coRoutingRightIndex = in.readString();
+      this.coRoutingLeftShardId = new ShardId(in);
+      this.coRoutingRightShardId = new ShardId(in);
+      this.coRoutingLeftScanIndex = in.readVInt();
+      this.coRoutingLeftPlanJson = in.readOptionalString();
+      this.coRoutingRightPlanJson = in.readOptionalString();
+    }
   }
 
   /** Constructor for normal scan requests (backward compatible). */
@@ -309,6 +348,18 @@ public class ExecuteFragmentRequest extends ActionRequest {
 
     // Profile toggle trailer.
     out.writeBoolean(profileEnabled);
+
+    // Co-Routing join trailer.
+    out.writeBoolean(coRoutingJoin);
+    if (coRoutingJoin) {
+      out.writeString(coRoutingLeftIndex);
+      out.writeString(coRoutingRightIndex);
+      coRoutingLeftShardId.writeTo(out);
+      coRoutingRightShardId.writeTo(out);
+      out.writeVInt(coRoutingLeftScanIndex);
+      out.writeOptionalString(coRoutingLeftPlanJson);
+      out.writeOptionalString(coRoutingRightPlanJson);
+    }
   }
 
   private static final byte[] EMPTY_BYTES = new byte[0];
@@ -491,6 +542,57 @@ public class ExecuteFragmentRequest extends ActionRequest {
 
   public boolean isShuffleJoin() {
     return shuffleJoinQueryId != null;
+  }
+
+  public boolean isCoRoutingJoin() {
+    return coRoutingJoin;
+  }
+
+  public String getCoRoutingLeftIndex() {
+    return coRoutingLeftIndex;
+  }
+
+  public String getCoRoutingRightIndex() {
+    return coRoutingRightIndex;
+  }
+
+  public ShardId getCoRoutingLeftShardId() {
+    return coRoutingLeftShardId;
+  }
+
+  public ShardId getCoRoutingRightShardId() {
+    return coRoutingRightShardId;
+  }
+
+  public int getCoRoutingLeftScanIndex() {
+    return coRoutingLeftScanIndex;
+  }
+
+  public String getCoRoutingLeftPlanJson() {
+    return coRoutingLeftPlanJson;
+  }
+
+  public String getCoRoutingRightPlanJson() {
+    return coRoutingRightPlanJson;
+  }
+
+  public void setCoRoutingJoin(
+      String leftIndex,
+      String rightIndex,
+      ShardId leftShardId,
+      ShardId rightShardId,
+      int leftScanIndex) {
+    this.coRoutingJoin = true;
+    this.coRoutingLeftIndex = leftIndex;
+    this.coRoutingRightIndex = rightIndex;
+    this.coRoutingLeftShardId = leftShardId;
+    this.coRoutingRightShardId = rightShardId;
+    this.coRoutingLeftScanIndex = leftScanIndex;
+  }
+
+  public void setCoRoutingLeafPlans(String leftPlanJson, String rightPlanJson) {
+    this.coRoutingLeftPlanJson = leftPlanJson;
+    this.coRoutingRightPlanJson = rightPlanJson;
   }
 
   // --- Setters for builder-style construction ---

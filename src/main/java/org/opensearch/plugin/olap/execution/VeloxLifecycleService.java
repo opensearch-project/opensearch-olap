@@ -299,6 +299,38 @@ public class VeloxLifecycleService implements Closeable {
           Setting.Property.NodeScope,
           Setting.Property.Dynamic);
 
+  // ---- Co-Routing settings (MPP Phase A) ----
+
+  /**
+   * Enable Co-Routing join optimization. When true, binary equi-joins between two co-routed indexes
+   * (see {@link #CO_ROUTED_PAIRS}) run shard-local with no shuffle, dominating the
+   * BROADCAST/HASH_SHUFFLE strategies when applicable. Requires {@code mpp_enabled=true}.
+   */
+  public static final Setting<Boolean> CO_ROUTING_ENABLED =
+      Setting.boolSetting(
+          "plugins.velox.co_routing_enabled",
+          false,
+          Setting.Property.NodeScope,
+          Setting.Property.Dynamic);
+
+  /**
+   * Registry of co-routed index pairs. Format: {@code "indexA:keyA,indexB:keyB;indexC:keyC,..."} —
+   * semicolon-separated entries where each entry is two {@code index:key} tuples joined by a comma.
+   * Only joins matching a registered pair (in either left→right or right→left order) are eligible
+   * for Co-Routing; all others fall back to BROADCAST/HASH_SHUFFLE/COORDINATOR-CENTRIC.
+   *
+   * <p>The pair is the user's assertion that both indexes were indexed with {@code _routing} equal
+   * to the listed key field <em>and</em> have matching {@code number_of_shards}. Drift produces
+   * wrong results; the setting is explicit precisely to avoid silently assuming it.
+   */
+  public static final Setting<List<String>> CO_ROUTED_PAIRS =
+      Setting.listSetting(
+          "plugins.velox.co_routed_pairs",
+          List.of(),
+          s -> s,
+          Setting.Property.NodeScope,
+          Setting.Property.Dynamic);
+
   private volatile boolean enabled;
   private volatile boolean forceVectorize;
   private volatile boolean mppEnabled;
@@ -321,6 +353,8 @@ public class VeloxLifecycleService implements Closeable {
   private volatile long shuffleBufferBytes;
   private volatile int backpressureWaitMs;
   private volatile int backpressureWatermarkPct;
+  private volatile boolean coRoutingEnabled;
+  private volatile CoRoutedPairs coRoutedPairs = CoRoutedPairs.EMPTY;
   private volatile MemoryManager memoryManager;
   private volatile Session session;
   private volatile boolean initialized = false;
@@ -348,6 +382,8 @@ public class VeloxLifecycleService implements Closeable {
     this.shuffleBufferBytes = SHUFFLE_BUFFER_BYTES.get(settings).getBytes();
     this.backpressureWaitMs = BACKPRESSURE_WAIT_MS.get(settings);
     this.backpressureWatermarkPct = BACKPRESSURE_WATERMARK_PCT.get(settings);
+    this.coRoutingEnabled = CO_ROUTING_ENABLED.get(settings);
+    this.coRoutedPairs = CoRoutedPairs.parse(CO_ROUTED_PAIRS.get(settings));
 
     if (enabled) {
       try {
@@ -598,6 +634,22 @@ public class VeloxLifecycleService implements Closeable {
     return Math.max(1L, hardCapBytes * backpressureWatermarkPct / 100L);
   }
 
+  public boolean isCoRoutingEnabled() {
+    return coRoutingEnabled;
+  }
+
+  public void setCoRoutingEnabled(boolean coRoutingEnabled) {
+    this.coRoutingEnabled = coRoutingEnabled;
+  }
+
+  public CoRoutedPairs getCoRoutedPairs() {
+    return coRoutedPairs;
+  }
+
+  public void setCoRoutedPairs(List<String> raw) {
+    this.coRoutedPairs = CoRoutedPairs.parse(raw);
+  }
+
   public static List<Setting<?>> getSettings() {
     return List.of(
         OLAP_ENABLED,
@@ -623,7 +675,9 @@ public class VeloxLifecycleService implements Closeable {
         COORDINATOR_INFLIGHT_BYTES,
         SHUFFLE_BUFFER_BYTES,
         BACKPRESSURE_WAIT_MS,
-        BACKPRESSURE_WATERMARK_PCT);
+        BACKPRESSURE_WATERMARK_PCT,
+        CO_ROUTING_ENABLED,
+        CO_ROUTED_PAIRS);
   }
 
   @Override
