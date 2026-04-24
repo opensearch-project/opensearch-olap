@@ -322,9 +322,6 @@ public class Big5IT extends OlapRestTestCase {
 
   // ---- Dedup ----
 
-  @Ignore(
-      "Unsupported: dedup compiles to row_number() whose Velox registration returns BIGINT, SQL"
-          + " plugin expects INTEGER")
   public void testDedupMetricsSizeField() throws IOException {
     runQuery("dedup_metrics_size_field");
   }

@@ -162,6 +162,27 @@ The Velox engine reads data from Lucene doc values only. Field types without doc
 | LIST | No | | |
 | VALUES | No | | |
 
+## Window Functions
+
+Window functions are evaluated by Velox's `WindowNode` (wrapped in PPL's `eventstats` / `dedup` commands). Regular aggregate functions (SUM/COUNT/AVG/MIN/MAX) also work as window aggregates over an OVER clause.
+
+| Function | Velox Support | Velox Name | Return Type | Notes |
+|----------|:---:|---|---|---|
+| ROW_NUMBER | Yes | `row_number` | INTEGER → BIGINT | Narrowed to INTEGER at WindowNode (Spark dialect wins registration race against Presto's BIGINT), then cast back to BIGINT in an inserted ProjectNode. See `VeloxPlanGenerator.INTEGER_RETURNING_WINDOW_FUNCTIONS`. |
+| RANK | Yes | `rank` | INTEGER → BIGINT | Same INTEGER→BIGINT bridging as row_number. |
+| DENSE_RANK | Yes | `dense_rank` | INTEGER → BIGINT | Same INTEGER→BIGINT bridging as row_number. |
+| NTILE | No | `ntile` | | Deferred — Spark registration pins the bucket argument to INTEGER, but Calcite may declare BIGINT, so routing without an argument coercion would fail Velox signature resolution instead of falling back cleanly. |
+| NTH_VALUE | No | `nth_value` | | Deferred — same offset-type mismatch as NTILE; return type is `T → T` (not INTEGER), so no narrowing bridge applies. |
+| SUM / COUNT / AVG / MIN / MAX (window) | Yes | same as agg | — | Backed by the same Velox aggregate registrations used in `AggregationNode`; no type bridging needed. |
+| LAG | No | `lag` | | Not yet verified — falls back to default engine via `canVectorize`. |
+| LEAD | No | `lead` | | Not yet verified. |
+| FIRST_VALUE | No | `first_value` | | Not yet verified. |
+| LAST_VALUE | No | `last_value` | | Not yet verified. |
+| CUME_DIST | No | | | |
+| PERCENT_RANK | No | | | |
+
+PPL's `dedup` command lowers to `row_number() OVER (PARTITION BY <keys>) <= N` + a filter; that path is integration-tested by `WindowFunctionIT.testDedupCompilesToRowNumber` and `Big5IT.testDedupMetricsSizeField`.
+
 ## Cryptographic Functions
 
 | Function | Velox Support | Velox Name | Notes |

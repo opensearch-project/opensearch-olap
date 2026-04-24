@@ -125,4 +125,21 @@ public class WindowFunctionIT extends OlapRestTestCase {
     // The plan should reference the partition key (dept_id)
     assertTrue("Plan should reference partition key dept_id", plan.contains("dept_id"));
   }
+
+  // ---- Ranking window functions (row_number) ----
+
+  /**
+   * PPL's {@code dedup} command lowers to {@code row_number() OVER (PARTITION BY ... ORDER BY ...)}
+   * with a {@code row_number <= 1} filter. Velox's registered row_number returns INTEGER while
+   * Calcite declares BIGINT, so the plan generator narrows the WindowNode output and inserts a
+   * CastTypedExpr projection to bridge the width gap. This test locks that path in.
+   */
+  public void testDedupCompilesToRowNumber() throws IOException {
+    JSONObject response =
+        executePPLQuery(
+            "source = " + Index.EMPLOYEES.getName() + " | dedup dept_id | fields dept_id");
+    JSONArray rows = getDataRows(response);
+    // employees has 3 distinct dept_ids (10, 20, 30) — dedup on dept_id keeps one per group.
+    assertEquals("dedup dept_id should keep 3 rows", 3, rows.length());
+  }
 }
