@@ -35,10 +35,11 @@ public class PhysicalAggregateRule extends ConverterRule {
   @Override
   public RelNode convert(RelNode rel) {
     Aggregate agg = (Aggregate) rel;
-    // Convert child to PhysicalConvention only (no distribution requirement).
-    // The aggregate itself declares SINGLETON distribution in its traitSet.
-    // Convention.enforce() will auto-insert PhysicalExchange when the child's
-    // distribution (e.g., RANDOM from scan) doesn't satisfy SINGLETON.
+    // Convert the child to PhysicalConvention only (no explicit distribution request on input —
+    // the VolcanoPlanner can't decompose NONE→PHYSICAL + ANY→SINGLETON in one step). The
+    // aggregate declares SINGLETON on its own traitSet; Convention.enforce() then inserts a
+    // PhysicalExchange between the now-PHYSICAL child and this aggregate whenever the child's
+    // distribution doesn't satisfy SINGLETON. Same pattern used by all rules in this package.
     RelNode input =
         convert(agg.getInput(), agg.getInput().getTraitSet().replace(PhysicalConvention.INSTANCE));
     return new PhysicalAggregate(

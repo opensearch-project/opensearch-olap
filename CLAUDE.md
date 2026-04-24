@@ -163,13 +163,8 @@ Cost estimator uses shard count heuristic (`plugins.velox.broadcast_max_shards`,
 
 **Custom task placement for a new execution strategy**: build `TaskDescriptor`s directly (don't re-enter `QueryScheduler.schedule()` which assumes a Stage graph) and dispatch via a dedicated `NodeResultCollector.dispatchAndCollect*` overload taking a `BiConsumer<TaskDescriptor, ExecuteFragmentRequest>` that stamps strategy-specific request fields. See `executeCoRoutingFragments` + `dispatchAndCollectCoRouting` for the shape.
 
-### MPP rule design (MppJoinRule, MppAggregateRule)
-MPP rules use the same explicit PhysicalExchange insertion pattern as the base rules:
-1. Convert children to PhysicalConvention (convention conversion only)
-2. Explicitly insert `PhysicalExchange.create(child, RelDistributions.hash(keys))`
-3. The VolcanoPlanner explores both SINGLETON (base rules) and HASH (MPP rules) alternatives, picks the lower-cost plan
-
-This avoids `CannotPlanException` — the VolcanoPlanner can't decompose cross-convention + cross-distribution conversion (NONE+ANY → PHYSICAL+HASH) in one step, so the exchange must be inserted explicitly rather than requested via traits.
+### Exchange insertion (pragmatic, not trait-driven in practice)
+`PhysicalConvention.enforce()` + `AbstractConverter.ExpandConversionRule` are wired up, but enforce does **not** reliably fire at scan→parent boundaries in this codebase: `PhysicalTableScan` declares distribution=`ANY`, which satisfies every other distribution, so enforce never sees a mismatch at that boundary. As a result, any operator that needs a specific exchange boundary (for fragment splits, two-stage aggregation, hash shuffle joins) inserts `PhysicalExchange.create()` explicitly: `PhysicalJoinRule` (SINGLETON), `MppJoinRule` (HASH per side), `MppAggregateRule` (HASH on group keys). `PhysicalAggregateRule` and `PhysicalSortRule` declare SINGLETON on their output but do NOT insert exchanges — they work today because typical plans resolve to single-node execution, not because enforce is doing anything. `PlanExplainTests.testAggregationProducesTwoStageFragments` explicitly notes that enforce "may or may not fire in unit test VolcanoPlanner"; the end-to-end two-stage split behavior is exercised by `AggregationIT`. `PhysicalExchange.computeSelfCost()` gives HASH 0.8x SINGLETON so when `mpp_enabled=true` the planner prefers HASH alternatives for joins and aggregations.
 
 `PhysicalExchange.computeSelfCost()` gives HASH_DISTRIBUTED 0.8x the cost of SINGLETON, so when `mpp_enabled=true` the planner prefers HASH exchanges for joins. The `CostEstimator` then decides BROADCAST vs HASH_SHUFFLE at execution time.
 
@@ -184,16 +179,18 @@ This avoids `CannotPlanException` — the VolcanoPlanner can't decompose cross-c
 - HASH_DISTRIBUTED exchange → `FragmentProperties.shuffleScan()` (hash-partition by key channels)
 
 ### Join column name conflict
-Velox validates that left and right output types have no duplicate names. The SQL plugin's `CalciteRelNodeVisitor.visitJoin()` adds a rename Project above the join (e.g. `dept_id0` → `d.dept_id`). The converter inserts a `ProjectNode` around the right side to rename conflicting columns. The scan keeps original names (for `LuceneArrowReader`), and ExternalStream maps by position, so the rename is transparent.
+Velox validates that left and right output types have no duplicate names. When the two join inputs share a column (e.g. both have `dept_id`), Calcite's `SqlValidatorUtil.EXPR_SUGGESTER` uniquifies by appending an attempt counter to the original name (`dept_id` → `dept_id0`, `sku2` → `sku20`). `VeloxPlanGenerator.convertJoin` mirrors this by wrapping the **right** input in a `ProjectNode` that maps renamed → raw (`names=[dept_id0, dept_name], projections=[FieldAccess("dept_id"), FieldAccess("dept_name")]`). The downstream SQL plugin's final projection then renames `dept_id0` to `d.dept_id` for user display. Scans keep original names (needed by `LuceneArrowReader`), and ExternalStream maps by position.
 
-**Plan-node field-name normalization**: when reading join keys via `HashJoinNode.getLeftKeys()/getRightKeys()` to match against raw index field names, strip trailing digits with `.replaceAll("\\d+$", "")` — the SQL plugin's rename suffixes field names like `dept_id` → `dept_id0`. Pattern used by `VeloxExecutionEngine.extractProbeJoinKeyField` and `selectJoinStrategy`.
+**Resolving a join-key name back to the raw scan column — use `VeloxExecutionEngine.resolveRawBuildKeyName(joinNode, isBuildLeft, keyName)`.** When any code path needs to map a HashJoin's key name (which may be the Calcite-uniquified form) back to the raw column name in the build-side scan schema — e.g. runtime-filter bloom build, co-routing pair eligibility — **always** use this helper, never a regex strip. The helper walks the plan: if the build-side child is the rename `ProjectNode`, it reverses the `names[i] → projections[i].fieldName` mapping; otherwise it returns the key unchanged. Regex stripping (`\\d+$`) silently corrupts legitimate field names that end in digits (`sku2`, `year2024`) — the uniquifier's counter is indistinguishable from real trailing digits without the schema. Call sites today: `executeBroadcastFragments` (two-stage bloom), `extractRuntimeFilter` (single-stage), `selectJoinStrategy` (co-routing eligibility). See `VeloxExecutionEngineTests.testResolveRawBuildKeyName_realFieldEndingInDigits` for the regression-guard test.
+
+**When adding a new PPL integration test that exercises joins** — especially with aggregation on the join output, runtime filters, or co-routing — prefer a join key whose column name does not end in a digit (`dept_id`, `customer_id`). If a new test must use a digit-ending name (`sku2`, `year2024`, `id2`), confirm both sides' bloom/RF/matching behavior end-to-end and add a unit test in `VeloxExecutionEngineTests` that pins the resolver's handling of that specific shape. The integration symptom of a broken resolver is "join returns zero rows despite matching data" — caused by an empty bloom filtering out all probe rows. Check the data-node log for `PARTIAL bloom built: field=<name>, inserted=0` when triaging.
 
 ## Calcite physical planning framework (plan/physical/)
 Uses Calcite's Convention + VolcanoPlanner, wired into `VeloxExecutionEngine.execute()`:
 - `PhysicalConvention` — custom Convention with `enforce()` for auto Exchange insertion; `useAbstractConvertersForConversion()` returns `true` for distribution enforcement
 - Physical nodes extend Calcite base classes (Filter, Project, etc.) and implement `PhysicalRel` marker interface
 - `PhysicalTableScan` overrides `deriveRowType()` to preserve the SQL plugin's scan row type
-- ConverterRules convert Convention.NONE → PhysicalConvention with explicit PhysicalExchange insertion
+- ConverterRules convert Convention.NONE → PhysicalConvention. Any rule needing a concrete exchange boundary (joins, MPP aggregate) inserts `PhysicalExchange.create()` explicitly — `Convention.enforce()` is wired up but does not fire at scan→parent boundaries because PhysicalTableScan's distribution is ANY. See "Exchange insertion" subsection below.
 - MPP rules (MppAggregateRule, MppJoinRule) registered only when mpp_enabled=true
 - Reuses Calcite's built-in `RelDistribution` (SINGLETON, HASH_DISTRIBUTED, RANDOM_DISTRIBUTED, ANY)
 - **Guava is compileOnly** in build.gradle — needed because Calcite base classes use `ImmutableList` in constructors

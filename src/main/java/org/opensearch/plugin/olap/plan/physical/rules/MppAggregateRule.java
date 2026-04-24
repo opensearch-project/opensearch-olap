@@ -44,13 +44,16 @@ public class MppAggregateRule extends ConverterRule {
       return null;
     }
 
-    // Convert child to PHYSICAL first, then explicitly insert Exchange(HASH).
-    // Same pattern as MppJoinRule — VolcanoPlanner can't decompose cross-convention +
-    // cross-distribution conversion in one step.
+    // Convert child to PhysicalConvention, then explicitly insert a PhysicalExchange(HASH) on
+    // the group keys. This matches MppJoinRule. We cannot rely solely on Convention.enforce():
+    // PhysicalTableScan produces distribution=ANY, which satisfies every other distribution —
+    // so enforce never fires at the scan→aggregate boundary and the exchange is absent. The
+    // downstream VeloxPlanGenerator.convertAggregate looks for a PhysicalExchange child to
+    // split SINGLE aggregate into PARTIAL+FINAL; without the explicit exchange, MPP queries
+    // fall back to single-stage aggregation.
     RelNode input =
         convert(agg.getInput(), agg.getInput().getTraitSet().replace(PhysicalConvention.INSTANCE));
     input = PhysicalExchange.create(input, RelDistributions.hash(agg.getGroupSet().asList()));
-
     return new PhysicalAggregate(
         rel.getCluster(),
         rel.getTraitSet()

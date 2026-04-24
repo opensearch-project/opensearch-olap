@@ -42,9 +42,12 @@ public class MppJoinRule extends ConverterRule {
       return null;
     }
 
-    // Convert children to PhysicalConvention first, then explicitly insert Exchange(HASH).
-    // Same pattern as PhysicalJoinRule — VolcanoPlanner can't decompose cross-convention +
-    // cross-distribution conversion in one step.
+    // Convert children to PhysicalConvention, then explicitly insert PhysicalExchange(HASH)
+    // with per-side keys. Calcite's Convention.enforce() can't drive this path because a
+    // single required distribution trait on the join node can't be "HASH(leftKeys) for left
+    // input AND HASH(rightKeys) for right input" simultaneously — the two inputs need
+    // different hash keys. The aggregate/sort rules use enforce because their single-input
+    // shape fits the trait model; joins don't.
     RelNode left =
         convert(join.getLeft(), join.getLeft().getTraitSet().replace(PhysicalConvention.INSTANCE));
     RelNode right =

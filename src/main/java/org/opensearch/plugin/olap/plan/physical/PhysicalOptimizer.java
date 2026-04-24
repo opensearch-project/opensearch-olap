@@ -128,10 +128,16 @@ public class PhysicalOptimizer {
       planner.addRule(rule);
     }
 
-    // Only require PhysicalConvention. Distribution (SINGLETON) is enforced explicitly
-    // by the ConverterRules (PhysicalAggregateRule, PhysicalJoinRule, PhysicalSortRule) which
-    // insert PhysicalExchange nodes. Convention.enforce() doesn't fire for distribution
-    // in Calcite's default VolcanoPlanner flow.
+    // Only require PhysicalConvention at the root. Rules that need a specific boundary — joins
+    // (PhysicalJoinRule, MppJoinRule) and MPP aggregate (MppAggregateRule) — call
+    // PhysicalExchange.create() explicitly on their inputs. Convention.enforce() is wired up
+    // here via AbstractConverter.ExpandConversionRule but does not reliably fire for
+    // scan→parent boundaries: PhysicalTableScan produces distribution=ANY, which satisfies
+    // every other distribution, so enforce never sees a mismatch. The boundary-requiring
+    // operators therefore cannot rely on enforce and must insert exchanges themselves.
+    // PhysicalAggregateRule / PhysicalSortRule declare SINGLETON but do not insert exchanges;
+    // they run on whatever distribution the child produces (usually single-node in current
+    // query shapes). If that ever stops being correct, they too need explicit insertion.
     RelTraitSet requiredTraits = newCluster.traitSet().replace(PhysicalConvention.INSTANCE);
 
     RelNode root = planner.changeTraits(copiedPlan, requiredTraits);
