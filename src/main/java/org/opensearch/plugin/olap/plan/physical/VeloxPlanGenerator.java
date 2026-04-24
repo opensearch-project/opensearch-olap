@@ -37,6 +37,7 @@ import org.boostscale.velox4j.aggregate.Aggregate;
 import org.boostscale.velox4j.aggregate.AggregateStep;
 import org.boostscale.velox4j.connector.ExternalStreamTableHandle;
 import org.boostscale.velox4j.expression.CallTypedExpr;
+import org.boostscale.velox4j.expression.CastTypedExpr;
 import org.boostscale.velox4j.expression.FieldAccessTypedExpr;
 import org.boostscale.velox4j.expression.TypedExpr;
 import org.boostscale.velox4j.join.JoinType;
@@ -52,6 +53,7 @@ import org.boostscale.velox4j.plan.WindowNode;
 import org.boostscale.velox4j.sort.SortOrder;
 import org.boostscale.velox4j.type.BigIntType;
 import org.boostscale.velox4j.type.DoubleType;
+import org.boostscale.velox4j.type.IntegerType;
 import org.boostscale.velox4j.type.RealType;
 import org.boostscale.velox4j.type.RowType;
 import org.boostscale.velox4j.type.Type;
@@ -86,6 +88,28 @@ public class VeloxPlanGenerator {
 
   private static final Set<String> METADATA_COLUMNS =
       Set.of("_id", "_index", "_score", "_maxscore", "_sort", "_routing");
+
+  /**
+   * Window functions whose Velox registration returns INTEGER (Spark dialect), not BIGINT.
+   *
+   * <p>velox4j's init registers Presto (BIGINT) first, then Spark (INTEGER) second, and the Spark
+   * registration overwrites. So despite Presto's documented BIGINT return type, the live
+   * registration actually returns INTEGER for these functions. Calcite's default {@code
+   * deriveRankType} returns BIGINT, producing a plan-type mismatch that Velox rejects at
+   * WindowFunction::create with "Expected INTEGER. Got BIGINT." We emit INTEGER at the WindowNode
+   * and then insert a CastTypedExpr to bring the output back to Calcite's declared type so
+   * downstream filters/projects that index the column by its Calcite-declared BIGINT still work.
+   *
+   * <p>Intentionally excludes {@code ntile} and {@code nth_value}: both take an explicit offset
+   * argument whose type the Spark registration pins to INTEGER, while Calcite may present the
+   * offset as BIGINT. Until we coerce the argument to INTEGER (and reject out-of-range literals),
+   * these two are kept out of {@code SUPPORTED_WINDOW_FUNCTIONS} in {@code
+   * VectorizedEngineExtension} so they fall back to the default engine cleanly. For {@code
+   * nth_value} the return type is also not INTEGER ({@code T → T}), so widening here would be
+   * actively wrong.
+   */
+  private static final Set<String> INTEGER_RETURNING_WINDOW_FUNCTIONS =
+      Set.of("row_number", "rank", "dense_rank");
 
   private final PlanIdGenerator idGen = new PlanIdGenerator();
   private final AtomicInteger fragmentId = new AtomicInteger(0);
@@ -928,6 +952,32 @@ public class VeloxPlanGenerator {
     }
 
     RelDataType inputRowType = window.getInput().getRowType();
+
+    // Snapshot the source's mappings BEFORE building our output schema. The outer Project above
+    // Window relies on these (e.g., to skip refs to metadata columns or MAP parents that the scan
+    // dropped — the scan marked them with veloxIndex=-1).
+    FieldMapping[] sourceMappings = currentFieldMappings;
+    RowType sourceVeloxType = currentVeloxOutputType;
+    // When the Window sits above an exchange (handleExchange cleared mappings, createExchangeScan
+    // didn't repopulate them), reconstruct the source's Velox schema and mappings from Calcite's
+    // input row type using the same drop-MAP-and-metadata rules the scan uses. Without this,
+    // every pre-window column gets veloxIndex=-1 in the rebuild below, silently dropping any
+    // downstream Sort/Filter/Project reference to a real input field.
+    if (sourceVeloxType == null) {
+      sourceVeloxType = buildFlatRowType(inputRowType);
+      Map<String, Integer> nameToIdx = new LinkedHashMap<>();
+      for (int i = 0; i < sourceVeloxType.getNames().size(); i++) {
+        nameToIdx.put(sourceVeloxType.getNames().get(i), i);
+      }
+      FieldMapping[] rebuilt = new FieldMapping[inputRowType.getFieldCount()];
+      for (int i = 0; i < inputRowType.getFieldCount(); i++) {
+        RelDataTypeField f = inputRowType.getFieldList().get(i);
+        Integer vIdx = nameToIdx.get(f.getName());
+        rebuilt[i] = new FieldMapping(vIdx != null ? vIdx : -1, f.getName(), null);
+      }
+      sourceMappings = rebuilt;
+    }
+
     String nodeId = idGen.next();
 
     // A Window can have multiple Groups (each with different partition/order specs).
@@ -971,6 +1021,12 @@ public class VeloxPlanGenerator {
     List<WindowFunction> windowFunctions = new ArrayList<>();
     VeloxExprConverter exprConverter = new VeloxExprConverter(inputRowType);
 
+    // Track ranking functions whose Velox registration emits INTEGER but whose Calcite-declared
+    // type is wider (usually BIGINT). For each, record the Calcite-declared type so we can insert
+    // a cast projection above the WindowNode to re-widen the output.
+    List<Integer> rankingColumnsToCast = new ArrayList<>();
+    List<Type> rankingColumnTargetTypes = new ArrayList<>();
+
     int outputFieldOffset = inputRowType.getFieldCount();
     for (int i = 0; i < group.aggCalls.size(); i++) {
       RexWinAggCall aggCall = group.aggCalls.get(i);
@@ -981,14 +1037,25 @@ public class VeloxPlanGenerator {
 
       // Convert function call
       String funcName = aggCall.getOperator().getName().toLowerCase(Locale.ROOT);
-      Type returnType = VeloxTypeConverter.toVeloxType(aggCall.getType());
+      Type calciteDeclaredType = VeloxTypeConverter.toVeloxType(aggCall.getType());
+
+      // Velox's registered ranking functions return INTEGER (Spark dialect wins the registration
+      // race against Presto's BIGINT in Init.cc). Override the WindowNode's declared return type
+      // so Velox accepts the plan; the cast projection below restores Calcite's declared type.
+      Type veloxReturnType = calciteDeclaredType;
+      if (INTEGER_RETURNING_WINDOW_FUNCTIONS.contains(funcName)
+          && !(calciteDeclaredType instanceof IntegerType)) {
+        veloxReturnType = new IntegerType();
+        rankingColumnsToCast.add(i);
+        rankingColumnTargetTypes.add(calciteDeclaredType);
+      }
 
       List<TypedExpr> args = new ArrayList<>();
       for (RexNode operand : aggCall.getOperands()) {
         args.add(exprConverter.convert(operand));
       }
 
-      CallTypedExpr callExpr = new CallTypedExpr(returnType, args, funcName);
+      CallTypedExpr callExpr = new CallTypedExpr(veloxReturnType, args, funcName);
       windowFunctions.add(new WindowFunction(callExpr, frame, false));
     }
 
@@ -1003,10 +1070,105 @@ public class VeloxPlanGenerator {
             false,
             Collections.singletonList(source));
 
-    // Window reshapes the schema — mappings into the scan are invalid above this point.
-    currentFieldMappings = null;
-    currentVeloxOutputType = null;
-    return windowNode;
+    // If any ranking function needed type-narrowing to match Velox's registration, wrap the
+    // WindowNode in a ProjectNode that casts the narrowed output back to Calcite's declared type.
+    // Without this cast, downstream operators that index these columns by their Calcite-declared
+    // type (BIGINT) would see a type mismatch against the Velox INTEGER output.
+    PlanNode result = windowNode;
+    List<String> outVeloxNames = new ArrayList<>();
+    List<Type> outVeloxTypes = new ArrayList<>();
+    if (!rankingColumnsToCast.isEmpty()) {
+      List<TypedExpr> projExprs = new ArrayList<>();
+      // Pass through the source's ACTUAL Velox output columns. We can't use Calcite's inputRowType
+      // here because the scan drops MAP parents (OpenSearch object fields like "cloud") and
+      // metadata columns (_id, _score, etc.) — those don't exist in the WindowNode output and
+      // referencing them would trigger "Field not found" in Velox.
+      if (sourceVeloxType != null) {
+        List<String> srcNames = sourceVeloxType.getNames();
+        List<Type> srcTypes = sourceVeloxType.getChildren();
+        for (int i = 0; i < srcNames.size(); i++) {
+          outVeloxNames.add(srcNames.get(i));
+          outVeloxTypes.add(srcTypes.get(i));
+          projExprs.add(FieldAccessTypedExpr.create(srcTypes.get(i), srcNames.get(i)));
+        }
+      } else {
+        // Fallback: iterate Calcite fields (shouldn't normally happen — source conversion
+        // populates currentVeloxOutputType for TableScan and Project).
+        for (RelDataTypeField field : inputRowType.getFieldList()) {
+          Type t = VeloxTypeConverter.toVeloxType(field.getType());
+          outVeloxNames.add(field.getName());
+          outVeloxTypes.add(t);
+          projExprs.add(FieldAccessTypedExpr.create(t, field.getName()));
+        }
+      }
+      // Pass through window columns, casting ranking ones up to their Calcite-declared type.
+      for (int i = 0; i < group.aggCalls.size(); i++) {
+        String colName = windowColumnNames.get(i);
+        int castIdx = rankingColumnsToCast.indexOf(i);
+        if (castIdx >= 0) {
+          Type widened = rankingColumnTargetTypes.get(castIdx);
+          outVeloxNames.add(colName);
+          outVeloxTypes.add(widened);
+          projExprs.add(
+              CastTypedExpr.create(
+                  widened,
+                  FieldAccessTypedExpr.create(new IntegerType(), colName),
+                  /* isTryCast */ false));
+        } else {
+          RelDataType calciteType =
+              window.getRowType().getFieldList().get(outputFieldOffset + i).getType();
+          Type t = VeloxTypeConverter.toVeloxType(calciteType);
+          outVeloxNames.add(colName);
+          outVeloxTypes.add(t);
+          projExprs.add(FieldAccessTypedExpr.create(t, colName));
+        }
+      }
+      result =
+          new ProjectNode(
+              idGen.next(), Collections.singletonList(windowNode), outVeloxNames, projExprs);
+    } else {
+      // No cast project — WindowNode's output directly is (source flat cols) + (window cols).
+      if (sourceVeloxType != null) {
+        outVeloxNames.addAll(sourceVeloxType.getNames());
+        outVeloxTypes.addAll(sourceVeloxType.getChildren());
+      }
+      for (int i = 0; i < group.aggCalls.size(); i++) {
+        RelDataType calciteType =
+            window.getRowType().getFieldList().get(outputFieldOffset + i).getType();
+        outVeloxNames.add(windowColumnNames.get(i));
+        outVeloxTypes.add(VeloxTypeConverter.toVeloxType(calciteType));
+      }
+    }
+
+    // Rebuild field mappings for Window's Calcite output = inputRowType + windowColumnNames.
+    // For input fields: carry over the source's mapping (preserves -1 for MAP/metadata).
+    // For window columns: map to their newly-emitted Velox index.
+    List<RelDataTypeField> windowOutputFields = window.getRowType().getFieldList();
+    FieldMapping[] newMappings = new FieldMapping[windowOutputFields.size()];
+    // Build a name->veloxIndex lookup for the Velox output.
+    Map<String, Integer> veloxNameToIdx = new LinkedHashMap<>();
+    for (int i = 0; i < outVeloxNames.size(); i++) {
+      veloxNameToIdx.put(outVeloxNames.get(i), i);
+    }
+    for (int i = 0; i < inputRowType.getFieldCount(); i++) {
+      String fieldName = inputRowType.getFieldList().get(i).getName();
+      if (sourceMappings != null && i < sourceMappings.length && sourceMappings[i] != null) {
+        // Carry over source mapping (keeps veloxIndex=-1 for dropped MAP/metadata columns).
+        newMappings[i] = sourceMappings[i];
+      } else {
+        Integer vIdx = veloxNameToIdx.get(fieldName);
+        newMappings[i] = new FieldMapping(vIdx != null ? vIdx : -1, fieldName, null);
+      }
+    }
+    for (int i = 0; i < group.aggCalls.size(); i++) {
+      int calciteIdx = outputFieldOffset + i;
+      String colName = windowColumnNames.get(i);
+      Integer vIdx = veloxNameToIdx.get(colName);
+      newMappings[calciteIdx] = new FieldMapping(vIdx != null ? vIdx : -1, colName, null);
+    }
+    currentFieldMappings = newMappings;
+    currentVeloxOutputType = new RowType(outVeloxNames, outVeloxTypes);
+    return result;
   }
 
   private BoundType convertBoundType(RexWindowBound bound, boolean isLower) {

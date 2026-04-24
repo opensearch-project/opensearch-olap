@@ -6,6 +6,7 @@ package org.opensearch.plugin.olap.engine;
 
 import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Set;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.logical.LogicalAggregate;
@@ -49,6 +50,20 @@ public class VectorizedEngineExtension implements ExecutionEngine {
   private static final Logger logger = LogManager.getLogger(VectorizedEngineExtension.class);
 
   private static final Set<Class<? extends RelNode>> SUPPORTED_REL_NODES = new HashSet<>();
+
+  /**
+   * Window aggregate functions we know Velox handles through {@link
+   * org.opensearch.plugin.olap.plan.physical.VeloxPlanGenerator#convertWindow}. Ranking functions
+   * (row_number/rank/dense_rank) are type-narrowed to Velox's INTEGER registration and cast back to
+   * Calcite's BIGINT; sum/count/avg/min/max reuse the same aggregate registrations as regular
+   * AggregationNode. Unlisted window functions (lag, lead, first_value, last_value, ntile,
+   * nth_value, etc.) fall back to the default engine until explicitly verified — ntile and
+   * nth_value in particular have offset-argument type mismatches (Spark registers them with INTEGER
+   * offsets while Calcite may declare BIGINT), so whitelisting them without an argument coercion
+   * would fail Velox signature resolution instead of falling back cleanly.
+   */
+  private static final Set<String> SUPPORTED_WINDOW_FUNCTIONS =
+      Set.of("ROW_NUMBER", "RANK", "DENSE_RANK", "SUM", "SUM0", "COUNT", "AVG", "MIN", "MAX");
 
   static {
     SUPPORTED_REL_NODES.add(LogicalTableScan.class);
@@ -185,6 +200,20 @@ public class VectorizedEngineExtension implements ExecutionEngine {
     String unsupportedFunc = findUnsupportedFunction(node);
     if (unsupportedFunc != null) {
       return unsupportedFunc;
+    }
+
+    // LogicalWindow carries window aggregate calls (RexWinAggCall) that aren't visited by the
+    // regular RexCall walker above — inspect each group's aggCalls explicitly.
+    if (node instanceof LogicalWindow) {
+      LogicalWindow window = (LogicalWindow) node;
+      for (org.apache.calcite.rel.core.Window.Group group : window.groups) {
+        for (org.apache.calcite.rel.core.Window.RexWinAggCall aggCall : group.aggCalls) {
+          String name = aggCall.getOperator().getName().toUpperCase(Locale.ROOT);
+          if (!SUPPORTED_WINDOW_FUNCTIONS.contains(name)) {
+            return "window_function:" + name;
+          }
+        }
+      }
     }
 
     for (RelNode input : node.getInputs()) {
