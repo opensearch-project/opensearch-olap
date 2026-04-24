@@ -36,12 +36,15 @@ public class PhysicalSortRule extends ConverterRule {
   @Override
   public RelNode convert(RelNode rel) {
     Sort sort = (Sort) rel;
+    // Convert child to PhysicalConvention only (no explicit distribution on input — the planner
+    // can't decompose NONE→PHYSICAL + ANY→SINGLETON in one step). The sort declares SINGLETON
+    // on its own traitSet; Convention.enforce() inserts PhysicalExchange between the now-PHYSICAL
+    // child and this sort when the child's distribution (e.g. RANDOM from scan) doesn't satisfy
+    // SINGLETON. When the child already produces SINGLETON (aggregate/join output), no exchange
+    // is added.
     RelNode input =
         convert(
             sort.getInput(), sort.getInput().getTraitSet().replace(PhysicalConvention.INSTANCE));
-    // Declare SINGLETON distribution. Convention.enforce() inserts PhysicalExchange when the
-    // child's distribution (e.g. RANDOM from scan) doesn't satisfy SINGLETON. When the child
-    // already produces SINGLETON (e.g. from aggregation/join), no exchange is added.
     return new PhysicalSort(
         rel.getCluster(),
         rel.getTraitSet().replace(PhysicalConvention.INSTANCE).replace(RelDistributions.SINGLETON),

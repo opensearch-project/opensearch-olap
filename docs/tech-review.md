@@ -12,6 +12,8 @@
    - 4.4 Fragment Dispatch Pipeline
    - 4.5 Data Node Pipeline
    - 4.6 Threading Model
+   - 4.7 Backpressure and Memory Bounds
+   - 4.8 Join Column-Name Disambiguation
 5. [Key Design Decisions](#5-key-design-decisions)
 6. [Comparison with RFC #4812](#6-comparison-with-rfc-4812)
 7. [Current Scope and Roadmap](#7-current-scope-and-roadmap)
@@ -410,6 +412,31 @@ The gauge is `BufferAllocator.getAllocatedMemory()`. Velox takes ownership of Ar
 - *Transport handlers never block*. `TransportShuffleDataAction` rejects with a backpressure flag rather than parking a transport thread; the sender retries with backoff. Blocking transport threads starves OpenSearch itself.
 - *Explicit failures over OOM*. When a hard cap is crossed, the plugin throws a typed exception that classifies to the right retry category (`RETRYABLE_TRANSIENT` for transient pressure, `RESOURCE_EXCEEDED` for user-query-too-large) rather than letting the JVM crash.
 - *Observable*. Every leaf-task profile carries `peakArrowBytes`, `backpressureWaitNanos`, `resultBytes`, and `shuffleRejectCount`; the coordinator sums them into `profile.plan` so users can see whether a query actually hit the limits.
+
+### 4.8 Join Column-Name Disambiguation
+
+When two join inputs share a column name (e.g. both `employees` and `departments` expose `dept_id`), Velox rejects the join — its `HashJoinNode` requires unique field names across the combined output. Resolving this without losing the connection back to the raw scan columns is more involved than it looks, and getting it wrong causes silently wrong results (empty runtime filters → zero-row joins).
+
+**The rename chain**:
+
+```
+  raw scan output               Calcite uniquifies             VeloxPlanGenerator wraps       SQL plugin final projection
+  [dept_id, dept_name]  ───────► [dept_id0, dept_name]  ──────► ProjectNode                ─► [d.dept_id, d.dept_name]
+                       EXPR_SUGGESTER                   (names=[dept_id0, dept_name],
+                        appends "0"                      projections=[FieldAccess("dept_id"),
+                                                                       FieldAccess("dept_name")])
+```
+
+1. Each leaf fragment scans one index; the scan's output row type has raw column names.
+2. At the coordinator, Calcite's `SqlValidatorUtil.EXPR_SUGGESTER` detects the name clash across the join's output and renames the right-side occurrence by appending an attempt counter: `dept_id` → `dept_id0`, `dept_id1`, `dept_id2`, ... Critically, **the counter is appended to the whole original name, including any existing trailing digits**: `sku2` becomes `sku20`, `year2024` becomes `year20240`.
+3. `VeloxPlanGenerator.convertJoin` translates this rename into a velox4j `ProjectNode` wrapping the right input: its `names` list carries the renamed columns, its `projections` list carries the matching `FieldAccessTypedExpr` instances pointing at the raw field names. This is the node that actually performs the rename at execution time.
+4. The SQL plugin's final projection re-labels `dept_id0` to `d.dept_id` for user display.
+
+**Why regex stripping is wrong**: A naive `\\d+$` strip cannot tell whether the trailing digits are Calcite's counter or part of the real column name. `sku20` could be `sku2` + counter `0`, or `sku20` with no rename, or `sku` + counter `20`. The string alone has no way to disambiguate. Stripping produces correct results for common cases like `dept_id0 → dept_id` and silently wrong results for cases like `sku20 → sku` (where the real column is `sku2` and the filter then looks up a non-existent `sku` column, yielding an empty runtime filter).
+
+**The correct resolver**: `VeloxExecutionEngine.resolveRawBuildKeyName(HashJoinNode, isBuildLeft, keyNameInJoin)` walks the plan. If the build-side child is a `ProjectNode`, it reverses the `names[i] → projections[i].fieldName` mapping to recover the raw name. If the child is a `TableScanNode` directly (no rename needed), the join key is already the raw name. All three code paths that need to map a join-key back to the scan schema use this resolver: two-stage BLOOM build (`executeBroadcastFragments`), single-stage RF extraction (`extractRuntimeFilter`), and co-routing pair eligibility (`selectJoinStrategy`).
+
+**Diagnostic signal**: the symptom of a broken resolver is "join returns zero rows despite matching data." The giveaway is a `PARTIAL bloom built: field=<name>, inserted=0` line in the data-node log when RF is enabled — that means the bloom builder couldn't find the column name in the scan schema. When adding a new PPL integration test that joins on a column whose name ends in digits, add a targeted resolver unit test alongside it in `VeloxExecutionEngineTests`.
 
 ---
 

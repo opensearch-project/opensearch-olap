@@ -33,12 +33,12 @@ public class PhysicalJoinRule extends ConverterRule {
   @Override
   public RelNode convert(RelNode rel) {
     Join join = (Join) rel;
-    // Convert children to PhysicalConvention, then explicitly insert Exchange(SINGLETON).
-    // We can't rely on Convention.enforce() here because the VolcanoPlanner can't decompose
-    // cross-convention + cross-distribution conversion (NONE+ANY → PHYSICAL+SINGLETON) into
-    // two steps. The aggregate rule uses same-convention enforce (PHYSICAL+RANDOM →
-    // PHYSICAL+SINGLETON)
-    // which works, but joins need the cross-convention step first.
+    // Convert children to PhysicalConvention, then explicitly insert PhysicalExchange(SINGLETON)
+    // on both inputs. The alternative — just declaring SINGLETON on the join's traitSet and
+    // relying on Convention.enforce() — doesn't reliably insert exchanges at the scan→join
+    // boundary (the planner doesn't propagate the join's required input distribution through
+    // convention-change boundaries). Unlike PhysicalAggregateRule where the single-input shape
+    // allows enforce to fire, joins need explicit insertion.
     RelNode left =
         convert(join.getLeft(), join.getLeft().getTraitSet().replace(PhysicalConvention.INSTANCE));
     RelNode right =

@@ -396,11 +396,10 @@ public class VeloxExecutionEngine {
         new CostEstimator(
             queryScheduler.getClusterService(), veloxLifecycle.getBroadcastMaxShards(), statsMap);
 
-    // Pull the raw join key field names off the coordinator plan. We pass them verbatim to the
-    // matcher; it tries an exact lookup first and only falls back to stripping a trailing
-    // disambiguation suffix (e.g. "dept_id0" from the SQL plugin's join rename) when the exact
-    // name does not match. Legitimate field names with trailing digits ("sku2", "year2024") are
-    // therefore matched correctly instead of being silently rewritten.
+    // Resolve raw join-key names for Co-Routing eligibility via the same schema-walking helper
+    // used by the runtime-filter paths (undoes VeloxPlanGenerator.convertJoin's rename project).
+    // This matches real field names correctly even when they end in digits (e.g. "sku2"), which a
+    // regex strip could not.
     String leftKey = null;
     String rightKey = null;
     if (coordinatorFragment != null) {
@@ -408,8 +407,10 @@ public class VeloxExecutionEngine {
       if (joinNode != null
           && !joinNode.getLeftKeys().isEmpty()
           && !joinNode.getRightKeys().isEmpty()) {
-        leftKey = joinNode.getLeftKeys().get(0).getFieldName();
-        rightKey = joinNode.getRightKeys().get(0).getFieldName();
+        leftKey =
+            resolveRawBuildKeyName(joinNode, true, joinNode.getLeftKeys().get(0).getFieldName());
+        rightKey =
+            resolveRawBuildKeyName(joinNode, false, joinNode.getRightKeys().get(0).getFieldName());
       }
     }
 
@@ -616,10 +617,24 @@ public class VeloxExecutionEngine {
         List<FieldAccessTypedExpr> buildKeys =
             (buildScanIndex == 0) ? joinNode.getLeftKeys() : joinNode.getRightKeys();
         if (!buildKeys.isEmpty()) {
-          buildJoinKeyName = buildKeys.get(0).getFieldName();
-          String rawProbeFieldName = extractProbeJoinKeyField(coordinatorFragment, buildScanIndex);
-          probeFieldName =
-              rawProbeFieldName == null ? null : rawProbeFieldName.replaceAll("\\d+$", "");
+          // The join key name in the coordinator plan can be the Calcite-uniquified form
+          // (e.g. "dept_id0") when both join sides share a column name. The data-node bloom
+          // builder looks up this name in the raw scan's output schema, which carries the
+          // unsuffixed name ("dept_id"). Resolve the raw build-side name by walking the plan:
+          // VeloxPlanGenerator.convertJoin inserts a ProjectNode on the right side that maps
+          // renamed → raw. Reverse that mapping here. Regex stripping is unsafe because real
+          // field names can end in digits (e.g. "sku2", "year2024"); schema-aware resolution
+          // is the only correct approach.
+          boolean isBuildLeft = (buildScanIndex == 0);
+          buildJoinKeyName =
+              resolveRawBuildKeyName(joinNode, isBuildLeft, buildKeys.get(0).getFieldName());
+          // Symmetric resolution for the probe side — probe is opposite of build.
+          List<FieldAccessTypedExpr> probeKeys =
+              isBuildLeft ? joinNode.getRightKeys() : joinNode.getLeftKeys();
+          if (!probeKeys.isEmpty()) {
+            probeFieldName =
+                resolveRawBuildKeyName(joinNode, !isBuildLeft, probeKeys.get(0).getFieldName());
+          }
           probeFieldType = extractProbeJoinKeyType(relNode, probeFieldName);
         }
       }
@@ -1392,16 +1407,18 @@ public class VeloxExecutionEngine {
           (buildScanIndex == 0) ? joinNode.getLeftKeys() : joinNode.getRightKeys();
       if (buildKeys.isEmpty()) return RuntimeFilterPayload.none();
 
-      // Use the first join key for RF (multi-key RF is future work)
-      String buildKeyName = buildKeys.get(0).getFieldName();
-
-      // Resolve the probe-side field name/type up-front. The join plan carries alias-suffixed
-      // names like "dept_id0" to disambiguate duplicate columns across the two sides; strip the
-      // trailing digits so (a) type lookup on the original RelNode matches, and (b) the field
-      // name pushed into Lucene on the probe side matches the real index mapping.
-      String rawProbeFieldName = extractProbeJoinKeyField(coordinatorFragment, buildScanIndex);
+      // Use the first join key for RF (multi-key RF is future work). Resolve the raw column
+      // name on both sides by reversing the VelogPlanGenerator.convertJoin rename project —
+      // regex stripping mis-handles real field names ending in digits (e.g. "sku2").
+      boolean isBuildLeft = (buildScanIndex == 0);
+      String buildKeyName =
+          resolveRawBuildKeyName(joinNode, isBuildLeft, buildKeys.get(0).getFieldName());
+      List<FieldAccessTypedExpr> probeKeys =
+          isBuildLeft ? joinNode.getRightKeys() : joinNode.getLeftKeys();
       String probeFieldName =
-          rawProbeFieldName == null ? null : rawProbeFieldName.replaceAll("\\d+$", "");
+          probeKeys.isEmpty()
+              ? null
+              : resolveRawBuildKeyName(joinNode, !isBuildLeft, probeKeys.get(0).getFieldName());
       String probeFieldType = extractProbeJoinKeyType(relNode, probeFieldName);
 
       Session session = veloxLifecycle.getSession();
@@ -1553,17 +1570,56 @@ public class VeloxExecutionEngine {
     }
   }
 
-  /** Extract the probe-side join key field name from the coordinator fragment's HashJoinNode. */
-  private String extractProbeJoinKeyField(PlanFragment coordinatorFragment, int buildScanIndex) {
-    HashJoinNode joinNode = findHashJoinNode(coordinatorFragment.getPlanRoot());
-    if (joinNode == null) return null;
-
-    // If build is at index 0 (left), probe is right → probe keys = rightKeys
-    // If build is at index 1 (right), probe is left → probe keys = leftKeys
-    List<FieldAccessTypedExpr> probeKeys =
-        (buildScanIndex == 0) ? joinNode.getRightKeys() : joinNode.getLeftKeys();
-    if (probeKeys.isEmpty()) return null;
-    return probeKeys.get(0).getFieldName();
+  /**
+   * Resolve a join-key field name in the coordinator's HashJoinNode back to the raw column name as
+   * it appears in the build-side scan's output schema.
+   *
+   * <p>Calcite's join-output disambiguation (via {@code SqlValidatorUtil.EXPR_SUGGESTER}) may
+   * rename duplicate columns by appending a numeric attempt counter to the original name — {@code
+   * dept_id} → {@code dept_id0}, or {@code sku2} → {@code sku20}. A regex strip like {@code \d+$}
+   * cannot distinguish the disambiguation suffix from digits that are part of the real field name,
+   * so fields like {@code sku2} get mangled to {@code sku} and the data-node lookup fails silently
+   * (empty bloom, zero-row join).
+   *
+   * <p>The reliable resolver walks the plan: a {@link ProjectNode} between the join and the
+   * exchange_scan carries the rename mapping (its {@code names[i]} is the renamed column, its
+   * {@code projections[i]} is a {@link FieldAccessTypedExpr} holding the raw column name). When no
+   * such project is present (no rename), the key name is already the raw name.
+   *
+   * <p>Package-private for test visibility.
+   *
+   * @param joinNode the coordinator's HashJoinNode
+   * @param isBuildLeft true if the build side is joinNode.getSources().get(0), false if get(1)
+   * @param keyNameInJoin the field name as it appears in joinNode's leftKeys/rightKeys
+   * @return the raw column name as it appears in the build-side TableScanNode's output row type, or
+   *     {@code keyNameInJoin} unchanged when no rename is detected
+   */
+  static String resolveRawBuildKeyName(
+      HashJoinNode joinNode, boolean isBuildLeft, String keyNameInJoin) {
+    if (joinNode == null || keyNameInJoin == null) {
+      return keyNameInJoin;
+    }
+    List<PlanNode> sources = joinNode.getSources();
+    int idx = isBuildLeft ? 0 : 1;
+    if (idx >= sources.size()) {
+      return keyNameInJoin;
+    }
+    PlanNode buildChild = sources.get(idx);
+    // Follow at most one ProjectNode level — that's where the disambiguation rename lives when
+    // present. Deeper plans don't insert additional renames between the exchange_scan and the
+    // HashJoin for Co-Routing / broadcast joins.
+    if (buildChild instanceof ProjectNode) {
+      ProjectNode project = (ProjectNode) buildChild;
+      int renameIdx = project.getNames().indexOf(keyNameInJoin);
+      if (renameIdx >= 0) {
+        TypedExpr expr = project.getProjections().get(renameIdx);
+        if (expr instanceof FieldAccessTypedExpr) {
+          return ((FieldAccessTypedExpr) expr).getFieldName();
+        }
+      }
+    }
+    // No rename project, or rename not found → the key name in the join is already the raw name.
+    return keyNameInJoin;
   }
 
   /**
