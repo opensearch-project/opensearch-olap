@@ -245,7 +245,7 @@ PPL's `dedup` command lowers to `row_number() OVER (PARTITION BY <keys>) <= N` +
 | WEEKDAY | No | | |
 | SYSDATE | No | | |
 | STRFTIME | No | | |
-| EXTRACT | No | | Needs special EXTRACT handling |
+| EXTRACT | Yes | (dispatches to `year`/`month`/`week_of_year`/`day`/`day_of_week`/`day_of_year`/`hour`/`minute`/`second`/`quarter`) | PPL's `extract(part FROM datetime)` lowers to a UDF with SqlKind.OTHER_FUNCTION. `VeloxExprConverter.convertExtract` rewrites it to the matching dedicated date-part scalar. Unsupported units (EPOCH, DECADE, CENTURY, MILLENNIUM, …) fall back to the default engine. |
 
 ## Collection Functions
 

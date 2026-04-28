@@ -197,8 +197,15 @@ public class VeloxExprConverterTests extends OpenSearchTestCase {
     RexNode call = rexBuilder.makeCall(SqlStdOperatorTable.NOT_EQUALS, ageRef, zeroLit);
 
     TypedExpr result = converter.convert(call);
+    // NOT_EQUALS lowers to not(equalto(a, b)) — Velox's Spark comparison registration has
+    // `notequalto` only for DECIMAL, so we can't call it directly for generic types.
     assertTrue(result instanceof CallTypedExpr);
-    assertEquals("notequalto", ((CallTypedExpr) result).getFunctionName());
+    CallTypedExpr outer = (CallTypedExpr) result;
+    assertEquals("not", outer.getFunctionName());
+    assertEquals(1, outer.getInputs().size());
+    assertTrue(outer.getInputs().get(0) instanceof CallTypedExpr);
+    CallTypedExpr inner = (CallTypedExpr) outer.getInputs().get(0);
+    assertEquals("equalto", inner.getFunctionName());
   }
 
   public void testConvertLessThanCall() {
@@ -310,16 +317,17 @@ public class VeloxExprConverterTests extends OpenSearchTestCase {
             rexBuilder.makeLiteral(
                 BigDecimal.ZERO, typeFactory.createSqlType(SqlTypeName.DECIMAL, 10, 0), false);
 
+    // NOT_EQUALS is excluded here because it rewrites to not(equalto(...)) — see
+    // testConvertNotEqualsCall for the shape assertion.
     org.apache.calcite.sql.SqlOperator[] operators = {
       SqlStdOperatorTable.EQUALS,
-      SqlStdOperatorTable.NOT_EQUALS,
       SqlStdOperatorTable.GREATER_THAN,
       SqlStdOperatorTable.GREATER_THAN_OR_EQUAL,
       SqlStdOperatorTable.LESS_THAN,
       SqlStdOperatorTable.LESS_THAN_OR_EQUAL
     };
     String[] expected = {
-      "equalto", "notequalto", "greaterthan", "greaterthanorequal", "lessthan", "lessthanorequal"
+      "equalto", "greaterthan", "greaterthanorequal", "lessthan", "lessthanorequal"
     };
 
     for (int i = 0; i < operators.length; i++) {

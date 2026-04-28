@@ -72,7 +72,9 @@ public class VeloxExprConverter {
   static {
     // Comparison operators (Velox uses Presto-style full names)
     FUNCTION_MAP.put(SqlKind.EQUALS, "equalto");
-    FUNCTION_MAP.put(SqlKind.NOT_EQUALS, "notequalto");
+    // NOT_EQUALS is intentionally NOT mapped here — it is rewritten to not(equalto(a,b)) in
+    // convertCall. Velox's Spark registration has `notequalto` only for DECIMAL; generic types
+    // would fail at compile time. See the NOT_EQUALS branch in convertCall.
     FUNCTION_MAP.put(SqlKind.GREATER_THAN, "greaterthan");
     FUNCTION_MAP.put(SqlKind.GREATER_THAN_OR_EQUAL, "greaterthanorequal");
     FUNCTION_MAP.put(SqlKind.LESS_THAN, "lessthan");
@@ -96,6 +98,39 @@ public class VeloxExprConverter {
     // Null checks
     FUNCTION_MAP.put(SqlKind.IS_NULL, "is_null");
     FUNCTION_MAP.put(SqlKind.IS_NOT_NULL, "not");
+  }
+
+  // ---- Layer 1b: PPL extract(<unit>, <datetime>) → Velox date-part scalar name ----
+  //
+  // PPL's `extract(part FROM datetime)` compiles to the SQL plugin's EXTRACT UDF
+  // (org.opensearch.sql.expression.function.udf.datetime.ExtractFunction), NOT Calcite's
+  // built-in SqlStdOperatorTable.EXTRACT. Its RexCall has SqlKind.OTHER_FUNCTION, operator name
+  // "EXTRACT", and two operands: a VARCHAR literal (the part name) and the datetime column. We
+  // route the upper-cased part name to a dedicated Velox scalar (`year`, `month`, `minute`, ...)
+  // because Velox has no generic `extract(VARCHAR, TIMESTAMP)` registration.
+  //
+  // The same table also handles Calcite's built-in EXTRACT (SqlKind.EXTRACT), whose first
+  // operand is a TimeUnitRange symbol literal — we resolve its `.name()` through this map.
+  private static final Map<String, String> EXTRACT_UNIT_NAME_TO_VELOX_FN;
+
+  static {
+    Map<String, String> m = new HashMap<>();
+    m.put("YEAR", "year");
+    m.put("QUARTER", "quarter");
+    m.put("MONTH", "month");
+    // Calcite WEEK / PPL "week" map to Velox's week_of_year.
+    m.put("WEEK", "week_of_year");
+    m.put("WEEK_OF_YEAR", "week_of_year");
+    m.put("DAY", "day");
+    m.put("DAY_OF_MONTH", "day");
+    m.put("DOW", "day_of_week");
+    m.put("DAY_OF_WEEK", "day_of_week");
+    m.put("DOY", "day_of_year");
+    m.put("DAY_OF_YEAR", "day_of_year");
+    m.put("HOUR", "hour");
+    m.put("MINUTE", "minute");
+    m.put("SECOND", "second");
+    EXTRACT_UNIT_NAME_TO_VELOX_FN = Map.copyOf(m);
   }
 
   // ---- Layer 2: Calcite operator name → Velox function name ----
@@ -278,6 +313,7 @@ public class VeloxExprConverter {
     if (FUNCTION_MAP.containsKey(kind)
         || kind == SqlKind.CAST
         || kind == SqlKind.IS_NOT_NULL
+        || kind == SqlKind.NOT_EQUALS
         || kind == SqlKind.IN
         || kind == SqlKind.BETWEEN
         || kind == SqlKind.SEARCH
@@ -285,6 +321,20 @@ public class VeloxExprConverter {
         || kind == SqlKind.CASE
         || kind == SqlKind.ITEM) {
       return true;
+    }
+
+    // EXTRACT is supported only for unit names that map to a registered Velox scalar (year /
+    // month / quarter / week_of_year / day / day_of_week / day_of_year / hour / minute / second).
+    // Other units (EPOCH, DECADE, CENTURY, MILLENNIUM, ...) cause canVectorize to reject the
+    // query so it falls back to the default engine. Matches both Calcite's built-in EXTRACT
+    // (SqlKind.EXTRACT) and PPL's EXTRACT UDF (SqlKind.OTHER_FUNCTION, name "EXTRACT").
+    if (kind == SqlKind.EXTRACT || isPplExtractFunction(call)) {
+      if (call.getOperands().size() == 2 && call.getOperands().get(0) instanceof RexLiteral) {
+        String unitName = extractUnitName((RexLiteral) call.getOperands().get(0));
+        return unitName != null
+            && EXTRACT_UNIT_NAME_TO_VELOX_FN.containsKey(unitName.toUpperCase(Locale.ROOT));
+      }
+      return false;
     }
 
     // Named functions: check operator name against NAME_MAP
@@ -489,6 +539,20 @@ public class VeloxExprConverter {
       return new CallTypedExpr(new BooleanType(), Collections.singletonList(isNull), "not");
     }
 
+    // Handle NOT_EQUALS as not(equalto(a, b)) — Velox's Spark comparison registration provides
+    // only `equalto` for generic types. There's a `notequalto` registration but only for DECIMAL,
+    // so using it for (VARCHAR,VARCHAR) or (INTEGER,INTEGER) would fail signature resolution.
+    // Rewriting to not(equalto) always resolves cleanly. Operands are run through the same
+    // binary-type coercion used for other comparisons so (SMALLINT, INTEGER) from e.g.
+    // `short_col != 0` doesn't hit equalto's exact-match signature requirement.
+    if (kind == SqlKind.NOT_EQUALS) {
+      TypedExpr left = convert(call.getOperands().get(0));
+      TypedExpr right = convert(call.getOperands().get(1));
+      List<TypedExpr> coerced = coerceBinaryTypes(List.of(left, right));
+      TypedExpr eq = new CallTypedExpr(new BooleanType(), coerced, "equalto");
+      return new CallTypedExpr(new BooleanType(), Collections.singletonList(eq), "not");
+    }
+
     // Handle IN as chain of OR(EQ(...))
     if (kind == SqlKind.IN) {
       return convertIn(call);
@@ -513,6 +577,20 @@ public class VeloxExprConverter {
     // Handle CASE → Velox switch expression
     if (kind == SqlKind.CASE) {
       return convertCase(call);
+    }
+
+    // Handle EXTRACT — both Calcite's SqlStdOperatorTable.EXTRACT (SqlKind.EXTRACT) and PPL's
+    // own EXTRACT UDF (SqlKind.OTHER_FUNCTION, operator name "EXTRACT"). PPL typically routes
+    // through the latter. Both shapes lower to a dedicated Velox date-part scalar here.
+    if (kind == SqlKind.EXTRACT || isPplExtractFunction(call)) {
+      TypedExpr extracted = convertExtract(call);
+      if (extracted != null) {
+        return extracted;
+      }
+      // Unit not supported — fall through to the generic path (which will emit the generic
+      // extract(VARCHAR, TIMESTAMP) call and fail at Velox signature resolution).
+      // isSupported() below rejects unsupported units up front, so this branch is only
+      // reachable via the force_vectorize escape hatch.
     }
 
     // General function call conversion
@@ -586,6 +664,78 @@ public class VeloxExprConverter {
     }
     Type returnType = VeloxTypeConverter.toVeloxType(call.getType());
     return new CallTypedExpr(returnType, inputs, "switch");
+  }
+
+  /**
+   * True for PPL's own EXTRACT UDF (SqlKind.OTHER_FUNCTION with operator name "EXTRACT"). PPL's
+   * {@code extract(part FROM datetime)} lowers to this UDF rather than Calcite's built-in
+   * SqlStdOperatorTable.EXTRACT.
+   */
+  private static boolean isPplExtractFunction(RexCall call) {
+    return "EXTRACT".equalsIgnoreCase(call.getOperator().getName())
+        && call.getOperands().size() == 2;
+  }
+
+  /**
+   * Convert EXTRACT(&lt;unit&gt;, &lt;datetime&gt;) to a Velox date-part scalar call. Handles two
+   * shapes:
+   *
+   * <ul>
+   *   <li>PPL's EXTRACT UDF — first operand is a VARCHAR RexLiteral holding the part name.
+   *   <li>Calcite's built-in SqlStdOperatorTable.EXTRACT — first operand is a symbol literal whose
+   *       getValue() is a TimeUnitRange enum; we use its name().
+   * </ul>
+   *
+   * <p>Returns null when the unit isn't in {@link #EXTRACT_UNIT_NAME_TO_VELOX_FN} — caller treats
+   * null as "fall through to the generic path". The Velox registrations return INTEGER (Spark
+   * dialect overwrites Presto's BIGINT during velox4j init); Calcite's declared return type is
+   * BIGINT, so we wrap the scalar in a CAST to match the declared type downstream operators expect.
+   */
+  private TypedExpr convertExtract(RexCall call) {
+    List<RexNode> operands = call.getOperands();
+    if (operands.size() != 2 || !(operands.get(0) instanceof RexLiteral)) {
+      return null;
+    }
+    String unitName = extractUnitName((RexLiteral) operands.get(0));
+    if (unitName == null) {
+      return null;
+    }
+    String veloxFn = EXTRACT_UNIT_NAME_TO_VELOX_FN.get(unitName.toUpperCase(Locale.ROOT));
+    if (veloxFn == null) {
+      return null;
+    }
+    TypedExpr arg = convert(operands.get(1));
+    // velox4j registers BOTH Presto (BIGINT) and Spark (INTEGER) variants of year/month/day/etc.
+    // under the same name. Unlike window ranking functions where Spark overwrites, these scalar
+    // registrations coexist because their physical signatures differ only in the return type.
+    // Asking for either INTEGER or BIGINT explicitly hits Velox's "incompatible return types"
+    // error at compile time when the resolver sees both candidates. Picking Calcite's declared
+    // type (normally BIGINT) resolves unambiguously and avoids the extra cast.
+    Type returnType = VeloxTypeConverter.toVeloxType(call.getType());
+    return new CallTypedExpr(returnType, Collections.singletonList(arg), veloxFn);
+  }
+
+  /**
+   * Extract the unit name (e.g. "MINUTE") from the first operand of an EXTRACT call. Handles both
+   * VARCHAR literals (PPL UDF) and SYMBOL literals carrying a Calcite {@code TimeUnitRange}.
+   * Returns null when the literal shape is unexpected.
+   */
+  private static String extractUnitName(RexLiteral unitLit) {
+    SqlTypeName typeName = unitLit.getTypeName();
+    if (typeName == SqlTypeName.CHAR || typeName == SqlTypeName.VARCHAR) {
+      String s = unitLit.getValueAs(String.class);
+      return s == null ? null : s.trim();
+    }
+    if (typeName == SqlTypeName.SYMBOL) {
+      // TimeUnitRange (or TimeUnit) — use the enum name. Avoid a hard reference to the Avatica
+      // class so we don't need it on the compile classpath.
+      Object v = unitLit.getValue();
+      if (v instanceof Enum<?>) {
+        return ((Enum<?>) v).name();
+      }
+      return v == null ? null : v.toString();
+    }
+    return null;
   }
 
   /**
