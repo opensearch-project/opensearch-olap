@@ -204,9 +204,18 @@ public class PhysicalOptimizer {
     @Override
     public RelNode visit(LogicalAggregate aggregate) {
       RelNode newInput = aggregate.getInput().accept(this);
+      // Drop the SQL plugin's AGG_ARGS hints — they're registered on the SQL plugin's
+      // RelOptCluster HintStrategyTable, but ClusterCopyShuttle creates a fresh cluster whose
+      // empty HintStrategyTable rejects any un-registered hint via an `assert ... "hint X must
+      // be present"` inside Calcite's HintStrategyTable.canApply. The hints' semantic effect
+      // (isNotNull filter for bucket_nullable=false, nested-agg bookkeeping) is already
+      // materialized in the plan tree by the upstream visitor, so we don't need the hints
+      // themselves — and we don't consume ignoreNullBucket()/hasNestedAggCall() anywhere below
+      // this point. This unblocks ~29 ClickBench queries that would otherwise fail with
+      // "hint AGG_ARGS must be present".
       return LogicalAggregate.create(
           newInput,
-          aggregate.getHints(),
+          List.of(),
           aggregate.getGroupSet(),
           aggregate.getGroupSets(),
           aggregate.getAggCallList());
