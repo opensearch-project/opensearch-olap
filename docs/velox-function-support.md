@@ -213,6 +213,7 @@ PPL's `dedup` command lowers to `row_number() OVER (PARTITION BY <keys>) <= N` +
 | DATEDIFF | Yes | `date_diff` | |
 | DATE_FORMAT | Yes | `date_format` | |
 | DATE_TRUNC | Yes | `date_trunc` | |
+| SPAN | Yes | `date_trunc` / `col - ((col mod w + w) mod w)` / `floor(col/w)*w` / `from_unixtime`+`floor`+`to_unixtime` | PPL's `span(field, count, unit)` lowers in `VeloxExprConverter.convertSpan`: **TIMESTAMP** with count=1 → `date_trunc`; **TIMESTAMP** count>1 on fixed-length second-aligned units (s/m/h/d) → `from_unixtime(floor(to_unixtime(ts)/N)*N)`; **DATE** with count=1 on d/w/M/q/y → `date_trunc`; **integer numeric** → Euclidean-modulo `col - ((col mod w + w) mod w)` in integer space (preserves BIGINT precision AND matches `floor` semantics for negative values — integer divide truncates toward zero, so the naive `floor(col/w)*w` form would mis-bucket negatives); **floating-point numeric** → `floor(col/w)*w` in DOUBLE. Fractional DECIMAL widths are accepted on DOUBLE/REAL fields only. Falls back to the default engine for: **TIME** columns (no velox4j TimeType wrapper); DATE sub-day units or count>1; `ms`/`us` units on TIMESTAMP; month/quarter/year with count>1 (variable-length); week with count>1 (epoch is Thursday-aligned but `date_trunc('week')` is Monday-aligned); DECIMAL columns; fractional widths on integer fields. |
 | FROM_UNIXTIME | Yes | `from_unixtime` | |
 | UNIX_TIMESTAMP | Yes | `to_unixtime` | |
 | LAST_DAY | Yes | `last_day_of_month` | |

@@ -49,6 +49,8 @@ import org.boostscale.velox4j.variant.RealValue;
 import org.boostscale.velox4j.variant.TimestampValue;
 import org.boostscale.velox4j.variant.VarCharValue;
 import org.boostscale.velox4j.variant.Variant;
+import org.opensearch.sql.calcite.type.AbstractExprRelDataType;
+import org.opensearch.sql.calcite.utils.OpenSearchTypeFactory.ExprUDT;
 
 /**
  * Converts Calcite RexNode expressions to velox4j TypedExpr.
@@ -90,7 +92,9 @@ public class VeloxExprConverter {
     FUNCTION_MAP.put(SqlKind.MINUS, "minus");
     FUNCTION_MAP.put(SqlKind.TIMES, "multiply");
     FUNCTION_MAP.put(SqlKind.DIVIDE, "divide");
-    FUNCTION_MAP.put(SqlKind.MOD, "modulus");
+    // Velox registers the modulo scalar as "mod" (Presto: CheckedModulusFunction for integers,
+    // ModulusFunction for floats); there is no "modulus" registration under any dialect.
+    FUNCTION_MAP.put(SqlKind.MOD, "mod");
 
     // String operators
     FUNCTION_MAP.put(SqlKind.LIKE, "like");
@@ -132,6 +136,45 @@ public class VeloxExprConverter {
     m.put("SECOND", "second");
     EXTRACT_UNIT_NAME_TO_VELOX_FN = Map.copyOf(m);
   }
+
+  // ---- Layer 1c: PPL span(<field>, <value>, <unit>) → Velox bucketing expression ----
+  //
+  // PPL's `span()` is a 3-operand SqlUserDefinedFunction with SqlKind.OTHER_FUNCTION, operator
+  // name "SPAN". Operand layout (from CalciteRexNodeVisitor.visitSpan in the SQL plugin):
+  //   [0] field (RexInputRef or RexCall)
+  //   [1] numeric width literal (INTEGER for time spans; any numeric for numeric spans)
+  //   [2] VARCHAR unit literal (short code from SpanUnit.getName()) for time spans, or
+  //       cast(null) for numeric spans.
+  // Velox has no native `span` scalar; we lower to one of three expression shapes in
+  // convertSpan: date_trunc (count=1), arithmetic seconds bucket (fixed-length unit,
+  // count>1), or floor+divide+multiply (numeric).
+
+  // Unit code → Velox date_trunc unit name. Case-sensitive: "M" (month) vs "m" (minute).
+  // `ms`/`us` intentionally absent — Velox date_trunc only supports second..year.
+  private static final Map<String, String> SPAN_UNIT_TO_DATE_TRUNC =
+      Map.ofEntries(
+          Map.entry("s", "second"),
+          Map.entry("m", "minute"),
+          Map.entry("h", "hour"),
+          Map.entry("d", "day"),
+          Map.entry("w", "week"),
+          Map.entry("M", "month"),
+          Map.entry("q", "quarter"),
+          Map.entry("y", "year"));
+
+  // Unit code → whole-second length. Month/quarter/year excluded — they're variable-length
+  // and the seconds-arithmetic shortcut (to_unixtime/floor/from_unixtime) would be wrong.
+  // Week ("w") is also excluded for count > 1: date_trunc('week', ts) anchors to Monday,
+  // but floor(to_unixtime(ts)/604800)*604800 anchors to Thursday (Unix epoch 1970-01-01 was
+  // a Thursday). Multi-week buckets via the arithmetic path would drift by 3 days relative
+  // to both count=1 week spans and the default engine, silently returning wrong groups. So
+  // span(ts, Nw) for N>1 falls back to the default engine.
+  private static final Map<String, Long> SPAN_UNIT_SECONDS =
+      Map.of("s", 1L, "m", 60L, "h", 3600L, "d", 86_400L);
+
+  // Units valid for date_trunc on a DATE input. Velox's DATE variant of date_trunc only
+  // accepts day-and-above (sub-day units make no sense on a day-granularity type).
+  private static final Set<String> SPAN_UNIT_DATE_VALID = Set.of("d", "w", "M", "q", "y");
 
   // ---- Layer 2: Calcite operator name → Velox function name ----
 
@@ -190,9 +233,9 @@ public class VeloxExprConverter {
 
     // PPL arithmetic operators (may use PPLBuiltinOperators instead of SqlStdOperatorTable)
     NAME_MAP.put("DIVIDE", "divide");
-    NAME_MAP.put("MOD", "modulus");
+    NAME_MAP.put("MOD", "mod");
     NAME_MAP.put("/", "divide");
-    NAME_MAP.put("%", "modulus");
+    NAME_MAP.put("%", "mod");
 
     // Conditional functions
     NAME_MAP.put("COALESCE", "coalesce");
@@ -335,6 +378,93 @@ public class VeloxExprConverter {
             && EXTRACT_UNIT_NAME_TO_VELOX_FN.containsKey(unitName.toUpperCase(Locale.ROOT));
       }
       return false;
+    }
+
+    // SPAN is supported for four shapes: TIMESTAMP (count=1 via date_trunc), TIMESTAMP
+    // (count>1 via fixed-length seconds arithmetic on s/m/h/d, not w), DATE (count=1 via
+    // date_trunc on d/w/M/q/y), and numeric (floor/divide/multiply in integer or DOUBLE
+    // space). Rejects that keep queries correct by falling back:
+    //   - TIME inputs (PPL's ExprTimeType or SqlTypeName.TIME) — velox4j Java has no TimeType
+    //     wrapper, so we cannot emit date_trunc(TIME). Falling back to the numeric path would
+    //     silently bucket raw millis ignoring the unit string.
+    //   - DATE span with sub-day units (s/m/h/ms/us) or count>1 — Velox's date_trunc(DATE)
+    //     only accepts day-and-above; multi-count DATE spans would need interval math we
+    //     don't emit here.
+    //   - TIMESTAMP `ms`/`us` units — date_trunc doesn't accept them.
+    //   - TIMESTAMP `w` with count>1 — epoch-anchored arithmetic (Thursday) disagrees with
+    //     date_trunc's Monday anchor.
+    //   - TIMESTAMP `M`/`q`/`y` with count>1 — variable-length units.
+    //   - DECIMAL numeric columns — precision-preserving DECIMAL arithmetic isn't wired up.
+    //   - Non-literal width; zero or negative count.
+    if (isPplSpanFunction(call)) {
+      List<RexNode> ops = call.getOperands();
+      if (!(ops.get(1) instanceof RexLiteral)) {
+        return false;
+      }
+      RexNode unitRex = ops.get(2);
+      boolean hasUnit = unitRex instanceof RexLiteral && !((RexLiteral) unitRex).isNull();
+      SpanFieldKind fieldKind = spanFieldKind(ops.get(0));
+
+      if (fieldKind == SpanFieldKind.TIMESTAMP) {
+        if (!hasUnit) {
+          return false;
+        }
+        String unit = ((RexLiteral) unitRex).getValueAs(String.class);
+        long count = readSpanCount((RexLiteral) ops.get(1));
+        if (count <= 0) {
+          return false;
+        }
+        if (count == 1) {
+          return SPAN_UNIT_TO_DATE_TRUNC.containsKey(unit);
+        }
+        return SPAN_UNIT_SECONDS.containsKey(unit);
+      }
+      if (fieldKind == SpanFieldKind.DATE) {
+        if (!hasUnit) {
+          return false;
+        }
+        String unit = ((RexLiteral) unitRex).getValueAs(String.class);
+        long count = readSpanCount((RexLiteral) ops.get(1));
+        return count == 1 && SPAN_UNIT_DATE_VALID.contains(unit);
+      }
+      if (fieldKind == SpanFieldKind.TIME) {
+        // See comment above — velox4j has no TimeType wrapper, so TIME span falls back.
+        return false;
+      }
+      // fieldKind == NONE: numeric span. The unit operand must be null (no string unit on a
+      // numeric value), else this is a malformed or unsupported shape.
+      if (hasUnit) {
+        return false;
+      }
+      // Width must be a strictly-positive literal. Zero would produce divide-by-zero in either
+      // lowering path; negative values produce nonsensical bucket boundaries. Match the
+      // temporal branch's `count > 0` check.
+      BigDecimal widthValue = readNumericWidth((RexLiteral) ops.get(1));
+      if (widthValue == null || widthValue.signum() <= 0) {
+        return false;
+      }
+      // Reject DECIMAL field columns — precision-preserving DECIMAL arithmetic isn't wired up
+      // here, and routing a DECIMAL column through DOUBLE would merge distinct buckets for
+      // large values.
+      SqlTypeName fieldType = ops.get(0).getType().getSqlTypeName();
+      SqlTypeName widthType = ops.get(1).getType().getSqlTypeName();
+      if (fieldType == SqlTypeName.DECIMAL) {
+        return false;
+      }
+      // Scaled DECIMAL width (e.g. `0.5`): only safe if the field is floating-point, where the
+      // DOUBLE arithmetic path handles the fractional width correctly. For integer fields, a
+      // scaled width would force DOUBLE conversion and lose BIGINT precision — reject.
+      if (widthType == SqlTypeName.DECIMAL) {
+        boolean integralWidth = widthValue.scale() <= 0;
+        boolean floatingField =
+            fieldType == SqlTypeName.DOUBLE
+                || fieldType == SqlTypeName.REAL
+                || fieldType == SqlTypeName.FLOAT;
+        if (!integralWidth && !floatingField) {
+          return false;
+        }
+      }
+      return true;
     }
 
     // Named functions: check operator name against NAME_MAP
@@ -593,6 +723,18 @@ public class VeloxExprConverter {
       // reachable via the force_vectorize escape hatch.
     }
 
+    // Handle PPL's span(field, width, unit) — lowers to date_trunc (count=1), an arithmetic
+    // seconds bucket (count>1 on fixed-length units), or floor/divide/multiply (numeric).
+    // Velox has no native span scalar. isSupported() rejects unsupported cases; this branch
+    // only produces an expression for the supported ones.
+    if (isPplSpanFunction(call)) {
+      TypedExpr lowered = convertSpan(call);
+      if (lowered != null) {
+        return lowered;
+      }
+      // Fall through to generic path — only reachable via force_vectorize.
+    }
+
     // General function call conversion
     String functionName = FUNCTION_MAP.get(kind);
     if (functionName == null) {
@@ -738,6 +880,272 @@ public class VeloxExprConverter {
     return null;
   }
 
+  /** True for PPL's span UDF (SqlKind.OTHER_FUNCTION with operator name "SPAN", 3 operands). */
+  private static boolean isPplSpanFunction(RexCall call) {
+    return "SPAN".equalsIgnoreCase(call.getOperator().getName()) && call.getOperands().size() == 3;
+  }
+
+  /**
+   * Classification of a span field's logical temporal kind. We must inspect Calcite's {@link
+   * RelDataType} (not the Velox type) because PPL's UDTs ({@link AbstractExprRelDataType}) report
+   * {@link SqlTypeName#VARCHAR} but tag themselves with an {@link ExprUDT} and map to distinct
+   * Velox types ({@code TimestampType}, {@code DateType}, {@code BigIntType} for TIME). A plain
+   * numeric column lands in {@link #NONE}.
+   */
+  private enum SpanFieldKind {
+    TIMESTAMP,
+    DATE,
+    TIME, // not supported — velox4j Java has no TimeType wrapper, so we can't emit date_trunc(TIME)
+    NONE
+  }
+
+  /** Inspect a span's field operand and decide which lowering path applies. */
+  private static SpanFieldKind spanFieldKind(RexNode fieldRex) {
+    RelDataType type = fieldRex.getType();
+    if (type instanceof AbstractExprRelDataType<?>) {
+      ExprUDT udt = ((AbstractExprRelDataType<?>) type).getUdt();
+      switch (udt) {
+        case EXPR_TIMESTAMP:
+          return SpanFieldKind.TIMESTAMP;
+        case EXPR_DATE:
+          return SpanFieldKind.DATE;
+        case EXPR_TIME:
+          return SpanFieldKind.TIME;
+        default:
+          break;
+      }
+    }
+    switch (type.getSqlTypeName()) {
+      case TIMESTAMP:
+      case TIMESTAMP_WITH_LOCAL_TIME_ZONE:
+        return SpanFieldKind.TIMESTAMP;
+      case DATE:
+        return SpanFieldKind.DATE;
+      case TIME:
+      case TIME_WITH_LOCAL_TIME_ZONE:
+        return SpanFieldKind.TIME;
+      default:
+        return SpanFieldKind.NONE;
+    }
+  }
+
+  /**
+   * Convert PPL's {@code span(field, width, unit)} into a Velox bucketing expression. Four shapes
+   * are supported, matching {@link #isSupported}:
+   *
+   * <ul>
+   *   <li>TIMESTAMP span, count = 1 → {@code date_trunc(<truncUnit>, ts)}.
+   *   <li>TIMESTAMP span, count > 1 on fixed-length second-aligned units (s/m/h/d) → {@code
+   *       from_unixtime(floor(to_unixtime(ts) / N) * N)} with {@code N = count × unit_seconds}.
+   *       Week is excluded for count &gt; 1 because epoch is Thursday-aligned but {@code
+   *       date_trunc('week')} is Monday-aligned.
+   *   <li>DATE span, count = 1 on day/week/month/quarter/year → {@code date_trunc(<truncUnit>,
+   *       date)}. Velox's DATE variant of date_trunc only accepts day-and-above units.
+   *   <li>Numeric span → {@code floor(col / width) * width}. Integer operands stay in integer space
+   *       to preserve BIGINT precision above 2^53.
+   * </ul>
+   *
+   * <p>Returns null when the call shape isn't one of the above. {@code isSupported} rejects
+   * unsupported cases up front on the normal path. TIME inputs fall back because velox4j has no
+   * TimeType wrapper — we can't emit {@code date_trunc(TIME)} from the Java binding.
+   */
+  private TypedExpr convertSpan(RexCall call) {
+    List<RexNode> ops = call.getOperands();
+    if (!(ops.get(1) instanceof RexLiteral)) {
+      return null;
+    }
+    RexLiteral widthLit = (RexLiteral) ops.get(1);
+    RexNode unitRex = ops.get(2);
+    TypedExpr fieldExpr = convert(ops.get(0));
+    Type returnType = VeloxTypeConverter.toVeloxType(call.getType());
+
+    SpanFieldKind kind = spanFieldKind(ops.get(0));
+    boolean hasUnit = unitRex instanceof RexLiteral && !((RexLiteral) unitRex).isNull();
+
+    if (kind == SpanFieldKind.TIMESTAMP && hasUnit) {
+      String unit = ((RexLiteral) unitRex).getValueAs(String.class);
+      long count = readSpanCount(widthLit);
+      if (count <= 0) {
+        return null;
+      }
+      return buildTimeSpanExpr(fieldExpr, count, unit, returnType);
+    }
+    if (kind == SpanFieldKind.DATE && hasUnit) {
+      String unit = ((RexLiteral) unitRex).getValueAs(String.class);
+      long count = readSpanCount(widthLit);
+      if (count != 1 || !SPAN_UNIT_DATE_VALID.contains(unit)) {
+        return null; // isSupported rejects these; this is the defensive branch.
+      }
+      String truncUnit = SPAN_UNIT_TO_DATE_TRUNC.get(unit);
+      if (truncUnit == null) {
+        return null;
+      }
+      TypedExpr unitConst =
+          ConstantTypedExpr.create(new VarCharType(), new VarCharValue(truncUnit));
+      return new CallTypedExpr(returnType, List.of(unitConst, fieldExpr), "date_trunc");
+    }
+    if (kind != SpanFieldKind.NONE) {
+      // TIME span — no velox4j TimeType wrapper available, so we cannot emit date_trunc(TIME).
+      // Also catch any stray temporal kind: we must not drop to the numeric path or we'd
+      // bucket raw millis/days ignoring the unit. isSupported rejects these; defensive.
+      return null;
+    }
+    // Defense in depth: never emit divide/mod-by-zero even if force_vectorize bypasses
+    // isSupported. A non-positive width also indicates nonsensical buckets; fall back.
+    BigDecimal widthValue = readNumericWidth(widthLit);
+    if (widthValue == null || widthValue.signum() <= 0) {
+      return null;
+    }
+    return buildNumericSpanExpr(fieldExpr, widthLit, returnType);
+  }
+
+  /**
+   * Time-span lowering. {@code count == 1} → {@code date_trunc(unit, ts)}. {@code count > 1} on
+   * fixed-length units → {@code from_unixtime(floor(to_unixtime(ts) / N) * N)} where {@code N =
+   * count × unit_seconds}. Returns null if the unit isn't in the lookup tables.
+   */
+  private TypedExpr buildTimeSpanExpr(
+      TypedExpr fieldExpr, long count, String unit, Type returnType) {
+    if (count == 1) {
+      String truncUnit = SPAN_UNIT_TO_DATE_TRUNC.get(unit);
+      if (truncUnit == null) {
+        return null;
+      }
+      TypedExpr unitConst =
+          ConstantTypedExpr.create(new VarCharType(), new VarCharValue(truncUnit));
+      return new CallTypedExpr(returnType, List.of(unitConst, fieldExpr), "date_trunc");
+    }
+    Long unitSeconds = SPAN_UNIT_SECONDS.get(unit);
+    if (unitSeconds == null) {
+      return null;
+    }
+    long bucketSeconds = Math.multiplyExact(unitSeconds, count);
+    DoubleType doubleType = new DoubleType();
+    TypedExpr bucketConst =
+        ConstantTypedExpr.create(doubleType, new DoubleValue((double) bucketSeconds));
+    TypedExpr toUnix = new CallTypedExpr(doubleType, List.of(fieldExpr), "to_unixtime");
+    TypedExpr divided = new CallTypedExpr(doubleType, List.of(toUnix, bucketConst), "divide");
+    TypedExpr floored = new CallTypedExpr(doubleType, List.of(divided), "floor");
+    TypedExpr multiplied = new CallTypedExpr(doubleType, List.of(floored, bucketConst), "multiply");
+    return new CallTypedExpr(returnType, List.of(multiplied), "from_unixtime");
+  }
+
+  /**
+   * Numeric-span lowering: semantically {@code floor(col / width) * width}.
+   *
+   * <p>Two paths to preserve precision:
+   *
+   * <ul>
+   *   <li><b>Integer types</b> (TINYINT, SMALLINT, INTEGER, BIGINT): emit the Euclidean-modulo form
+   *       {@code col - ((col mod width + width) mod width)} in integer space. This matches {@code
+   *       floor} semantics for both positive and negative values — a naive {@code
+   *       floor(integer_divide(col, w)) * w} would round {@code -1/10} to {@code 0} (Velox integer
+   *       divide truncates toward zero and {@code floor} on integers is a no-op), producing the
+   *       wrong bucket. Staying in integer space preserves full range for {@code BIGINT} values
+   *       above 2<sup>53</sup> that would silently merge when routed through DOUBLE.
+   *   <li><b>Floating-point types</b> (REAL, DOUBLE): emit the DOUBLE arithmetic {@code
+   *       floor(col/width)*width}. Precision already matches Calcite's declared type and {@code
+   *       floor} on DOUBLE is a real floor (not a no-op).
+   * </ul>
+   *
+   * <p>DECIMAL fields fall back at {@link #isSupported}; scaled DECIMAL widths against a
+   * floating-point field reach the DOUBLE path.
+   */
+  private TypedExpr buildNumericSpanExpr(
+      TypedExpr fieldExpr, RexLiteral widthLit, Type returnType) {
+    TypedExpr widthExpr = convert(widthLit);
+    Type fieldType = fieldExpr.getReturnType();
+    Type widthType = widthExpr.getReturnType();
+
+    // Integer path: both sides integral. Emit `col - ((col mod w + w) mod w)` so the result is
+    // equivalent to `floor(col / w) * w` across the sign range.
+    if (isIntegerType(fieldType) && isIntegerType(widthType)) {
+      Type wider = numericRank(fieldType) >= numericRank(widthType) ? fieldType : widthType;
+      TypedExpr col = castIfDifferent(fieldExpr, wider);
+      TypedExpr w = castIfDifferent(widthExpr, wider);
+      TypedExpr colModW = new CallTypedExpr(wider, List.of(col, w), "mod");
+      TypedExpr colModWPlusW = new CallTypedExpr(wider, List.of(colModW, w), "plus");
+      TypedExpr euclideanMod = new CallTypedExpr(wider, List.of(colModWPlusW, w), "mod");
+      TypedExpr bucketStart = new CallTypedExpr(wider, List.of(col, euclideanMod), "minus");
+      return castIfDifferent(bucketStart, returnType);
+    }
+
+    // DOUBLE/REAL path — safe for values inside floating-point precision. Velox's DOUBLE floor
+    // is a real floor (not a no-op), so `floor(col/w)*w` has the correct sign behavior here.
+    DoubleType doubleType = new DoubleType();
+    TypedExpr fieldAsDouble = castIfDifferent(fieldExpr, doubleType);
+    TypedExpr widthAsDouble = castIfDifferent(widthExpr, doubleType);
+    TypedExpr divided =
+        new CallTypedExpr(doubleType, List.of(fieldAsDouble, widthAsDouble), "divide");
+    TypedExpr floored = new CallTypedExpr(doubleType, List.of(divided), "floor");
+    TypedExpr multiplied =
+        new CallTypedExpr(doubleType, List.of(floored, widthAsDouble), "multiply");
+    return castIfDifferent(multiplied, returnType);
+  }
+
+  /** Wrap {@code expr} in a CAST to {@code target} unless its return type is already target. */
+  private static TypedExpr castIfDifferent(TypedExpr expr, Type target) {
+    return expr.getReturnType().getClass().equals(target.getClass())
+        ? expr
+        : CastTypedExpr.create(target, expr, /* isTryCast */ false);
+  }
+
+  /**
+   * Read a span-count RexLiteral as a positive long. Returns -1 for non-integral values (e.g.,
+   * DECIMAL with non-zero scale) — the caller treats that as "not a valid time-span count".
+   */
+  private static long readSpanCount(RexLiteral widthLit) {
+    // Check BigDecimal first: Calcite's getValueAs(Long.class) on a DECIMAL returns the
+    // *unscaled* long (0.5 → 5), silently losing scale. We must verify scale <= 0 before
+    // accepting a value as integral.
+    try {
+      BigDecimal bd = widthLit.getValueAs(BigDecimal.class);
+      if (bd != null && bd.scale() <= 0) {
+        return bd.longValueExact();
+      }
+      if (bd != null) {
+        // Fractional — not a valid time-span count, nor an integer-semantics width.
+        return -1L;
+      }
+    } catch (Exception ignored) {
+      // fall through to Long path (non-DECIMAL numeric literal)
+    }
+    try {
+      Long v = widthLit.getValueAs(Long.class);
+      if (v != null) {
+        return v;
+      }
+    } catch (Exception ignored) {
+      // fall through
+    }
+    return -1L;
+  }
+
+  /**
+   * Read a numeric-span width RexLiteral as a signed {@link BigDecimal}. Returns null when the
+   * literal can't be interpreted as a numeric value. Callers use this to enforce positivity and to
+   * distinguish integral vs fractional widths.
+   */
+  private static BigDecimal readNumericWidth(RexLiteral widthLit) {
+    try {
+      BigDecimal bd = widthLit.getValueAs(BigDecimal.class);
+      if (bd != null) {
+        return bd;
+      }
+    } catch (Exception ignored) {
+      // fall through to Double path (non-DECIMAL numeric literal)
+    }
+    try {
+      Double d = widthLit.getValueAs(Double.class);
+      if (d != null) {
+        return BigDecimal.valueOf(d);
+      }
+    } catch (Exception ignored) {
+      // fall through
+    }
+    return null;
+  }
+
   /**
    * Convert ITEM(parent, 'fieldName') → Velox FieldAccessTypedExpr. The SQL plugin generates ITEM
    * calls for nested object field access (e.g., cloud.region → ITEM(cloud, 'region')). The scan
@@ -857,7 +1265,7 @@ public class VeloxExprConverter {
   }
 
   private static final Set<String> ARITHMETIC_FUNCTIONS =
-      Set.of("plus", "minus", "multiply", "divide", "modulus");
+      Set.of("plus", "minus", "multiply", "divide", "mod");
 
   private static boolean isArithmeticFunction(String functionName) {
     return ARITHMETIC_FUNCTIONS.contains(functionName);
