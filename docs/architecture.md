@@ -1,4 +1,4 @@
-# OpenSearch OLAP Plugin — Technical Review
+# OpenSearch OLAP Plugin — Architecture
 
 ## Table of Contents
 
@@ -14,9 +14,15 @@
    - 4.6 Threading Model
    - 4.7 Backpressure and Memory Bounds
    - 4.8 Join Column-Name Disambiguation
+   - 4.9 Query Profiling
 5. [Key Design Decisions](#5-key-design-decisions)
 6. [Comparison with RFC #4812](#6-comparison-with-rfc-4812)
 7. [Current Scope and Roadmap](#7-current-scope-and-roadmap)
+8. [Reference](#8-reference)
+   - 8.1 Project Structure
+   - 8.2 Supported Operators
+   - 8.3 Dependencies and Classloader Isolation
+   - 8.4 SQL Plugin Changes
 
 ---
 
@@ -438,6 +444,59 @@ When two join inputs share a column name (e.g. both `employees` and `departments
 
 **Diagnostic signal**: the symptom of a broken resolver is "join returns zero rows despite matching data." The giveaway is a `PARTIAL bloom built: field=<name>, inserted=0` line in the data-node log when RF is enabled — that means the bloom builder couldn't find the column name in the scan schema. When adding a new PPL integration test that joins on a column whose name ends in digits, add a targeted resolver unit test alongside it in `VeloxExecutionEngineTests`.
 
+### 4.9 Query Profiling
+
+The OLAP plugin plugs into the SQL plugin's PPL `profile=true` flow. When the profile flag is set, each data node records per-task Lucene scan counters (`docsRead`, `docsMatched`, `rowsEmitted`, `rfKind`) plus backpressure counters (`peakArrowBytes`, `backpressureWaitNanos`, `resultBytes`, `shuffleRejectCount`), and the coordinator assembles them into a plan tree under `profile.plan`. The main use case is answering "did my runtime filter actually narrow the Lucene scan?" — without profiling, the only visible signal is total query latency.
+
+**Wire format.** Each `ExecuteFragmentResponse` carries an `OlapTaskProfile` trailer when `ExecuteFragmentRequest.profileEnabled=true`. The coordinator accumulates every response in a thread-local list, hands them to `OlapProfileAssembler.buildPlan` which produces a `ProfilePlanNode` tree, and calls `QueryProfiling.current().setPlanRoot(root)`. The SQL plugin's `SimpleJsonResponseFormatter` then emits it as `profile.plan` in the PPL response.
+
+**Profile output shape.** The standard SQL-plugin `profile` block (`summary` + `phases`) is augmented with a plan subtree reflecting Velox execution:
+
+```json
+"profile": {
+  "summary": {"total_time_ms": 412.0},
+  "phases": {"analyze": {...}, "optimize": {...}, "execute": {...}, "format": {...}},
+  "plan": {
+    "node": "VeloxQuery rf=BLOOM bloomBytes=512 docsRead=20000 docsMatched=240 rows=120",
+    "time_ms": 380.0,
+    "rows": 0,
+    "children": [
+      {
+        "node": "Fragment[0] rf=NONE docsRead=0 docsMatched=0 rows=3 (2 tasks)",
+        "time_ms": 25.0,
+        "children": [
+          {"node": "Task frag=0 part=0 node=data-1 rf=NONE docsRead=0 docsMatched=0 rows=2", "time_ms": 12.0},
+          {"node": "Task frag=0 part=1 node=data-2 rf=NONE docsRead=0 docsMatched=0 rows=1", "time_ms": 13.0}
+        ]
+      },
+      {
+        "node": "Fragment[1] rf=BLOOM docsRead=20000 docsMatched=240 rows=120 (2 tasks)",
+        "time_ms": 355.0,
+        "children": [
+          {"node": "Task frag=1 part=0 node=data-1 rf=BLOOM docsRead=10000 docsMatched=120 rows=60", "time_ms": 180.0},
+          {"node": "Task frag=1 part=1 node=data-2 rf=BLOOM docsRead=10000 docsMatched=120 rows=60", "time_ms": 175.0}
+        ]
+      }
+    ]
+  }
+}
+```
+
+**Counter meanings (probe-side leaf tasks only):**
+
+- `docsRead` — number of live docs the Lucene scorer iterated over. This is the universe the runtime filter acted on.
+- `docsMatched` — number of docs the scorer admitted and emitted into the Arrow bridge.
+- `rows` — rows emitted by the Velox fragment's final operator (may differ from `docsMatched` due to joins/aggregations).
+- `rf` — runtime filter kind applied on this task (`NONE` / `TERMS` / `BLOOM`).
+- `peakArrowBytes` (when > 0) — peak Java-side Arrow allocator memory during the task. Useful for right-sizing `per_fragment_arrow_bytes`.
+- `backpressureWaitNanos` (when > 0) — total time this task's feeder was parked waiting for the downstream allocator to drain. A non-zero value means a bound was engaged; sustained values across tasks indicate the caps are tight for the workload.
+- `resultBytes` (when > 0) — serialized result size produced by this task. Compare against `max_result_bytes`.
+- `shuffleRejectCount` (when > 0) — number of times a shuffle send was rejected with backpressure and retried.
+
+The gap between `docsRead` and `docsMatched` is the observable effect of the runtime filter at the Lucene level. Tasks with `rf=NONE` (e.g., build-side leaves, coordinator stages) naturally report `docsRead=0` when they don't read from Lucene.
+
+**Overhead.** Profiling adds a per-task wire-format trailer (~60 bytes) and skips all counter work when `profile=true` is absent from the request, so the overhead is negligible for non-profiled queries. Per-fragment `time_ms` is the **sum** of task times, not wall-clock — parallelism across tasks is not subtracted out. Profiling is only emitted for successful queries.
+
 ---
 
 ## 5. Key Design Decisions
@@ -587,3 +646,149 @@ Gaps identified by comparison with [RFC #4812](https://github.com/opensearch-pro
 | **Low** | Recursive CTE (WITH RECURSIVE) | Fixpoint iteration | Not implemented |
 | **Low** | Cross-cluster query | Analytics across multiple OpenSearch clusters | Not implemented |
 | ~~**Low**~~ | ~~EXPLAIN visualization~~ | ~~RFC has multi-stage plan visualization + DOT format~~ | **Done** — PPL `explain` command outputs Velox plan tree via `PlanNode.toFormatString()`; shows operator pipeline, column projections, and filter expressions |
+
+---
+
+## 8. Reference
+
+### 8.1 Project Structure
+
+```
+src/main/java/org/opensearch/plugin/olap/
+├── OlapPlugin.java                    # Plugin entry point
+├── common/
+│   └── QueryId.java                   # Query identifier
+├── engine/                            # SQL plugin integration
+│   ├── VeloxExecutionEngine.java      #   RelNode → Velox pipeline orchestration
+│   └── VectorizedEngineExtension.java #   ExecutionEngine impl (canVectorize + execute)
+├── plan/
+│   ├── convert/                       # Calcite → Velox expression/type converters
+│   │   ├── VeloxExprConverter.java    #   RexNode → TypedExpr
+│   │   ├── VeloxTypeConverter.java    #   RelDataType → velox4j Type
+│   │   ├── VeloxAggConverter.java     #   AggregateCall → Aggregate
+│   │   └── PlanIdGenerator.java       #   Unique plan node IDs
+│   ├── fragment/                      # Distributed plan fragmentation
+│   │   ├── PlanFragment.java          #   Fragment with plan subtree + properties
+│   │   └── FragmentProperties.java    #   Distribution metadata (SOURCE, COORDINATOR, BROADCAST, HASH_PARTITIONED)
+│   └── physical/                      # Calcite physical planning framework
+│       ├── PhysicalConvention.java    #   Convention with enforce() for auto Exchange insertion
+│       ├── PhysicalRel.java           #   Marker interface for physical nodes
+│       ├── PhysicalTableScan.java     #   Physical scan (dist=RANDOM)
+│       ├── PhysicalFilter.java        #   Physical filter (inherits child dist)
+│       ├── PhysicalProject.java       #   Physical project
+│       ├── PhysicalAggregate.java     #   Physical aggregate (SINGLE/PARTIAL/FINAL)
+│       ├── PhysicalJoin.java          #   Physical hash join
+│       ├── PhysicalSort.java          #   Physical sort/limit (dist=SINGLETON)
+│       ├── PhysicalWindow.java        #   Physical window (eventstats)
+│       ├── PhysicalExchange.java      #   Redistribution boundary
+│       ├── PhysicalOptimizer.java     #   ClusterCopyShuttle + HepPlanner (join reorder) + VolcanoPlanner
+│       ├── StatisticsTableScan.java   #   TableScan with CBO row count for join reorder cost model
+│       ├── VeloxPlanGenerator.java    #   Physical plan → Velox PlanNodes + PlanFragments
+│       └── rules/                     #   Conversion + optimization rules
+│           ├── PhysicalRules.java     #     All rule lists
+│           ├── Physical*Rule.java     #     ConverterRules (NONE → PHYSICAL, incl. PhysicalWindowRule)
+│           ├── Mpp*Rule.java          #     MPP rules (HASH distribution)
+│           └── TwoStageAggRule.java   #     SINGLE → PARTIAL + Exchange + FINAL
+├── scheduler/                         # Query scheduling
+│   ├── QueryScheduler.java            #   Orchestrates distributed execution
+│   ├── QueryExecution.java            #   Single query lifecycle
+│   ├── Stage.java                     #   Execution stage (1 fragment → N tasks)
+│   ├── ShardRouter.java               #   Routes to nodes by shard assignment
+│   ├── CostEstimator.java             #   Join strategy selection (shard count + CBO row count)
+│   ├── JoinStrategy.java              #   COORDINATOR_CENTRIC / BROADCAST / HASH_SHUFFLE
+│   ├── StatisticsCollector.java       #   Collects row count + size from IndicesStatsResponse
+│   ├── TableStatistics.java           #   Row count, size, shard count per index
+│   ├── ErrorClassifier.java           #   Classifies errors: RETRYABLE_NODE/SHARD/TRANSIENT, FATAL
+│   ├── BadResourceTracker.java        #   Thread-safe tracker for failed nodes/shards
+│   ├── TaskDescriptor.java            #   Task metadata for a node
+│   ├── TaskTracker.java               #   Tracks task states
+│   ├── StageId.java / TaskId.java     #   Identifiers
+│   ├── TaskState.java                 #   Task lifecycle enum
+│   └── ExecutionPolicy.java           #   ALL_AT_ONCE vs PHASED
+├── transport/                         # Inter-node communication
+│   ├── ExecuteFragmentAction.java     #   Action type definition
+│   ├── ExecuteFragmentRequest.java    #   Plan + shard IDs + broadcast/shuffle config
+│   ├── ExecuteFragmentResponse.java   #   Status + Arrow IPC / native serde results
+│   ├── TransportExecuteFragmentAction.java  # Data node handler (scan, broadcast join, shuffle)
+│   ├── NodeResultCollector.java       #   Fan-out + collect results (normal, broadcast, shuffle)
+│   ├── ShuffleDataAction.java         #   P2P shuffle transport action
+│   ├── ShuffleDataRequest.java        #   Shuffle partition data
+│   ├── ShuffleDataResponse.java       #   Shuffle acknowledgement
+│   ├── ShuffleManager.java            #   Thread-safe shuffle buffer management
+│   └── TransportShuffleDataAction.java#   Shuffle data receiver
+├── execution/                         # Lucene → Arrow → Velox pipeline
+│   ├── LuceneArrowReader.java         #   Reads shards into Arrow batches
+│   ├── DocValueColumnReader.java      #   Single column from DocValues
+│   ├── ArrowBatchBuilder.java         #   Builds VectorSchemaRoot
+│   ├── ExternalStreamBridge.java      #   Arrow → velox4j BlockingQueue
+│   ├── RuntimeFilterBuilder.java      #   Builds Lucene TermInSetQuery/PointInSetQuery from RF values
+│   ├── VeloxExecutor.java             #   Executes plan via velox4j (single/dual input)
+│   └── VeloxLifecycleService.java     #   Velox engine init/shutdown + dynamic settings
+└── result/                            # Result handling (interfaces)
+    ├── QueryResult.java               #   Query result interface
+    └── ResultCollector.java           #   Merge partial results
+```
+
+### 8.2 Supported Operators
+
+**Plan Node Conversion (Calcite → Velox):**
+
+| Calcite RelNode | Velox PlanNode |
+|----------------|---------------|
+| `TableScan` (`LogicalTableScan`, `CalciteLogicalIndexScan`) | `TableScanNode` + `ExternalStreamTableHandle` |
+| `LogicalFilter` | `FilterNode` |
+| `LogicalProject` | `ProjectNode` |
+| `LogicalAggregate` | `AggregationNode` (SINGLE / PARTIAL+FINAL) |
+| `LogicalJoin` | `HashJoinNode` (equi-join key extraction) |
+| `Sort` (`LogicalSort`, `LogicalSystemLimit`) | `OrderByNode` + `LimitNode` (two-stage TopN: PARTIAL + FINAL when distributed) |
+| `LogicalWindow` | `WindowNode` (eventstats: COUNT, SUM, AVG, MIN, MAX with PARTITION BY; ranking: ROW_NUMBER, RANK, DENSE_RANK) |
+
+**Expression Conversion (RexNode → TypedExpr):**
+
+| Calcite Expression | Velox Expression |
+|-------------------|-----------------|
+| `RexInputRef` | `FieldAccessTypedExpr` |
+| `RexLiteral` | `ConstantTypedExpr` (BooleanValue, IntegerValue, BigIntValue, DoubleValue, VarCharValue) |
+| `RexCall` (=, <, >, AND, OR, +, -, *, /) | `CallTypedExpr` (equalto, lessthan, greaterthan, and, or, plus, minus, multiply, divide, mod) |
+| `RexCall` (!=) | `not(equalto(a, b))` — Velox has no `notequalto` for generic types |
+| `CAST` | `CastTypedExpr` |
+| `IS NULL` / `IS NOT NULL` | `CallTypedExpr` (is_null / not(is_null)) |
+| `IN` | Chain of eq + or |
+| `BETWEEN` | gte + lte + and |
+| PPL `extract(unit FROM ts)` | Dedicated Velox date-part scalar (`year`, `month`, `day`, `hour`, `minute`, `second`, `week_of_year`, `day_of_week`, `day_of_year`, `quarter`) |
+| PPL `span(field, count, unit)` | `date_trunc` (count=1 temporal), `from_unixtime(floor(to_unixtime(ts)/N)*N)` (count>1 on s/m/h/d), or integer/DOUBLE Euclidean-modulo (numeric) — see §4.9 in `docs/velox-function-support.md` |
+
+**Aggregate Functions:** COUNT, SUM, AVG, MIN, MAX (with DISTINCT support). See `docs/velox-function-support.md` for the full PPL → Velox coverage matrix.
+
+### 8.3 Dependencies and Classloader Isolation
+
+| Dependency | Version | Scope | Purpose |
+|-----------|---------|-------|---------|
+| OpenSearch | 3.7.0 | compileOnly | Host platform |
+| opensearch-sql | 3.7.0.0 | compileOnly + runtime (extended plugin) | SQL/PPL parsing, `ExecutionEngine` interface, Calcite |
+| Apache Calcite | 1.41.0 | compileOnly | Plan conversion — provided by SQL plugin at runtime |
+| Apache Arrow | 18.1.0 | implementation | `arrow-vector`, `arrow-memory-core`, `arrow-c-data`, `arrow-format` + `arrow-memory-unsafe` (runtime) |
+| flatbuffers-java | 24.3.25 | implementation | Required by `arrow-c-data` (not pulled transitively) |
+| velox4j | 0.1.0 | compileOnly + repackaged runtime | JNI bridge to Velox C++ engine |
+
+The OLAP plugin extends the SQL plugin's classloader (`extendedPlugins = ['opensearch-sql']`). To avoid duplicate class errors and jar-hell issues:
+
+- **Calcite** is `compileOnly` — already bundled by the SQL plugin.
+- **velox4j** is repackaged at build time (`repackageVelox4j` task) to strip `javax.annotation` and `org.slf4j` classes that conflict with the SQL plugin's `jsr305` jar.
+- **jsr305** is excluded globally via `configurations.all`.
+- **Arrow memory**: uses `arrow-memory-unsafe` instead of `arrow-memory-netty` — OpenSearch's Netty lives in the system classloader and is invisible to plugin classloaders; `arrow-memory-netty` would crash with `NoClassDefFoundError` at load time. `arrow-memory-unsafe` has no external dependencies and uses `sun.misc.Unsafe` directly. Safe because Velox manages its own memory in C++ — the Java-side Arrow allocator is only the Lucene→Arrow feeder.
+- **Arrow C Data transitive deps**: `arrow-c-data` needs `arrow-format` and `com.google.flatbuffers:flatbuffers-java` — not pulled transitively by Gradle, declared explicitly.
+- **Thread context classloader**: `VeloxLifecycleService` sets `Thread.currentThread().setContextClassLoader(Velox4j.class.getClassLoader())` before `Velox4j.initialize()`. velox4j's native library discovery uses the thread context classloader to find `velox4j-lib/Linux/amd64/` resources, which are inside the plugin's repackaged jar but invisible to the default thread context classloader.
+
+### 8.4 SQL Plugin Changes
+
+The following changes are needed in the SQL plugin (`opensearch-sql`) for the OLAP plugin to work:
+
+1. **`ExecutionEngine.java`** — Added `default boolean canVectorize(RelNode plan)` returning `false`.
+2. **`DelegatingExecutionEngine.java`** (new) — Wraps default engine + SPI extensions; routes to the first extension where `canVectorize()` returns `true`.
+3. **`EngineExtensionsHolder`** — Makes extensions injectable via OpenSearch's Guice.
+4. **`SQLPlugin.java`** — Implements `ExtensiblePlugin`, loads `ExecutionEngine` extensions via SPI.
+5. **`OpenSearchPluginModule.java`** — Wraps the execution engine in `DelegatingExecutionEngine` when extensions are present.
+6. **`TransportPPLQueryAction`** — Injects the extensions holder (bug fix: previously had no extensions).
+
+`QueryService` is **not modified** — the delegation is transparent.

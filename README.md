@@ -1,986 +1,150 @@
 # OpenSearch OLAP Plugin
 
-An OpenSearch plugin that integrates [Apache Velox](https://velox-lib.io/) as a vectorized execution engine for analytical (OLAP) queries. Instead of OpenSearch's row-oriented query-then-fetch pipeline, this plugin reads columnar data from Lucene doc values, converts it to Apache Arrow format, and executes queries through Velox's C++ vectorized engine via [velox4j](https://github.com/velox4j/velox4j).
+## Welcome!
 
-## Co-work with SQL Plugin
+An OpenSearch plugin that accelerates analytical (OLAP) queries by executing them through [Apache Velox](https://velox-lib.io/), a C++ vectorized columnar engine, via the [velox4j](https://github.com/velox4j/velox4j) JNI bridge. Instead of OpenSearch's row-oriented query-then-fetch pipeline, the plugin reads columnar data from Lucene doc values into Apache Arrow and runs aggregations, joins, and sorts through Velox.
 
-This plugin is designed to **co-work with the OpenSearch SQL plugin** (`opensearch-sql`), not replace it. The SQL plugin handles SQL/PPL parsing and Calcite RelNode generation. The OLAP plugin provides an alternative execution engine that takes the RelNode and executes it through Velox.
+The plugin **co-works with the OpenSearch SQL plugin** — the SQL plugin continues to parse SQL/PPL and generate Calcite plans; the OLAP plugin registers itself as an alternative `ExecutionEngine` and advertises the plan shapes it can vectorize. Queries it can't handle fall back to the default engine automatically.
 
-```
-[SQL Plugin]                                    [OLAP Plugin]
+## Project Resources
 
-SQL/PPL Query
-    │
-    ▼
-Calcite Analyzer
-    │
-    ▼
-RelNode (Logical Plan)
-    │
-    ▼
-DelegatingExecutionEngine
-    │
-    ├── canVectorize() = true ──► OlapExecutionExtensionImpl ──► VeloxExecutionEngine
-    │                                                                │
-    │                                                         PhysicalOptimizer
-    │                                                         (VolcanoPlanner + Convention)
-    │                                                                │
-    │                                                         VeloxPlanGenerator
-    │                                                         (split at PhysicalExchange)
-    │                                                                │
-    │                                                         QueryScheduler
-    │                                                         (route by shard)
-    │                                                                │
-    │                                                   ┌────────────┼────────────┐
-    │                                                   ▼            ▼            ▼
-    │                                                Data Node    Data Node    Data Node
-    │                                                Lucene →     Lucene →     Lucene →
-    │                                                Arrow →      Arrow →      Arrow →
-    │                                                Velox C++    Velox C++    Velox C++
-    │
-    └── canVectorize() = false ─► OpenSearchExecutionEngine (default row-oriented)
-```
+* [Project Website](https://opensearch.org/)
+* [Downloads](https://opensearch.org/downloads.html)
+* [Documentation](docs/)
+* Need help? Try the [Forum](https://forum.opensearch.org/c/plugins/sql/8)
+* [Project Principles](https://opensearch.org/#principles)
+* [Contributing to OpenSearch k-NN](CONTRIBUTING.md)
+* [Maintainer Responsibilities](MAINTAINERS.md)
 
-### Integration via ExecutionEngine
+## Features
 
-The SQL plugin discovers the OLAP engine using OpenSearch's `ExtensiblePlugin` mechanism:
+- Vectorized columnar execution for aggregations, joins, sorts, and window functions
+- Distributed MPP execution: two-phase aggregation (PARTIAL/FINAL), broadcast joins, hash-shuffle joins
+- Co-Routing joins: shard-local, zero-shuffle joins between co-indexed tables
+- Runtime Filter pushdown (TERMS and BLOOM) from build side to probe-side Lucene scan
+- CBO row-count statistics for join build-side selection and join reorder
+- Two-stage TopN (partial sort+limit per shard → final merge)
+- Window functions: eventstats (COUNT/SUM/AVG/MIN/MAX with PARTITION BY) + ranking (ROW_NUMBER, RANK, DENSE_RANK)
+- PPL `span()` lowered to Velox (time bucketing via `date_trunc` / arithmetic; numeric bucketing)
+- Segment-level parallel Lucene reads
+- End-to-end backpressure: bounded Arrow allocators, per-fragment and aggregate result caps, shuffle-buffer flow control
+- Fault tolerance: per-task retry with error classification (node/shard/transient), bad-resource tracking, replica failover
+- Plan introspection via PPL `explain` and `{"profile": true}`
+- Graceful degradation — if Velox native libraries are unavailable (e.g. macOS/aarch64), the plugin disables itself and all queries fall back to the default engine
 
-1. The OLAP plugin declares `extended.plugins=opensearch-sql` in its plugin descriptor
-2. The OLAP plugin implements `ExecutionEngine` and registers via SPI (`META-INF/services/org.opensearch.sql.executor.ExecutionEngine`)
-3. The SQL plugin implements `ExtensiblePlugin` and loads `ExecutionEngine` extensions in `loadExtensions()`
-4. Extensions are wrapped with the default engine in a `DelegatingExecutionEngine`
-5. When a query arrives, `DelegatingExecutionEngine` calls `canVectorize(RelNode plan)` on each extension
-6. If an extension returns `true`, execution is delegated to it; otherwise, the default engine is used
+For internal design, the end-to-end query flow, MPP details, backpressure internals, profiling wire format, and project structure, see [`docs/architecture.md`](docs/architecture.md).
 
-This design keeps `QueryService` unchanged — it just calls `executionEngine.execute()`.
+## Prerequisites
 
-## Architecture
+- **OpenSearch 3.7.0-SNAPSHOT** built locally. Typical layout: `../OpenSearch/build/distribution/local/opensearch-3.7.0-SNAPSHOT`.
+- **opensearch-sql** plugin (3.7.0.0-SNAPSHOT) and **opensearch-job-scheduler** (3.7.0.0-SNAPSHOT) built and available.
+- **JDK 21** or later (JDK 25 compiles cleanly).
+- **Linux x86_64** for runtime. macOS/aarch64 can build and install the plugin, but Velox native libraries won't load — the plugin will disable itself at startup and all queries fall back. Use the Docker workflow below if you need to test on an incompatible host.
 
-```
-                          +-----------------------+
-                          |     Coordinator Node  |
-                          |                       |
-  SQL Query ──> SQL Plugin ──> Calcite Analyzer  |
-                          |        │              |
-                          | DelegatingExecutionEngine
-                          |        │              |
-                          | OlapExecutionExtensionImpl
-                          |        │              |
-                          | PhysicalOptimizer     |
-                          |  (VolcanoPlanner)     |
-                          |        │              |
-                          | VeloxPlanGenerator    |
-                          |  (split at exchanges) |
-                          |        │              |
-                          |  QueryScheduler       |
-                          |  (route by shard)     |
-                          +--------│──────────────+
-                     ┌─────────────┼─────────────┐
-                     │             │             │
-              ┌──────▼──────┐ ┌───▼──────┐ ┌───▼──────┐
-              │  Data Node  │ │Data Node │ │Data Node │
-              │             │ │          │ │          │
-              │ Lucene      │ │          │ │          │
-              │  DocValues  │ │  ...     │ │  ...     │
-              │    │        │ │          │ │          │
-              │ Arrow       │ │          │ │          │
-              │  Batches    │ │          │ │          │
-              │    │        │ │          │ │          │
-              │ ExternalStream          │ │          │
-              │  BlockingQueue          │ │          │
-              │    │        │ │          │ │          │
-              │ Velox C++   │ │          │ │          │
-              │  Execution  │ │          │ │          │
-              └─────────────┘ └──────────┘ └──────────┘
-```
-
-### Query Execution Flow
-
-1. **SQL Parsing** (SQL plugin) - SQL/PPL is parsed and analyzed into a Calcite RelNode tree
-2. **Routing** - `DelegatingExecutionEngine` calls `canVectorize()` on the OLAP extension
-3. **Physical Optimization** - `PhysicalOptimizer` deep-copies the plan into a new VolcanoPlanner (stripping pushdown), runs HepPlanner + ConverterRules to produce PhysicalConvention nodes with PhysicalExchange at distribution boundaries
-4. **Plan Generation** - `VeloxPlanGenerator` splits the physical plan at PhysicalExchange nodes into PlanFragments, handles two-stage aggregation split (PARTIAL/FINAL), and converts to velox4j PlanNodes
-5. **Scheduling** - `QueryScheduler` uses `ClusterState` routing table to assign fragments to data nodes owning the target shards
-6. **Transport** - Coordinator dispatches `ExecuteFragmentRequest` to data nodes via OpenSearch `TransportService`
-7. **Data Node Execution**:
-   - Acquire Lucene searcher via `IndexShard.acquireSearcher()`
-   - Read doc values column-by-column into Arrow `VectorSchemaRoot` batches
-   - Feed Arrow batches into velox4j `ExternalStream.BlockingQueue` (zero-copy via Arrow C Data Interface)
-   - Velox `TableScanNode` reads from the queue and executes the plan fragment natively in C++
-   - For non-aggregation queries: results serialized as Arrow IPC bytes
-   - For PARTIAL aggregation: results serialized using Velox native format (`BaseVectors.serializeToBuf`) to preserve intermediate accumulator state
-8. **Coordinator FINAL Aggregation** (for aggregation queries):
-   - Receives Velox native serialized partial results from all data nodes
-   - Deserializes via `BaseVectors.deserializeOneFromBuf` (preserves intermediate types like avg's `{sum, count}`)
-   - Feeds deserialized RowVectors into a local ExternalStream BlockingQueue
-   - Executes FINAL aggregation plan through Velox C++ locally on the coordinator
-   - Results converted to Arrow IPC for the final response
-9. **Result Collection** - Arrow IPC results converted to SQL plugin's `QueryResponse` format
-
-### Key Design Decisions
-
-- **Co-work, not duplicate**: The SQL plugin handles SQL/PPL → Calcite. The OLAP plugin only handles Calcite → Velox → execution.
-- **`canVectorize(RelNode)` on `ExecutionEngine`**: A default method returning `false`. Extensions override it to advertise support for specific plan shapes. The `DelegatingExecutionEngine` routes based on this.
-- **Doc values over stored fields**: Doc values are columnar on disk, matching Arrow/Velox's columnar layout. Sequential iteration per segment is ideal for full-scan analytics.
-- **ExternalStream bridge**: velox4j's `BlockingQueue` eliminates the need for a custom C++ OpenSearch connector in Velox. Java pushes data, C++ pulls it.
-- **Velox native serde for exchange**: PARTIAL aggregation results are serialized using Velox's internal binary format (`BaseVectors.serializeToBuf/deserializeFromBuf`) instead of Arrow IPC. This preserves intermediate accumulator state (e.g., avg's `{sum, count}` pair) that would be lost in an Arrow round-trip. Arrow IPC is still used for final results to the SQL plugin.
-- **No core changes**: The plugin uses only public OpenSearch APIs (`Plugin`, `ActionPlugin`, `TransportService`, `IndicesService`, `IndexShard.acquireSearcher()`).
-- **Presto-inspired scheduler**: Stage/Task hierarchy and fragment dispatch modeled after Presto's `SqlStageExecution` and `RemoteTaskFactory`, adapted for OpenSearch's transport layer.
-- **Graceful degradation**: If Velox native libraries are unavailable (e.g. macOS/aarch64), the plugin logs a warning and disables itself. `canVectorize()` returns `false`, all queries fall back to the default engine.
-
-### MPP Join Strategies
-
-When `plugins.velox.mpp_enabled=true` (dynamic — can be toggled at runtime), the plugin selects between three join strategies based on cost:
-
-| Strategy | When Used | How It Works |
-|----------|-----------|-------------|
-| **Coordinator-Centric** | Default (`mpp_enabled=false`) | Both sides gathered to coordinator, join runs locally |
-| **Broadcast** | Small build side (shard count ≤ threshold) | Small table broadcast to all probe-side nodes, each runs local join in parallel |
-| **Hash Shuffle** | Both sides large | Both sides hash-partitioned by join key, shuffled P2P via `ShuffleDataAction` to workers |
-
-### Calcite Physical Planning
-
-The execution pipeline uses a Calcite Convention-based physical planning framework under `plan/physical/`. When a query arrives:
-
-1. **`PhysicalOptimizer`** creates a fresh `VolcanoPlanner` and deep-copies the SQL plugin's plan into it (stripping `CalciteLogicalIndexScan`'s pushdown context). When CBO statistics are available, `StatisticsTableScan` nodes inject row counts for join reorder. Runs HepPlanner (`FilterMergeRule` + `JoinToMultiJoinRule` + `MultiJoinOptimizeBushyRule` for join reorder), then VolcanoPlanner with `PhysicalConvention` converter rules.
-
-2. **ConverterRules** transform each logical operator to its physical equivalent (`PhysicalTableScan`, `PhysicalFilter`, `PhysicalProject`, `PhysicalAggregate`, `PhysicalJoin`, `PhysicalSort`), inserting `PhysicalExchange(SINGLETON)` nodes at distribution boundaries. When `mpp_enabled=true`, MPP rules (`MppJoinRule`, `MppAggregateRule`) are also registered, inserting `PhysicalExchange(HASH)` for hash-distributed alternatives. The VolcanoPlanner explores both and picks the lower-cost plan.
-
-3. **`VeloxPlanGenerator`** walks the physical plan, splits at `PhysicalExchange` boundaries into `PlanFragment`s, and converts to Velox PlanNodes. Two-stage aggregation (PARTIAL + FINAL) is split here with Velox-specific intermediate accumulator types.
-
-4. The downstream scheduling infrastructure (`QueryScheduler`, `NodeResultCollector`, `TransportExecuteFragmentAction`) executes the fragments on data nodes via Velox C++.
-
-## Project Structure
-
-```
-src/main/java/org/opensearch/plugin/olap/
-├── OlapPlugin.java                    # Plugin entry point
-├── common/
-│   └── QueryId.java                   # Query identifier
-├── engine/                            # SQL plugin integration
-│   ├── VeloxExecutionEngine.java      #   RelNode → Velox pipeline orchestration
-│   └── VectorizedEngineExtension.java #   ExecutionEngine impl (canVectorize + execute)
-├── plan/
-│   ├── convert/                       # Calcite → Velox expression/type converters
-│   │   ├── VeloxExprConverter.java    #   RexNode → TypedExpr
-│   │   ├── VeloxTypeConverter.java    #   RelDataType → velox4j Type
-│   │   ├── VeloxAggConverter.java     #   AggregateCall → Aggregate
-│   │   └── PlanIdGenerator.java       #   Unique plan node IDs
-│   ├── fragment/                      # Distributed plan fragmentation
-│   │   ├── PlanFragment.java          #   Fragment with plan subtree + properties
-│   │   └── FragmentProperties.java    #   Distribution metadata (SOURCE, COORDINATOR, BROADCAST, HASH_PARTITIONED)
-│   └── physical/                      # Calcite physical planning framework
-│       ├── PhysicalConvention.java    #   Convention with enforce() for auto Exchange insertion
-│       ├── PhysicalRel.java           #   Marker interface for physical nodes
-│       ├── PhysicalTableScan.java     #   Physical scan (dist=RANDOM)
-│       ├── PhysicalFilter.java        #   Physical filter (inherits child dist)
-│       ├── PhysicalProject.java       #   Physical project
-│       ├── PhysicalAggregate.java     #   Physical aggregate (SINGLE/PARTIAL/FINAL)
-│       ├── PhysicalJoin.java          #   Physical hash join
-│       ├── PhysicalSort.java          #   Physical sort/limit (dist=SINGLETON)
-│       ├── PhysicalWindow.java        #   Physical window (eventstats)
-│       ├── PhysicalExchange.java      #   Redistribution boundary
-│       ├── PhysicalOptimizer.java     #   ClusterCopyShuttle + HepPlanner (join reorder) + VolcanoPlanner
-│       ├── StatisticsTableScan.java   #   TableScan with CBO row count for join reorder cost model
-│       ├── VeloxPlanGenerator.java    #   Physical plan → Velox PlanNodes + PlanFragments
-│       └── rules/                     #   Conversion + optimization rules
-│           ├── PhysicalRules.java     #     All rule lists
-│           ├── Physical*Rule.java     #     ConverterRules (NONE → PHYSICAL, incl. PhysicalWindowRule)
-│           ├── Mpp*Rule.java          #     MPP rules (HASH distribution)
-│           └── TwoStageAggRule.java   #     SINGLE → PARTIAL + Exchange + FINAL
-├── scheduler/                         # Query scheduling
-│   ├── QueryScheduler.java            #   Orchestrates distributed execution
-│   ├── QueryExecution.java            #   Single query lifecycle
-│   ├── Stage.java                     #   Execution stage (1 fragment → N tasks)
-│   ├── ShardRouter.java               #   Routes to nodes by shard assignment
-│   ├── CostEstimator.java             #   Join strategy selection (shard count + CBO row count)
-│   ├── JoinStrategy.java              #   COORDINATOR_CENTRIC / BROADCAST / HASH_SHUFFLE
-│   ├── StatisticsCollector.java       #   Collects row count + size from IndicesStatsResponse
-│   ├── TableStatistics.java           #   Row count, size, shard count per index
-│   ├── ErrorClassifier.java           #   Classifies errors: RETRYABLE_NODE/SHARD/TRANSIENT, FATAL
-│   ├── BadResourceTracker.java        #   Thread-safe tracker for failed nodes/shards
-│   ├── TaskDescriptor.java            #   Task metadata for a node
-│   ├── TaskTracker.java               #   Tracks task states
-│   ├── StageId.java / TaskId.java     #   Identifiers
-│   ├── TaskState.java                 #   Task lifecycle enum
-│   └── ExecutionPolicy.java           #   ALL_AT_ONCE vs PHASED
-├── transport/                         # Inter-node communication
-│   ├── ExecuteFragmentAction.java     #   Action type definition
-│   ├── ExecuteFragmentRequest.java    #   Plan + shard IDs + broadcast/shuffle config
-│   ├── ExecuteFragmentResponse.java   #   Status + Arrow IPC / native serde results
-│   ├── TransportExecuteFragmentAction.java  # Data node handler (scan, broadcast join, shuffle)
-│   ├── NodeResultCollector.java       #   Fan-out + collect results (normal, broadcast, shuffle)
-│   ├── ShuffleDataAction.java         #   P2P shuffle transport action
-│   ├── ShuffleDataRequest.java        #   Shuffle partition data
-│   ├── ShuffleDataResponse.java       #   Shuffle acknowledgement
-│   ├── ShuffleManager.java            #   Thread-safe shuffle buffer management
-│   └── TransportShuffleDataAction.java#   Shuffle data receiver
-├── execution/                         # Lucene → Arrow → Velox pipeline
-│   ├── LuceneArrowReader.java         #   Reads shards into Arrow batches
-│   ├── DocValueColumnReader.java      #   Single column from DocValues
-│   ├── ArrowBatchBuilder.java         #   Builds VectorSchemaRoot
-│   ├── ExternalStreamBridge.java      #   Arrow → velox4j BlockingQueue
-│   ├── RuntimeFilterBuilder.java      #   Builds Lucene TermInSetQuery/PointInSetQuery from RF values
-│   ├── VeloxExecutor.java             #   Executes plan via velox4j (single/dual input)
-│   └── VeloxLifecycleService.java     #   Velox engine init/shutdown + dynamic settings
-└── result/                            # Result handling (interfaces)
-    ├── QueryResult.java               #   Query result interface
-    └── ResultCollector.java           #   Merge partial results
-```
-
-## Supported Operators
-
-### Plan Node Conversion (Calcite → Velox)
-
-| Calcite RelNode | Velox PlanNode |
-|----------------|---------------|
-| `TableScan` (`LogicalTableScan`, `CalciteLogicalIndexScan`) | `TableScanNode` + `ExternalStreamTableHandle` |
-| `LogicalFilter` | `FilterNode` |
-| `LogicalProject` | `ProjectNode` |
-| `LogicalAggregate` | `AggregationNode` (SINGLE / PARTIAL+FINAL) |
-| `LogicalJoin` | `HashJoinNode` (equi-join key extraction) |
-| `Sort` (`LogicalSort`, `LogicalSystemLimit`) | `OrderByNode` + `LimitNode` (two-stage TopN: PARTIAL + FINAL when distributed) |
-| `LogicalWindow` | `WindowNode` (eventstats: COUNT, SUM, AVG, MIN, MAX with PARTITION BY) |
-
-### Expression Conversion (RexNode → TypedExpr)
-
-| Calcite Expression | Velox Expression |
-|-------------------|-----------------|
-| `RexInputRef` | `FieldAccessTypedExpr` |
-| `RexLiteral` | `ConstantTypedExpr` (BooleanValue, IntegerValue, BigIntValue, DoubleValue, VarCharValue) |
-| `RexCall` (=, !=, <, >, AND, OR, +, -, *, /) | `CallTypedExpr` (equalto, notequalto, lessthan, greaterthan, and, or, plus, minus, multiply, divide) |
-| `CAST` | `CastTypedExpr` |
-| `IS NULL` / `IS NOT NULL` | `CallTypedExpr` (is_null / not(is_null)) |
-| `IN` | Chain of eq + or |
-| `BETWEEN` | gte + lte + and |
-
-### Aggregate Functions
-
-COUNT, SUM, AVG, MIN, MAX (with DISTINCT support)
-
-## Configuration
-
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `plugins.velox.enabled` | `true` | Enable/disable the OLAP plugin |
-| `plugins.velox.memory_limit_bytes` | `4294967296` (4 GB) | Velox engine memory limit |
-| `plugins.velox.num_threads` | `4` | Velox execution threads |
-| `plugins.velox.mpp_enabled` | `false` | Enable MPP join strategies (broadcast + hash shuffle). When false, joins use coordinator-centric execution. **Dynamic** — can be toggled at runtime via cluster settings API. |
-| `plugins.velox.broadcast_max_shards` | `2` | Max primary shard count for the smaller join side to qualify for broadcast join (MPP only). **Dynamic.** |
-| `plugins.velox.shuffle_partitions` | `0` | Number of hash shuffle partitions. 0 = auto (uses number of data nodes). **Dynamic.** |
-| `plugins.velox.segment_parallelism` | `4` | Number of parallel threads for reading Lucene segments within a shard. Set to 1 to disable. **Dynamic.** |
-| `plugins.velox.task_max_retries` | `2` | Max retry attempts per failed task. Retries use replica shards on different nodes when available. Set to 0 to disable. **Dynamic.** |
-| `plugins.velox.runtime_filter_enabled` | `true` | Enable runtime filter pushdown for broadcast joins. Extracts build-side join key values and pushes as a Lucene `TermInSetQuery` / `PointInSetQuery` (TERMS) or `BloomFilterQuery` (BLOOM) to the probe scan. **Dynamic.** |
-| `plugins.velox.runtime_filter_max_cardinality` | `10000` | Max distinct values for TERMS runtime filter. If build-side cardinality exceeds this, BLOOM is tried (subject to bloom cap below), or RF is skipped. **Dynamic.** |
-| `plugins.velox.runtime_filter_bloom_enabled` | `true` | Enable BLOOM variant of runtime filter for high-cardinality join keys (above the TERMS cap). Applied as a Lucene `BloomFilterQuery` — walks doc values and skips docs that fail `bloom.mightContain`. **Dynamic.** |
-| `plugins.velox.runtime_filter_bloom_max_cardinality` | `10000000` | Max distinct values for BLOOM runtime filter. Beyond this cap, RF is skipped entirely. Also used as `expectedInsertions` for sizing partial blooms in two-stage mode. **Dynamic.** |
-| `plugins.velox.runtime_filter_bloom_two_stage` | `true` | Two-stage BLOOM build: each data node builds a PARTIAL bloom over local shards, coordinator merges via bitwise-OR into a FINAL bloom. Identical `expectedInsertions` across partials guarantees bit alignment. When false, coordinator rebuilds the bloom from broadcast build rows. **Dynamic.** |
-| `plugins.velox.cbo_statistics_mode` | `RUNTIME` | CBO statistics mode. `RUNTIME` collects row counts from IndicesStatsResponse before optimization for accurate build side selection. `NONE` skips (uses shard-count heuristic). **Dynamic.** |
-| `plugins.velox.co_routing_enabled` | `false` | Enable Co-Routing join optimization. Binary equi-joins between registered co-routed pairs run shard-local with zero shuffle. Requires `mpp_enabled=true`. See the [Co-Routing](#co-routing-joins) section. **Dynamic.** |
-| `plugins.velox.co_routed_pairs` | `[]` | List of co-routed index pairs. Each entry is `"<indexA>:<keyA>,<indexB>:<keyB>"` — a user assertion that both indexes share `_routing` on the listed key and have identical `number_of_shards`. Joins matching a registered pair (in either order) are eligible for Co-Routing. **Dynamic.** |
-
-### Backpressure / memory bounds
-
-All allocator and buffer caps are dynamic. See [Backpressure](#backpressure) below for what each bound protects.
-
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `plugins.velox.per_fragment_arrow_bytes` | `256mb` | Hard cap on the Arrow allocator feeding Velox on data nodes. Soft watermark gates the feeder before each Arrow batch. **Dynamic.** |
-| `plugins.velox.result_allocator_bytes` | `512mb` | Hard cap on the Arrow allocator used by `VeloxExecutor` to serialize results. **Dynamic.** |
-| `plugins.velox.max_result_bytes` | `1gb` | Max serialized size of a single fragment result (Arrow IPC or Velox native). Overflow → `ResultTooLargeException` (non-retryable). **Dynamic.** |
-| `plugins.velox.coordinator_allocator_bytes` | `1gb` | Hard cap on coordinator-side Arrow allocators (FINAL-agg feed, broadcast build, partial-result deserialization). **Dynamic.** |
-| `plugins.velox.coordinator_queue_bytes` | `256mb` | Soft watermark for the FINAL-aggregation feed queue on the coordinator. Feeders park until drained. **Dynamic.** |
-| `plugins.velox.coordinator_inflight_bytes` | `2gb` | Aggregate cap across all fragment responses for a single query. Overflow → query fails fast with `ResultTooLargeException`. **Dynamic.** |
-| `plugins.velox.shuffle_buffer_bytes` | `512mb` | Per-partition shuffle buffer cap. Sends over the cap receive `backpressure=true`; sender exponentially backs off and retries (5 attempts). **Dynamic.** |
-| `plugins.velox.backpressure_wait_ms` | `30000` | Max time a producer will wait on the soft-watermark gate before giving up with `BackpressureTimeoutException` (retryable transient). **Dynamic.** |
-| `plugins.velox.backpressure_watermark_pct` | `80` | Soft watermark as a percentage of the matching hard cap. Values below 100 give headroom between "pause producer" and "fail". **Dynamic.** |
-
-## Dependencies
-
-| Dependency | Version | Scope | Purpose |
-|-----------|---------|-------|---------|
-| OpenSearch | 3.6.0 | compileOnly | Host platform |
-| opensearch-sql | 3.6.0.0 | compileOnly + runtime (extended plugin) | SQL/PPL parsing, `ExecutionEngine` interface, Calcite |
-| Apache Calcite | 1.41.0 | compileOnly | Plan conversion — provided by SQL plugin at runtime |
-| Apache Arrow | 18.1.0 | implementation | `arrow-vector`, `arrow-memory-core`, `arrow-c-data`, `arrow-format` + `arrow-memory-unsafe` (runtime) |
-| flatbuffers-java | 24.3.25 | implementation | Required by `arrow-c-data` (not pulled transitively) |
-| velox4j | 0.1.0 | compileOnly + repackaged runtime | JNI bridge to Velox C++ engine |
-
-### Jar Hell Avoidance
-
-The OLAP plugin extends the SQL plugin's classloader (`extendedPlugins = ['opensearch-sql']`). To avoid duplicate class errors:
-
-- **Calcite** is `compileOnly` — already bundled by the SQL plugin
-- **velox4j** is repackaged at build time (`repackageVelox4j` task) to strip `javax.annotation` and `org.slf4j` classes that conflict with the SQL plugin's `jsr305` jar
-- **jsr305** is excluded globally via `configurations.all`
-- **Arrow memory**: Uses `arrow-memory-unsafe` instead of `arrow-memory-netty` — OpenSearch's Netty is in the system classloader and invisible to plugin classloaders
-
-## Building
+## Build
 
 ```bash
-# Full build (requires at least one test class)
+# Full build (compile + test + checks)
 ./gradlew build
 
 # Assemble only (skip tests)
 ./gradlew assemble
-```
 
-The plugin ZIP will be generated at `build/distributions/opensearch-olap-3.6.0-SNAPSHOT.zip`.
-
-## Testing
-
-### Unit Tests
-
-```bash
-# Run unit tests
-./gradlew test
-
-# Run unit tests with coverage verification (fails if below 50%)
-./gradlew test jacocoTestCoverageVerification
-
-# Auto-fix import ordering / formatting
+# Auto-format after Java code changes
 ./gradlew spotlessApply
+
+# Fast pre-commit check (~45s): spotlessCheck + jacoco + unit tests, no cluster
+./gradlew build -x integTest
 ```
 
-Coverage reports are generated at `build/reports/jacoco/test/html/index.html`. Classes that require Velox native libraries or full OpenSearch runtime (e.g., `VeloxExecutor`, `VeloxExecutionEngine`, `QueryScheduler`) are excluded from coverage verification since they cannot be unit tested without the C++ runtime.
+The plugin ZIP lands at `build/distributions/opensearch-olap-3.7.0-SNAPSHOT.zip`.
 
-### Integration Tests
+**Integration tests** (`./gradlew integTest`) spin up a managed single-node cluster with job-scheduler, SQL, and OLAP plugins installed. Takes ~1–2 minutes including Velox engine init.
 
-Integration tests run against a real single-node OpenSearch cluster with the job-scheduler, SQL, and OLAP plugins installed. The cluster is managed by Gradle's `testClusters` infrastructure — it starts automatically, waits for Velox engine initialization (~30-40s), runs the tests, and shuts down.
-
-```bash
-./gradlew integTest
-```
-
-Test sources live in `src/integTest/java/`. The base class `OlapRestTestCase` provides helpers for creating test indices, executing PPL queries, and asserting results via the OpenSearch REST API.
-
-Test suites (107 integration tests total):
-- **AggregationIT** (9 tests) — distributed aggregation (count, sum, avg, min/max by group) + plan explain
-- **JoinIT** (10 tests) — coordinator-centric joins (inner, left, with filter/agg/limit) + plan explain
-- **PredicatePushdownIT** (19 tests) — Lucene predicate pushdown (equality, range, compound)
-- **MppJoinIT** (14 tests) — broadcast + hash shuffle joins with `mpp_enabled=true`
-- **RuntimeFilterIT** (10 tests) — RF enabled/disabled, join types, cardinality threshold
-- **TopNIT** (9 tests) — two-stage sort+limit correctness + plan explain
-- **WindowFunctionIT** (6 tests) — eventstats count/max/sum + plan explain
-- **FaultToleranceIT** (11 tests) — retries enabled/disabled, fault injection
-- **ParallelReadIT** (6 tests) — segment-level parallel vs sequential consistency
-- **PlanExplainIT** (7 tests) — plan structure verification via explain command
-- **CboStatisticsIT** (4 tests) — CBO join, comparison, aggregation, logging
-
-**Note:** Integration tests require the Velox native libraries (`libvelox.so`) to be compatible with the host OS. The Maven-published `velox4j` jar bundles libraries built on CentOS 7. If the host is incompatible, Velox will fail to initialize and the OLAP plugin will disable itself — queries will fall back to the default SQL engine and the tests will fail. See [Multi-Node Testing (Docker)](#multi-node-testing-docker) for an alternative.
-
-## Query Profiling
-
-The OLAP plugin plugs into the SQL plugin's PPL `profile=true` flow (see the SQL plugin's [endpoint docs](../search-plugins-sql/docs/user/ppl/interfaces/endpoint.md#profile-experimental)). When the profile flag is set, each data node records per-task Lucene scan counters and the coordinator assembles them into a plan tree under `profile.plan`. The main use case is answering "did my runtime filter actually narrow the Lucene scan?" — without profiling, the only visible signal is total query latency.
-
-### Enable profiling for a query
-
-```bash
-curl -sS -H 'Content-Type: application/json' \
-  -X POST localhost:9200/_plugins/_ppl \
-  -d '{
-        "profile": true,
-        "query": "source = employees | inner join left=e right=d ON e.dept_id = d.dept_id departments | fields e.name, d.dept_name"
-      }'
-```
-
-### Profile output
-
-The standard SQL-plugin `profile` block (see `summary` + `phases`) is augmented with a plan subtree reflecting Velox/OLAP execution:
-
-```json
-"profile": {
-  "summary": {"total_time_ms": 412.0},
-  "phases": {"analyze": {...}, "optimize": {...}, "execute": {...}, "format": {...}},
-  "plan": {
-    "node": "VeloxQuery rf=BLOOM bloomBytes=512 docsRead=20000 docsMatched=240 rows=120",
-    "time_ms": 380.0,
-    "rows": 0,
-    "children": [
-      {
-        "node": "Fragment[0] rf=NONE docsRead=0 docsMatched=0 rows=3 (2 tasks)",
-        "time_ms": 25.0,
-        "children": [
-          {"node": "Task frag=0 part=0 node=data-1 rf=NONE docsRead=0 docsMatched=0 rows=2", "time_ms": 12.0},
-          {"node": "Task frag=0 part=1 node=data-2 rf=NONE docsRead=0 docsMatched=0 rows=1", "time_ms": 13.0}
-        ]
-      },
-      {
-        "node": "Fragment[1] rf=BLOOM docsRead=20000 docsMatched=240 rows=120 (2 tasks)",
-        "time_ms": 355.0,
-        "children": [
-          {"node": "Task frag=1 part=0 node=data-1 rf=BLOOM docsRead=10000 docsMatched=120 rows=60", "time_ms": 180.0},
-          {"node": "Task frag=1 part=1 node=data-2 rf=BLOOM docsRead=10000 docsMatched=120 rows=60", "time_ms": 175.0}
-        ]
-      }
-    ]
-  }
-}
-```
-
-**Counter meanings (probe-side leaf tasks only):**
-- `docsRead` — number of live docs the Lucene scorer iterated over. This is the universe the runtime filter acted on.
-- `docsMatched` — number of docs the scorer admitted and emitted into the Arrow bridge.
-- `rows` — rows emitted by the Velox fragment's final operator (may differ from `docsMatched` due to joins/aggregations).
-- `rf` — runtime filter kind applied on this task (`NONE` / `TERMS` / `BLOOM`).
-- `peakArrowBytes` (only shown when > 0) — peak Java-side Arrow allocator memory during the task. Useful for right-sizing `per_fragment_arrow_bytes`.
-- `backpressureWaitNanos` (only shown when > 0) — total time this task's feeder was parked waiting for the downstream allocator to drain. A non-zero value means a bound was engaged; sustained values across tasks indicate the caps are tight for the workload.
-- `resultBytes` (only shown when > 0) — serialized result size produced by this task. Compare against `max_result_bytes`.
-- `shuffleRejectCount` (only shown when > 0) — number of times a shuffle send was rejected with backpressure and retried.
-
-The gap between `docsRead` and `docsMatched` is the observable effect of the runtime filter at the Lucene level. Tasks with `rf=NONE` (e.g., build-side leaves, coordinator stages) naturally report `docsRead=0` when they don't read from Lucene.
-
-### Verifying BLOOM runtime filter effectiveness
-
-Run the same query twice, once baseline and once with BLOOM forced, then diff `docsMatched` for the probe-side tasks:
-
-```bash
-# Baseline: no runtime filter
-curl -sS ... -d '{"persistent":{"plugins.velox.runtime_filter_enabled": false}}'  # PUT _cluster/settings
-# Run query with profile=true, note baseline docsMatched
-
-# Force BLOOM: set TERMS cap below build-side cardinality so BLOOM kicks in
-curl -sS ... -d '{"persistent":{
-  "plugins.velox.runtime_filter_enabled": true,
-  "plugins.velox.runtime_filter_bloom_enabled": true,
-  "plugins.velox.runtime_filter_max_cardinality": "1",
-  "plugins.velox.runtime_filter_bloom_max_cardinality": "100000"
-}}'
-# Re-run same query with profile=true, compare docsMatched — should be lower
-```
-
-If the BLOOM run's `docsMatched` sum is lower than the baseline, the Lucene pushdown is active. If it matches baseline, BLOOM either wasn't applied (check the root node's `rf=` suffix) or the filter isn't selective for your data.
-
-### Notes
-
-- Profiling is only emitted for successful queries (same as the SQL plugin's profile).
-- Per-fragment `time_ms` is the **sum** of task times, not wall-clock — parallelism across tasks is not subtracted out. This matches the SQL plugin's convention where child times may exceed the parent.
-- Profiling adds a per-task wire-format trailer (~60 bytes) and skips all counter work when `profile=true` is absent from the request, so the overhead is negligible for non-profiled queries.
-
-## Backpressure
-
-The plugin bounds memory at every producer/consumer boundary so a single heavy query cannot OOM the node. All knobs are dynamic — tune them without a restart. See the [Backpressure / memory bounds](#backpressure--memory-bounds) config table for the full list.
-
-**Boundaries and what they protect**:
-
-| Where | Setting | What happens when full |
-|---|---|---|
-| Data-node feeder (Lucene → Arrow → Velox) | `per_fragment_arrow_bytes` | Feeder parks on soft watermark; if still over after `backpressure_wait_ms`, fragment fails `RETRYABLE_TRANSIENT` |
-| Data-node result serialization | `result_allocator_bytes`, `max_result_bytes` | Oversized single result → `ResultTooLargeException` (non-retryable — the user query needs to reduce its output) |
-| Coordinator FINAL aggregation | `coordinator_allocator_bytes`, `coordinator_queue_bytes` | Feeder parks on soft watermark until the FINAL agg drains |
-| Coordinator response accumulation | `coordinator_inflight_bytes` | Query-wide aggregate cap; crossing it cancels remaining fragments and fails the query |
-| Per-partition shuffle buffer | `shuffle_buffer_bytes` | Receiver rejects with `backpressure=true`; sender exponentially backs off (100ms → 3.2s, 5 retries) |
-
-**How to tell if a query is hitting backpressure**:
-
-Run the query with `"profile": true` and look for non-zero `backpressureWaitNanos` or `shuffleRejectCount` in the profile tree. If you see them, the node was healthy but the caps were tight. If a query fails with `ResultTooLargeException`, the cap was exceeded — either raise `max_result_bytes`/`coordinator_inflight_bytes` or narrow the query.
-
-**Example: shrink the feeder cap to test backpressure**:
-
-```bash
-curl -sS -H 'Content-Type: application/json' -X PUT localhost:9200/_cluster/settings -d '{
-  "persistent": {
-    "plugins.velox.per_fragment_arrow_bytes": "32mb",
-    "plugins.velox.backpressure_watermark_pct": 50
-  }
-}'
-# Run a large aggregation with profile=true — backpressureWaitNanos will be > 0
-# on tasks where the feeder had to pause.
-```
-
-**Design intent**:
-- Hard caps trigger *typed exceptions*, not OOM. The error classifier routes them to `RETRYABLE_TRANSIENT` (temporary pressure — retry) or `RESOURCE_EXCEEDED` (user-query-too-large — don't retry).
-- Transport handlers never block. Shuffle backpressure is propagated via a response flag; the sender retries. Blocking transport threads would starve OpenSearch itself.
-- Defaults are conservative. For heap-constrained deployments, scale all `*_bytes` settings down in proportion; for large fanout, raise `coordinator_inflight_bytes` toward `num_fragments × max_result_bytes`.
-
-## Co-Routing Joins
-
-When two indexes are indexed with the same `_routing` field and have identical `number_of_shards`, OpenSearch places rows with the same routing key on the same shard of both indexes. Co-Routing takes advantage of this: the join runs **shard-local on each node with zero shuffle and zero broadcast**. For large-table joins on co-located data this strictly dominates `BROADCAST` and `HASH_SHUFFLE`.
-
-**Enable it** (requires `mpp_enabled=true`):
-
-```bash
-curl -sS -H 'Content-Type: application/json' -X PUT localhost:9200/_cluster/settings -d '{
-  "persistent": {
-    "plugins.velox.mpp_enabled": true,
-    "plugins.velox.co_routing_enabled": true,
-    "plugins.velox.co_routed_pairs": [
-      "orders:customer_id,customers:customer_id",
-      "events:user_id,profiles:user_id"
-    ]
-  }
-}'
-```
-
-Each pair in `co_routed_pairs` is the user's explicit assertion that both indexes were indexed with `_routing` equal to the listed key field and share `number_of_shards`. A `customer_id` join between the two indexes then runs shard-local:
-
-```
-  Node A                                  Node B
-  orders shard 0 ⋈ customers shard 0      orders shard 1 ⋈ customers shard 1
-```
-
-**How the plan decides**:
-1. The query is a binary equi-join on a single key per side.
-2. `co_routing_enabled=true` and the `(leftIdx, leftKey, rightIdx, rightKey)` tuple is registered (either order).
-3. `number_of_shards` on both indexes matches.
-4. Shard alignment exists — for every shard index *i*, some node hosts active copies of both left[*i*] and right[*i*] (primary or replica).
-
-All four must hold or the plan falls back to `BROADCAST`/`HASH_SHUFFLE`/`COORDINATOR_CENTRIC`. Falls are logged at `INFO` level.
-
-**Safety note** — the plugin does not try to discover co-location from index mappings; `_routing` is supplied at index time and mappings don't declare it. The `co_routed_pairs` setting is therefore load-bearing: register a pair whose indexes were not actually co-routed and you get incorrect results. Only register pairs you control the indexing pipeline for.
-
-**Current scope (Phase A)**: binary joins only, single-column equi-join, routing partition size 1. Multi-way co-routed joins, distribution-trait-driven planning, and routing-partition-size > 1 are deferred to Phase B.
-
-## Installation
+## Install
 
 The OLAP plugin requires the SQL plugin to be installed first:
 
 ```bash
-# Install SQL plugin
 bin/opensearch-plugin install opensearch-sql
-
-# Install OLAP plugin
-bin/opensearch-plugin install file:///path/to/opensearch-olap-3.6.0-SNAPSHOT.zip
+bin/opensearch-plugin install file:///path/to/opensearch-olap-3.7.0-SNAPSHOT.zip
 ```
 
-On platforms without Velox native library support (e.g. macOS/aarch64), the plugin will start but disable itself:
+On platforms without Velox native-library support (e.g. macOS/aarch64), the plugin will start but disable itself:
+
 ```
 [WARN] Velox engine unavailable on this platform, OLAP plugin will be disabled
 ```
 
-All queries will fall back to the default OpenSearch execution engine.
+All queries then fall back to the default OpenSearch execution engine.
 
-## Manual Testing
+## Configuration
 
-### Prerequisites
+The plugin exposes ~30 settings under the `plugins.velox.` namespace (engine tuning, MPP toggles, runtime filters, CBO, Co-Routing pair registration, backpressure / memory bounds). Most are **dynamic** — apply at runtime via `PUT /_cluster/settings`.
 
-- OpenSearch 3.6.0-SNAPSHOT built locally (e.g. at `../OpenSearch/build/distribution/local/opensearch-3.6.0-SNAPSHOT`)
-- SQL plugin installed
-- OLAP plugin built and installed (see [Building](#building) and [Installation](#installation))
+See [`docs/configuration.md`](docs/configuration.md) for the full settings reference, including the Co-Routing registration example and safety note, and the backpressure/memory tuning table.
 
-### Single-Node Testing
+## Run / Manual Testing
 
-#### 1. Start OpenSearch
+Hands-on walkthroughs for single-node, multi-node, and Docker setups live in [`docs/running.md`](docs/running.md).
+
+Quick smoke test once the plugin is installed:
 
 ```bash
-cd ../OpenSearch/build/distribution/local/opensearch-3.6.0-SNAPSHOT
+# Start OpenSearch and wait for Velox init
 bin/opensearch -d -p /tmp/opensearch.pid
-```
+grep "Velox engine initialized successfully" logs/opensearch.log
 
-Wait for startup and verify Velox initialized:
-
-```bash
-# Wait until OpenSearch is ready
-curl -s http://localhost:9200
-
-# Check Velox engine status in logs
-grep "Velox engine" logs/opensearch.log | tail -1
-# Expected: Velox engine initialized successfully
-```
-
-#### 2. Create test index and insert data
-
-```bash
-# Create index with typed mappings
-curl -s -X PUT "http://localhost:9200/test_olap" \
-  -H "Content-Type: application/json" \
-  -d '{
-  "mappings": {
-    "properties": {
-      "name": {"type": "keyword"},
-      "age": {"type": "integer"},
-      "city": {"type": "keyword"},
-      "salary": {"type": "double"}
-    }
-  }
+# Create a tiny index and run an aggregation through Velox
+curl -s -X PUT "http://localhost:9200/test_olap" -H "Content-Type: application/json" -d '{
+  "mappings": {"properties": {"city": {"type": "keyword"}, "age": {"type": "integer"}}}
 }'
+curl -s -X POST "http://localhost:9200/test_olap/_doc?refresh=true" -H "Content-Type: application/json" -d '{"city":"Seattle","age":35}'
+curl -s -X POST "http://localhost:9200/_plugins/_ppl" -H "Content-Type: application/json" -d '{"query": "source=test_olap | stats count() by city"}'
 
-# Insert sample data
-curl -s -X POST "http://localhost:9200/test_olap/_doc" -H "Content-Type: application/json" -d '{"name":"Alice","age":35,"city":"Seattle","salary":120000}'
-curl -s -X POST "http://localhost:9200/test_olap/_doc" -H "Content-Type: application/json" -d '{"name":"Bob","age":28,"city":"Portland","salary":95000}'
-curl -s -X POST "http://localhost:9200/test_olap/_doc" -H "Content-Type: application/json" -d '{"name":"Charlie","age":42,"city":"Seattle","salary":150000}'
-curl -s -X POST "http://localhost:9200/test_olap/_doc" -H "Content-Type: application/json" -d '{"name":"Diana","age":31,"city":"Denver","salary":110000}'
-curl -s -X POST "http://localhost:9200/test_olap/_doc" -H "Content-Type: application/json" -d '{"name":"Eve","age":26,"city":"Portland","salary":88000}'
-
-# Verify data
-curl -s "http://localhost:9200/test_olap/_count"
-# Expected: {"count":5, ...}
+# Confirm Velox handled it
+grep "Executing query.*Velox engine" logs/opensearch.log | tail -1
 ```
 
-#### 3. Run queries through Velox
+If you see the `Executing query <id> via Velox engine` log line, the plugin is active. See [`docs/running.md`](docs/running.md) for the full single-node workflow (index creation, join queries, log verification, reinstall-after-build), the two-node cluster setup, and the CentOS 7 Docker recipe for hosts whose Velox native libraries aren't compatible.
+
+## Troubleshooting
+
+**Is a query being vectorized?** Run it with `{"profile": true}`:
 
 ```bash
-# Aggregation - count by city
-curl -s -X POST "http://localhost:9200/_plugins/_ppl" \
-  -H "Content-Type: application/json" \
-  -d '{"query": "source=test_olap | stats count() by city"}'
-
-# Aggregation - avg salary by city
-curl -s -X POST "http://localhost:9200/_plugins/_ppl" \
-  -H "Content-Type: application/json" \
-  -d '{"query": "source=test_olap | stats avg(salary) by city"}'
-
-# Aggregation - sum and count (no group by)
-curl -s -X POST "http://localhost:9200/_plugins/_ppl" \
-  -H "Content-Type: application/json" \
-  -d '{"query": "source=test_olap | stats sum(age), count()"}'
-
-# SQL query (same delegation path)
-curl -s -X POST "http://localhost:9200/_plugins/_sql" \
-  -H "Content-Type: application/json" \
-  -d '{"query": "SELECT city, COUNT(*) FROM test_olap GROUP BY city"}'
-```
-
-#### 3b. Run join queries (requires two indices)
-
-```bash
-# Create a departments index
-curl -s -X PUT "http://localhost:9200/departments" \
-  -H "Content-Type: application/json" \
-  -d '{"mappings": {"properties": {"dept_id": {"type": "integer"}, "dept_name": {"type": "keyword"}}}}'
-
-# Insert departments
-curl -s -X POST "http://localhost:9200/_bulk?refresh=true" \
-  -H "Content-Type: application/json" \
-  -d '{"index":{"_index":"departments"}}
-{"dept_id": 1, "dept_name": "Engineering"}
-{"index":{"_index":"departments"}}
-{"dept_id": 2, "dept_name": "Marketing"}
-'
-
-# Add dept_id to test_olap (recreate with dept_id field)
-# ... then run join queries:
-
-# Inner join using PPL
-curl -s -X POST "http://localhost:9200/_plugins/_ppl" \
-  -H "Content-Type: application/json" \
-  -d '{"query": "source = employees | inner join left=e right=d ON e.dept_id = d.dept_id departments | fields e.name, d.dept_name"}'
-
-# Join + aggregation
-curl -s -X POST "http://localhost:9200/_plugins/_ppl" \
-  -H "Content-Type: application/json" \
-  -d '{"query": "source = employees | inner join left=e right=d ON e.dept_id = d.dept_id departments | stats count() by d.dept_name"}'
-```
-
-#### 4. Verify OLAP plugin handled the query
-
-Check logs for the Velox execution path:
-
-```bash
-grep -E "Routing query to extension|Executing query.*Velox|Executing fragment|Dispatching stage|Cannot vectorize" logs/opensearch.log | tail -10
-```
-
-Expected log sequence when query is handled by Velox:
-```
-[o.o.s.e.DelegatingExecutionEngine] Routing query to extension engine : VectorizedEngineExtension
-[o.o.p.o.e.VeloxExecutionEngine]    Executing query <id> via Velox engine
-[o.o.p.o.s.QueryScheduler]          Dispatching stage <id> with 1 tasks
-[o.o.p.o.t.TransportExecuteFragmentAction] Executing fragment 0 for query <id> on 1 shards
-```
-
-If the query falls back to the default engine, you will see:
-```
-[o.o.p.o.e.VectorizedEngineExtension] Cannot vectorize plan: unsupported node [<class>] in <plan>
-```
-
-If no OLAP plugin log appears at all, `canVectorize()` returned `false` because Velox is unavailable — check for `Velox engine unavailable` at startup.
-
-#### 5. Enable debug logging (optional)
-
-```bash
-curl -s -X PUT "http://localhost:9200/_cluster/settings" \
-  -H "Content-Type: application/json" \
-  -d '{"transient": {"logger.org.opensearch.plugin.olap": "DEBUG"}}'
-```
-
-#### 6. Reinstall after code changes
-
-```bash
-# Stop OpenSearch
-kill $(cat /tmp/opensearch.pid)
-
-# Rebuild
-cd /path/to/opensearch-olap
-./gradlew assemble
-
-# Reinstall
-cd ../OpenSearch/build/distribution/local/opensearch-3.6.0-SNAPSHOT
-bin/opensearch-plugin remove opensearch-olap
-bin/opensearch-plugin install file:///absolute/path/to/opensearch-olap/build/distributions/opensearch-olap-3.6.0-SNAPSHOT.zip
-
-# Restart
-bin/opensearch -d -p /tmp/opensearch.pid
-```
-
-### Multi-Node Testing
-
-Tests distributed execution where fragments are dispatched to remote data nodes via TransportService.
-
-#### 1. Set up a 2-node local cluster
-
-Copy the existing build to create a second node:
-
-```bash
-BASE=../OpenSearch/build/distribution/local
-cp -r "$BASE/opensearch-3.6.0-SNAPSHOT" "$BASE/opensearch-node2"
-```
-
-Configure node 1 (`$BASE/opensearch-3.6.0-SNAPSHOT/config/opensearch.yml`):
-
-```yaml
-cluster.name: olap-test-cluster
-node.name: node-1
-network.host: 127.0.0.1
-http.port: 9200
-transport.port: 9300
-discovery.seed_hosts: ["127.0.0.1:9300", "127.0.0.1:9301"]
-cluster.initial_cluster_manager_nodes: ["node-1", "node-2"]
-```
-
-Configure node 2 (`$BASE/opensearch-node2/config/opensearch.yml`):
-
-```yaml
-cluster.name: olap-test-cluster
-node.name: node-2
-network.host: 127.0.0.1
-http.port: 9201
-transport.port: 9301
-discovery.seed_hosts: ["127.0.0.1:9300", "127.0.0.1:9301"]
-cluster.initial_cluster_manager_nodes: ["node-1", "node-2"]
-```
-
-Clean old data from both nodes (important if they previously ran as single-node):
-
-```bash
-rm -rf $BASE/opensearch-3.6.0-SNAPSHOT/data/*
-rm -rf $BASE/opensearch-node2/data/*
-rm -rf /tmp/opensearch-*
-```
-
-#### 2. Start both nodes
-
-```bash
-cd $BASE/opensearch-3.6.0-SNAPSHOT && bin/opensearch -d -p /tmp/opensearch-node1.pid
-cd $BASE/opensearch-node2 && bin/opensearch -d -p /tmp/opensearch-node2.pid
-```
-
-Wait for the cluster to form and verify both nodes joined:
-
-```bash
-curl -s "http://localhost:9200/_cat/nodes?v"
-```
-
-Expected output (2 nodes):
-```
-ip        heap.percent ram.percent cpu node.role cluster_manager name
-127.0.0.1           14          92   5 dimr      *               node-1
-127.0.0.1           13          92   5 dimr      -               node-2
-```
-
-#### 3. Create test index with multiple shards
-
-Use 2 shards and 0 replicas so each shard goes to a different node:
-
-```bash
-curl -s -X PUT "http://localhost:9200/test_olap" \
-  -H "Content-Type: application/json" \
-  -d '{
-  "settings": {"number_of_shards": 2, "number_of_replicas": 0},
-  "mappings": {
-    "properties": {
-      "name": {"type": "keyword"},
-      "age": {"type": "integer"},
-      "city": {"type": "keyword"},
-      "salary": {"type": "double"}
-    }
-  }
+curl -sS -H 'Content-Type: application/json' -X POST localhost:9200/_plugins/_ppl -d '{
+  "profile": true,
+  "query": "source=test_olap | stats count() by city"
 }'
-
-# Insert sample data
-curl -s -X POST "http://localhost:9200/test_olap/_doc" -H "Content-Type: application/json" -d '{"name":"Alice","age":35,"city":"Seattle","salary":120000}'
-curl -s -X POST "http://localhost:9200/test_olap/_doc" -H "Content-Type: application/json" -d '{"name":"Bob","age":28,"city":"Portland","salary":95000}'
-curl -s -X POST "http://localhost:9200/test_olap/_doc" -H "Content-Type: application/json" -d '{"name":"Charlie","age":42,"city":"Seattle","salary":150000}'
-curl -s -X POST "http://localhost:9200/test_olap/_doc" -H "Content-Type: application/json" -d '{"name":"Diana","age":31,"city":"Denver","salary":110000}'
-curl -s -X POST "http://localhost:9200/test_olap/_doc" -H "Content-Type: application/json" -d '{"name":"Eve","age":26,"city":"Portland","salary":88000}'
-
-# Verify shards are distributed across both nodes
-curl -s "http://localhost:9200/_cat/shards/test_olap?v"
 ```
 
-Expected output (shards on different nodes):
+If `profile.plan.node` starts with `VeloxQuery`, the OLAP plugin handled the query. If `profile.plan` is absent or doesn't mention Velox, the query fell back to the default engine. The server log line `Cannot vectorize plan: unsupported node [<class>]` tells you which operator forced the fallback. See [`docs/architecture.md` §4.9](docs/architecture.md#49-query-profiling) for the full profile schema and counter meanings.
+
+**Is the Velox engine loaded?** Look for one of these at startup:
+
 ```
-index     shard prirep state   docs store ip        node
-test_olap 0     p      STARTED    3 5.1kb 127.0.0.1 node-2
-test_olap 1     p      STARTED    2 4.9kb 127.0.0.1 node-1
-```
-
-#### 4. Run distributed queries
-
-```bash
-# Aggregation - count by city (distributed across both nodes)
-curl -s -X POST "http://localhost:9200/_plugins/_ppl" \
-  -H "Content-Type: application/json" \
-  -d '{"query": "source=test_olap | stats count() by city"}'
-
-# Aggregation - avg salary by city
-curl -s -X POST "http://localhost:9200/_plugins/_ppl" \
-  -H "Content-Type: application/json" \
-  -d '{"query": "source=test_olap | stats avg(salary) by city"}'
+Velox engine initialized successfully                      # happy path
+Velox engine unavailable on this platform, OLAP plugin ... # native library not loadable
 ```
 
-Expected results:
-```json
-{"datarows": [[2,"Seattle"],[2,"Portland"],[1,"Denver"]], ...}
-{"datarows": [[135000.0,"Seattle"],[91500.0,"Portland"],[110000.0,"Denver"]], ...}
-```
+**Force fallback for a query**: the plugin respects `"force_vectorize=false"` set on the SQL plugin's query hint block; alternatively, unsupported plan shapes always fall back automatically.
 
-#### 5. Verify distributed execution in logs
+**Backpressure diagnosis**: if a query succeeds but feels slow, look for non-zero `backpressureWaitNanos` or `shuffleRejectCount` in the profile tree. If a query fails with `ResultTooLargeException`, raise `max_result_bytes` / `coordinator_inflight_bytes` or narrow the query. Settings live in [`docs/configuration.md`](docs/configuration.md#backpressure--memory-bounds); the design diagram lives in [`docs/architecture.md` §4.7](docs/architecture.md#47-backpressure-and-memory-bounds).
 
-Check that both nodes participated in query execution:
+**PPL function not supported?** See [`docs/velox-function-support.md`](docs/velox-function-support.md) for the full coverage matrix. Unsupported functions cause a per-query fallback; the plan is otherwise unchanged.
 
-```bash
-# Node 1 (coordinator): should show routing + scheduling + local fragment execution
-grep -E "Routing query|Dispatching stage|Executing fragment" \
-  $BASE/opensearch-3.6.0-SNAPSHOT/logs/olap-test-cluster.log | tail -5
+## Further Reading
 
-# Node 2 (remote data node): should show fragment execution
-grep -E "Executing fragment" \
-  $BASE/opensearch-node2/logs/olap-test-cluster.log | tail -5
-```
+- [`docs/configuration.md`](docs/configuration.md) — full settings reference for engine, MPP, runtime filters, CBO, Co-Routing, and backpressure / memory bounds.
+- [`docs/running.md`](docs/running.md) — single-node, multi-node, and Docker walkthroughs for running the plugin locally.
+- [`docs/architecture.md`](docs/architecture.md) — internal design: end-to-end query flow, plugin integration model, MPP, fragment dispatch, data-node pipeline, threading, backpressure internals, join column-name disambiguation, query profiling wire format, comparison with RFC #4812, project structure, supported-operator conversion tables.
+- [`docs/velox-function-support.md`](docs/velox-function-support.md) — PPL → Velox function coverage matrix.
+- [RFC #4812](https://github.com/opensearch-project/sql/issues/4812) — upstream design reference for the OLAP architecture.
 
-Expected: coordinator dispatches **2 tasks** (one per shard), each node executes a fragment:
-```
-[node-1] Dispatching stage <id> with 2 tasks
-[node-1] Executing fragment 0 for query <id> on 1 shards
-[node-2] Executing fragment 0 for query <id> on 1 shards
-```
+## Security
 
-Note: the log file is named `olap-test-cluster.log` (matching `cluster.name` in the config), not `opensearch.log`.
-
-#### 6. Stop the cluster
-
-```bash
-kill $(cat /tmp/opensearch-node1.pid) $(cat /tmp/opensearch-node2.pid)
-rm -rf /tmp/opensearch-*
-```
-
-### Multi-Node Testing (Docker)
-
-When the host platform cannot run the Velox native libraries (e.g., the `libvelox.so` in the Maven-published velox4j jar was built on CentOS 7), use a CentOS 7 Docker container to run the cluster. This ensures the native libraries are compatible with the runtime environment.
-
-#### 1. Build the OLAP plugin on the host
-
-```bash
-./gradlew clean assemble
-```
-
-#### 2. Start a CentOS 7 container with volume mounts
-
-```bash
-docker run --init -d --name olap-test \
-  -v /path/to/OpenSearch/build/distribution/local/opensearch-3.6.0-SNAPSHOT:/opensearch-src:ro \
-  -v /path/to/opensearch-olap/build/distributions:/olap-plugin:ro \
-  -v /path/to/search-plugins-sql/plugin/build/distributions:/sql-plugin:ro \
-  -v /path/to/job-scheduler/build/distributions:/job-scheduler-plugin:ro \
-  -p 9200:9200 -p 9201:9201 \
-  centos:7 sleep infinity
-```
-
-#### 3. Install Java and set up the cluster inside the container
-
-```bash
-docker exec olap-test bash -c '
-  # Fix CentOS 7 EOL mirrors
-  sed -i -e "s|mirrorlist=|#mirrorlist=|g" /etc/yum.repos.d/CentOS-*.repo
-  sed -i -e "s|#baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|g" /etc/yum.repos.d/CentOS-*.repo
-  yum install -y tar
-
-  # Install Amazon Corretto 21
-  rpm --import https://yum.corretto.aws/corretto.key
-  curl -sLo /etc/yum.repos.d/corretto.repo https://yum.corretto.aws/corretto.repo
-  yum install -y java-21-amazon-corretto-devel
-
-  # Copy OpenSearch for 2 nodes
-  cp -r /opensearch-src /opensearch-node1
-  cp -r /opensearch-src /opensearch-node2
-
-  # Install plugins on both nodes
-  for node in /opensearch-node1 /opensearch-node2; do
-    rm -rf "$node/plugins/opensearch-sql" "$node/plugins/opensearch-olap" \
-           "$node/plugins/opensearch-job-scheduler" "$node/data"
-    "$node/bin/opensearch-plugin" install -b file:///job-scheduler-plugin/opensearch-job-scheduler-3.6.0.0-SNAPSHOT.zip
-    "$node/bin/opensearch-plugin" install -b file:///sql-plugin/opensearch-sql-3.6.0.0-SNAPSHOT.zip
-    "$node/bin/opensearch-plugin" install -b file:///olap-plugin/opensearch-olap-3.6.0-SNAPSHOT.zip
-  done
-
-  # Configure node 1
-  cat > /opensearch-node1/config/opensearch.yml << EOF
-cluster.name: olap-test-cluster
-node.name: node-1
-network.host: 0.0.0.0
-http.port: 9200
-transport.port: 9300
-discovery.seed_hosts: ["127.0.0.1:9300", "127.0.0.1:9301"]
-cluster.initial_cluster_manager_nodes: ["node-1", "node-2"]
-EOF
-
-  # Configure node 2
-  cat > /opensearch-node2/config/opensearch.yml << EOF
-cluster.name: olap-test-cluster
-node.name: node-2
-network.host: 0.0.0.0
-http.port: 9201
-transport.port: 9301
-discovery.seed_hosts: ["127.0.0.1:9300", "127.0.0.1:9301"]
-cluster.initial_cluster_manager_nodes: ["node-1", "node-2"]
-EOF
-
-  # Create non-root user (OpenSearch refuses to run as root)
-  useradd -m opensearch
-  chown -R opensearch:opensearch /opensearch-node1 /opensearch-node2
-
-  # Start nodes with staggered timing
-  su opensearch -c "/opensearch-node1/bin/opensearch -d -p /tmp/node1.pid"
-  sleep 10
-  su opensearch -c "/opensearch-node2/bin/opensearch -d -p /tmp/node2.pid"
-'
-```
-
-#### 4. Wait for cluster and run queries
-
-```bash
-# Wait for both nodes
-curl -s "http://localhost:9200/_cat/nodes?v"
-
-# Create index, insert data, and run queries (same as local multi-node testing steps 3-4)
-```
-
-#### 5. Verified test results (2-node CentOS 7 Docker cluster)
-
-| Query | Result | Status |
-|-------|--------|--------|
-| `source=test_olap \| stats count() by city` | Seattle=2, Portland=2, Denver=1 | PASS |
-| `source=test_olap \| stats avg(salary) by city` | Seattle=135000, Portland=91500, Denver=110000 | PASS |
-| `source=test_olap \| stats sum(age), count()` | sum=162, count=5 | PASS |
-
-All queries executed as distributed PARTIAL+FINAL aggregation across 2 nodes with shards on different data nodes.
-
-#### 6. Clean up
-
-```bash
-docker rm -f olap-test
-```
-
-## SQL Plugin Changes Required
-
-The following changes are needed in the SQL plugin (`opensearch-sql`) for the OLAP plugin to work:
-
-1. **`ExecutionEngine.java`** — Added `default boolean canVectorize(RelNode plan)` returning `false`
-2. **`DelegatingExecutionEngine.java`** (new) — Wraps default engine + SPI extensions; routes to the first extension where `canVectorize()` returns `true`
-3. **`SQLPlugin.java`** — Implements `ExtensiblePlugin`, loads `ExecutionEngine` extensions via SPI
-4. **`OpenSearchPluginModule.java`** — Wraps the execution engine in `DelegatingExecutionEngine` when extensions are present
-
-`QueryService` is **not modified** — the delegation is transparent.
+If you discover a potential security issue in this project we ask that you notify OpenSearch Security directly via email to security@opensearch.org. Please do **not** create a public GitHub issue.
 
 ## License
 
