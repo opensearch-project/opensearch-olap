@@ -70,8 +70,8 @@ The SQL plugin side:
 SPI service file: `META-INF/services/org.opensearch.sql.executor.ExecutionEngine` → `VectorizedEngineExtension`
 
 ## Dependencies
-- OpenSearch 3.6.0-SNAPSHOT (compileOnly)
-- opensearch-sql 3.6.0.0-SNAPSHOT (extended plugin — classloader sees SQL plugin classes)
+- OpenSearch 3.7.0-SNAPSHOT (compileOnly)
+- opensearch-sql 3.7.0.0-SNAPSHOT (extended plugin — classloader sees SQL plugin classes)
   - `unified-query-core`, `unified-query-common`, `unified-query-opensearch` (compileOnly, transitive=false)
 - Apache Calcite 1.41.0 (compileOnly — provided by SQL plugin at runtime)
 - Apache Arrow 18.1.0 — `arrow-vector`, `arrow-memory-core`, `arrow-memory-unsafe`, `arrow-c-data`, `arrow-format`
