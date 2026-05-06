@@ -99,6 +99,9 @@ Integration test logs are at `build/testclusters/integTest-0/logs/integTest.log`
 
 **JDK 21 / JDK 25 compile classpath**: Project targets JDK 21 bytecode (`sourceCompatibility = VERSION_21`) but also compiles cleanly under JDK 25. JDK 25's javac is stricter about missing annotation class files — it fails hard where JDK 21 merely warned. Four `compileOnly` entries in `build.gradle` supply the annotations/helper classes referenced by Calcite/Arrow/SQL-plugin bytecode: `org.checkerframework:checker-qual`, `org.apiguardian:apiguardian-api`, `com.fasterxml.jackson.core:jackson-annotations`, `org.apache.calcite:calcite-linq4j`. If a new JDK version surfaces another `CompletionFailure: class file for X not found`, add that library as a `compileOnly` entry in the same block.
 
+**Benchmark triage**: after an `integTest` run, classify PASS/SKIP/FAIL from a suite XML with
+`python3 -c "c=open('build/test-results/integTest/TEST-<class>.xml').read(); print('cases=',c.count('<testcase'),'skip=',c.count('<skipped'),'fail=',c.count('<failure'))"`.
+
 ## Jar hell and classloader isolation
 OpenSearch plugins run in isolated classloaders that cannot see classes from OpenSearch core or other plugins (except declared `extendedPlugins`). This causes several dependency conflicts:
 
@@ -118,10 +121,13 @@ The SQL plugin uses custom Calcite RelNode subclasses, not always the standard `
 - **UDT types**: `ExprDateType`/`ExprTimeStampType`/`ExprTimeType` report `SqlTypeName.VARCHAR`. Check `instanceof AbstractExprRelDataType` and `getUdt()` in `VeloxTypeConverter` — `EXPR_TIMESTAMP → TimestampType`, `EXPR_DATE → DateType` (int32 days), `EXPR_TIME → BigIntType` (millis, no velox4j wrapper), `EXPR_IP`/`EXPR_BINARY → VarCharType`.
 - **Datetime coercion UDFs**: SQL plugin's `CoercionUtils` wraps both sides of comparisons between a datetime UDT column and a string literal in matching coercion UDFs — `@timestamp >= '2023-01-01 00:00:00'` becomes `timestamp(@timestamp) >= timestamp('2023-01-01 00:00:00')`, same pattern for `date()` and `time()`. Velox has no `timestamp(varchar)`/`date(varchar)`/`time(varchar)` scalar, so `DateTimeUdfRewriter` strips these at plan time. `timestamp(<TIMESTAMP>)`/`date(<DATE>)`/`time(<TIME>)` are identity strips; cross-type wrappers (e.g. `timestamp(<DATE>)`) are real casts and fall back via `canVectorize()`.
 - **Outer sort + system limit**: `QueryService.convertToCalcitePlan` wraps every plan in `LogicalSort(collation from input) → LogicalSystemLimit(fetch=query_size_limit)`. The outer Sort inherits the inner sort's collation; schema-reshaping operators below must rewrite/clear field-index references before this outer layer consumes them.
+- **RexLiteral.getValueAs(Long.class) on DECIMAL returns the *unscaled* long** (`0.5` → `5`), silently losing scale. To detect "is this literal an integer?", check `getValueAs(BigDecimal.class).scale() <= 0` first, fall back to `getValueAs(Long.class)` only for non-DECIMAL numerics. See `VeloxExprConverter.readSpanCount` for the pattern.
+- **PPL UDFs vs Calcite built-ins**: `EXTRACT` and `SPAN` are PPL's own UDFs (`SqlKind.OTHER_FUNCTION`, operator name `"EXTRACT"`/`"SPAN"`), not Calcite's `SqlStdOperatorTable.EXTRACT`/span. Detect by operator name, not SqlKind. `SpanUnit.getName()` returns short codes (`"m"`=minute, `"M"`=month — case-sensitive).
 
 ## velox4j integration details
 - **ExternalStream connector ID**: The connector is registered in velox4j's C++ init as `"connector-external-stream"` (not `"external_stream"`). The `ExternalStreamTableHandle` and `ExternalStreamConnectorSplit` must use this exact ID.
-- **Velox function names**: Velox uses Presto-style full names for comparison operators: `greaterthan`, `greaterthanorequal`, `lessthan`, `lessthanorequal`, `equalto`, `notequalto`. Not short forms like `gt`, `gte`, `lt`, `lte`, `eq`, `neq`.
+- **Velox function names**: Presto-style full names for comparisons: `greaterthan`, `greaterthanorequal`, `lessthan`, `lessthanorequal`, `equalto` (not `gt`/`gte`/`lt`/`lte`/`eq`). **No generic `notequalto`** — Spark registers it only for DECIMAL. `VeloxExprConverter` rewrites `SqlKind.NOT_EQUALS` to `not(equalto(a, b))` with binary-type coercion.
+- **Velox modulo is `mod`, not `modulus`**. No dialect registers `modulus`. `FUNCTION_MAP[SqlKind.MOD]` and `NAME_MAP["MOD"]`/`NAME_MAP["%"]` map to `"mod"`.
 - **ExternalStream split wiring**: `SerialTask.addSplit(planNodeId, split)` takes the **plan node ID** of the `TableScanNode` (not the connector ID). The `ExternalStreamConnectorSplit` takes `(connectorId, queueId)` where `queueId` is `BlockingQueue.id()`.
 - **Query construction**: A velox4j `Query` wraps `PlanNode` + `Config` + `ConnectorConfig`. The `ConnectorConfig` must register the connector ID with `ConnectorConfig.create(Map.of("connector-external-stream", Config.empty()))`. Plan serialization uses `Serde.toJson(query)` / `Serde.fromJson(json, Query.class)`.
 - **Calcite DECIMAL literals**: Calcite represents integer literals (e.g. `30`) as `DECIMAL` type with scale 0. Velox requires exact type match in expressions, so `VeloxExprConverter` must produce `IntegerValue`/`BigIntValue` (not `DoubleValue`) for zero-scale decimals.
@@ -129,6 +135,10 @@ The SQL plugin uses custom Calcite RelNode subclasses, not always the standard `
 - **PARTIAL/FINAL aggregation exchange**: Arrow IPC does NOT preserve Velox's intermediate accumulator state (e.g., avg's `{sum, count}`). The coordinator exchange must use Velox native serialization (`BaseVectors.serializeToBuf/deserializeFromBuf`) — added to velox4j as a custom extension. Without this, the FINAL aggregation hangs because it can't interpret Arrow-deserialized data as valid intermediate state.
 - **ExternalStream empty assignments**: `ExternalStreamConnector` enforces `columnHandles.empty()` in C++. `TableScanNode` for ExternalStream must have empty assignments list — the schema is defined solely by `outputType`.
 - **BlockingQueue API is minimal**: `ExternalStreams.BlockingQueue` exposes only `put(RowVector)` and `noMoreInput()` — no `size()`, no drain callback. `put()` blocks only *after* the RowVector has already been allocated, so it's a poor fit for bounding Java-side Arrow memory. For byte-level backpressure use `BufferAllocator.getAllocatedMemory()` as the gauge — Velox takes ownership via `fromArrowVectorSchemaRoot()`, so Java-side live bytes drop as Velox consumes. See `execution/Backpressure.java`.
+- **velox4j init order**: Presto first (`registerAllWindowFunctions()`), then Spark second with `overwrite=true` (`registerWindowFunctions("")`). For functions both dialects register, **Spark wins**: `row_number`/`rank`/`dense_rank` return INTEGER (not Presto's BIGINT). For scalar date-part functions (`year`, `month`, `minute`, …) Velox keeps BOTH physical signatures under one name — request Calcite's declared BIGINT and the resolver picks the right one (requesting INTEGER explicitly hits "Found incompatible return types").
+- **Velox integer divide truncates toward zero; integer `floor` is a no-op**. For bucketing (span, width_bucket-like): naive `floor(col/w)*w` mis-buckets negatives — emit `col - ((col mod w + w) mod w)` (Euclidean modulo) to preserve `floor` semantics across signs while staying in integer space. Also preserves BIGINT precision above 2^53 that would be lost via DOUBLE.
+- **No `TimeType` in velox4j Java bindings**. `ExprTimeType` maps to `BigIntType` (millis from midnight); can't emit `date_trunc(TIME)` from Java. Time spans fall back to default engine.
+- **`date_trunc('week')` anchors to Monday**; Unix epoch is Thursday. Don't use `from_unixtime(floor(to_unixtime(ts)/604800)*604800)` as a multi-week substitute — buckets drift by 3 days.
 - **velox4j source**: `../velox4j`
 
 ## Distributed aggregation execution flow
@@ -200,6 +210,8 @@ Uses Calcite's Convention + VolcanoPlanner, wired into `VeloxExecutionEngine.exe
 The SQL plugin's `CalciteLogicalIndexScan.register()` adds pushdown rules (`FilterIndexScanRule`, `AggregateIndexScanRule`, etc.) to whatever planner it's registered with. If the OLAP plugin reused the SQL plugin's planner, these rules would fire and fold operators into the scan — eliminating the LogicalAggregate/LogicalFilter that Velox needs.
 
 Solution: `PhysicalOptimizer` creates its own `VolcanoPlanner` + `RelOptCluster` and deep-copies the plan into it. `ClusterCopyShuttle` converts `CalciteLogicalIndexScan` → plain `LogicalTableScan` (stripping PushDownContext), so the pushdown rules are never registered. All logical operators remain in the plan tree. HepPlanner then runs: `FilterMergeRule`, `PROJECT_TO_LOGICAL_PROJECT_AND_WINDOW` (decomposes `LogicalProject(RexOver)` → `LogicalWindow` + `LogicalProject`), then join reorder rules. Finally the VolcanoPlanner runs with ConverterRules.
+
+**Hint cluster-copy trap**: the SQL plugin registers `AGG_ARGS` hint strategies on its own `RelOptCluster.HintStrategyTable` (for `bucket_nullable=false` and nested-agg bookkeeping). `ClusterCopyShuttle` creates a fresh cluster with an empty strategy table; when any Calcite rule inspects hints, `HintStrategyTable.canApply` asserts `"hint <name> must be present"`. Fix: strip hints in `visit(LogicalAggregate)` by passing `List.of()` to `LogicalAggregate.create`. Semantic effects (isNotNull filter) are already materialized upstream before we copy, so stripping is safe.
 
 ### Join reorder
 The SQL plugin produces left-deep join trees preserving the user's PPL pipe order (no reordering). The HepPlanner phase in `PhysicalOptimizer` now runs Calcite's join reorder pipeline:
@@ -278,7 +290,8 @@ Failure semantics:
 - **OpenSearch doc values types**: OpenSearch stores all numeric types as `SORTED_NUMERIC` (not `NUMERIC`) and keyword/text as `SORTED_SET` (not `SORTED`). `LuceneArrowReader.mapToDocValueType()` handles this.
 - **Arrow Text → String**: Arrow Utf8 vectors return `org.apache.arrow.vector.util.Text` objects. Must convert to `String` before passing to `ExprValueUtils.tupleValue()` in `VeloxExecutionEngine.readArrowIpcToExprValues()`.
 - **Velox temp dirs in /tmp**: Each Velox initialization creates ~490MB temp dir under `/tmp`. Multiple restarts or multi-node clusters on the same host can fill `/tmp` (tmpfs). Clean with `rm -rf /tmp/opensearch-*`.
-- **Big5IT @Ignore'd tests (33/58)**: unsupported PPL lowerings — `timestamp()` UDF on VARCHAR `@timestamp` comparisons, `map(VARCHAR,VARCHAR)` helper from PPL match(), `hint AGG_ARGS` for composite/date-histogram, `width_bucket`/`||`/`rex_extract`/`to_unixtime(BIGINT)` not registered in Velox, `row_number()` return-type mismatch (BIGINT vs INTEGER), `coalesce` with mixed VARCHAR/BIGINT operands. Each test's `@Ignore` reason documents the specific missing lowering.
+- **Big5IT @Ignore'd tests**: unsupported PPL lowerings — `map(VARCHAR,VARCHAR)` helper from PPL match(), `width_bucket`/`||`/`rex_extract`/`to_unixtime(BIGINT)` not registered in Velox, `coalesce` with mixed VARCHAR/BIGINT operands. `row_number()` / `hint AGG_ARGS` / `!=` / EXTRACT / SPAN were fixed and re-enabled. Each remaining test's `@Ignore` reason documents the specific missing lowering.
+- **ClickBench: 43/43 passing.** `PPLClickBenchIT` migrated to `ClickBenchIT` under `integTest`.
 
 ## Graceful degradation
 `VeloxLifecycleService` catches native library load failures and disables itself (logs a warning). This allows the plugin to install on unsupported platforms (e.g. macOS/aarch64) without crashing OpenSearch. `canVectorize()` returns `false` when Velox is unavailable.
@@ -286,12 +299,18 @@ Failure semantics:
 ## Installation
 ```bash
 bin/opensearch-plugin install opensearch-sql
-bin/opensearch-plugin install file:///path/to/opensearch-olap-3.6.0-SNAPSHOT.zip
+bin/opensearch-plugin install file:///path/to/opensearch-olap-3.7.0-SNAPSHOT.zip
 ```
 
 ## Design reference
 RFC 4812: https://github.com/opensearch-project/sql/issues/4812
 - Summary folder: `../RFC_4812`
+
+Plugin docs (under `docs/`):
+- `architecture.md` — internal design, MPP, fragment dispatch, backpressure internals, reference (project structure, operator conversion tables, dependencies, SQL-plugin changes).
+- `configuration.md` — full settings reference.
+- `running.md` — single-node / multi-node / Docker walkthroughs.
+- `velox-function-support.md` — PPL → Velox function coverage matrix.
 
 ## API reference repositories
 All repositories are siblings under the same parent directory (`../`):
