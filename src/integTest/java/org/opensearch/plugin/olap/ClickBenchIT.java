@@ -8,7 +8,6 @@ import java.io.IOException;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import org.json.JSONObject;
-import org.junit.Ignore;
 
 /**
  * ClickBench benchmark integration tests. Migrated from the SQL plugin's {@code PPLClickBenchIT}
@@ -210,9 +209,6 @@ public class ClickBenchIT extends OlapRestTestCase {
     runQuery("q42");
   }
 
-  @Ignore(
-      "Unsupported: PPL grammar has no date_trunc(), and span(TIMESTAMP, 1m) lowers to a"
-          + " Velox UDF that isn't registered — no minute-bucketing path reaches Velox today.")
   public void testQ43() throws IOException {
     runQuery("q43");
   }

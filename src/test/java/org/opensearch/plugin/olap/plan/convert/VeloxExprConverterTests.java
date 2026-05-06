@@ -13,7 +13,12 @@ import org.apache.calcite.rex.RexCall;
 import org.apache.calcite.rex.RexInputRef;
 import org.apache.calcite.rex.RexLiteral;
 import org.apache.calcite.rex.RexNode;
+import org.apache.calcite.sql.SqlFunction;
+import org.apache.calcite.sql.SqlFunctionCategory;
+import org.apache.calcite.sql.SqlKind;
 import org.apache.calcite.sql.fun.SqlStdOperatorTable;
+import org.apache.calcite.sql.type.OperandTypes;
+import org.apache.calcite.sql.type.ReturnTypes;
 import org.apache.calcite.sql.type.SqlTypeName;
 import org.apache.calcite.util.DateString;
 import org.apache.calcite.util.TimeString;
@@ -666,5 +671,411 @@ public class VeloxExprConverterTests extends OpenSearchTestCase {
     Variant variant = ((ConstantTypedExpr) result).getValue();
     assertTrue(variant instanceof BigIntValue);
     assertNull(((BigIntValue) variant).getValue());
+  }
+
+  // ---- PPL span() conversion tests ----
+
+  /** Minimal stand-in for PPL's SPAN operator — matches the real one on name and SqlKind. */
+  private static final SqlFunction SPAN_OP =
+      new SqlFunction(
+          "SPAN",
+          SqlKind.OTHER_FUNCTION,
+          ReturnTypes.ARG0,
+          null,
+          OperandTypes.VARIADIC,
+          SqlFunctionCategory.USER_DEFINED_FUNCTION);
+
+  /** Row type with a TIMESTAMP `ts` column and an INTEGER `price` column. */
+  private RelDataType buildSpanRowType() {
+    RelDataTypeFactory.Builder builder = typeFactory.builder();
+    builder.add("ts", typeFactory.createSqlType(SqlTypeName.TIMESTAMP));
+    builder.add("price", typeFactory.createSqlType(SqlTypeName.INTEGER));
+    builder.add("weight", typeFactory.createSqlType(SqlTypeName.DOUBLE));
+    return builder.build();
+  }
+
+  private RexNode makeSpanCall(RexNode field, int count, String unit) {
+    RexLiteral countLit =
+        (RexLiteral)
+            rexBuilder.makeLiteral(count, typeFactory.createSqlType(SqlTypeName.INTEGER), false);
+    RexNode unitLit =
+        unit == null
+            ? rexBuilder.makeNullLiteral(typeFactory.createSqlType(SqlTypeName.VARCHAR, 8))
+            : rexBuilder.makeLiteral(unit);
+    return rexBuilder.makeCall(SPAN_OP, field, countLit, unitLit);
+  }
+
+  public void testConvertSpanTimestamp1mUsesDateTrunc() {
+    RelDataType rowType = buildSpanRowType();
+    VeloxExprConverter converter = new VeloxExprConverter(rowType);
+    RexNode tsRef = rexBuilder.makeInputRef(typeFactory.createSqlType(SqlTypeName.TIMESTAMP), 0);
+
+    TypedExpr result = converter.convert(makeSpanCall(tsRef, 1, "m"));
+
+    assertTrue(result instanceof CallTypedExpr);
+    CallTypedExpr outer = (CallTypedExpr) result;
+    assertEquals("date_trunc", outer.getFunctionName());
+    assertTrue(outer.getReturnType() instanceof TimestampType);
+    assertEquals(2, outer.getInputs().size());
+    TypedExpr unitArg = outer.getInputs().get(0);
+    assertTrue(unitArg instanceof ConstantTypedExpr);
+    assertTrue(unitArg.getReturnType() instanceof VarCharType);
+  }
+
+  public void testConvertSpanTimestamp1yUsesDateTruncYear() {
+    RelDataType rowType = buildSpanRowType();
+    VeloxExprConverter converter = new VeloxExprConverter(rowType);
+    RexNode tsRef = rexBuilder.makeInputRef(typeFactory.createSqlType(SqlTypeName.TIMESTAMP), 0);
+
+    TypedExpr result = converter.convert(makeSpanCall(tsRef, 1, "y"));
+
+    CallTypedExpr outer = (CallTypedExpr) result;
+    assertEquals("date_trunc", outer.getFunctionName());
+  }
+
+  public void testConvertSpanTimestamp5mUsesFromUnixtimeFloor() {
+    // span(ts, 5, 'm') → from_unixtime(multiply(floor(divide(to_unixtime(ts), 300.0)), 300.0))
+    RelDataType rowType = buildSpanRowType();
+    VeloxExprConverter converter = new VeloxExprConverter(rowType);
+    RexNode tsRef = rexBuilder.makeInputRef(typeFactory.createSqlType(SqlTypeName.TIMESTAMP), 0);
+
+    TypedExpr result = converter.convert(makeSpanCall(tsRef, 5, "m"));
+
+    CallTypedExpr fromUnix = (CallTypedExpr) result;
+    assertEquals("from_unixtime", fromUnix.getFunctionName());
+    assertTrue(fromUnix.getReturnType() instanceof TimestampType);
+
+    CallTypedExpr multiply = (CallTypedExpr) fromUnix.getInputs().get(0);
+    assertEquals("multiply", multiply.getFunctionName());
+    CallTypedExpr floor = (CallTypedExpr) multiply.getInputs().get(0);
+    assertEquals("floor", floor.getFunctionName());
+    CallTypedExpr divide = (CallTypedExpr) floor.getInputs().get(0);
+    assertEquals("divide", divide.getFunctionName());
+    CallTypedExpr toUnix = (CallTypedExpr) divide.getInputs().get(0);
+    assertEquals("to_unixtime", toUnix.getFunctionName());
+  }
+
+  public void testConvertSpanTimestamp90sUsesBucket90() {
+    RelDataType rowType = buildSpanRowType();
+    VeloxExprConverter converter = new VeloxExprConverter(rowType);
+    RexNode tsRef = rexBuilder.makeInputRef(typeFactory.createSqlType(SqlTypeName.TIMESTAMP), 0);
+
+    TypedExpr result = converter.convert(makeSpanCall(tsRef, 90, "s"));
+
+    CallTypedExpr fromUnix = (CallTypedExpr) result;
+    CallTypedExpr multiply = (CallTypedExpr) fromUnix.getInputs().get(0);
+    // bucket constant is the second arg to multiply
+    TypedExpr bucketArg = multiply.getInputs().get(1);
+    assertTrue(bucketArg instanceof ConstantTypedExpr);
+    assertTrue(bucketArg.getReturnType() instanceof DoubleType);
+  }
+
+  public void testConvertSpanNumericIntegerStaysInIntegerSpace() {
+    // span(price_int, 100) lowers to the Euclidean-modulo shape in INTEGER space:
+    //   col - ((col mod w + w) mod w).
+    // Staying in integer space preserves BIGINT precision above 2^53. The mod-based form
+    // (instead of floor(divide)) matches `floor` semantics for negative values — Velox's
+    // integer divide truncates toward zero and integer floor is a no-op.
+    RelDataType rowType = buildSpanRowType();
+    VeloxExprConverter converter = new VeloxExprConverter(rowType);
+    RexNode priceRef = rexBuilder.makeInputRef(typeFactory.createSqlType(SqlTypeName.INTEGER), 1);
+
+    TypedExpr result = converter.convert(makeSpanCall(priceRef, 100, null));
+
+    assertTrue(result.getReturnType() instanceof IntegerType);
+    CallTypedExpr minus = (CallTypedExpr) result;
+    assertEquals("minus", minus.getFunctionName());
+    assertTrue(minus.getReturnType() instanceof IntegerType);
+    CallTypedExpr outerMod = (CallTypedExpr) minus.getInputs().get(1);
+    assertEquals("mod", outerMod.getFunctionName());
+    assertTrue(outerMod.getReturnType() instanceof IntegerType);
+    CallTypedExpr plus = (CallTypedExpr) outerMod.getInputs().get(0);
+    assertEquals("plus", plus.getFunctionName());
+    assertTrue(plus.getReturnType() instanceof IntegerType);
+    CallTypedExpr innerMod = (CallTypedExpr) plus.getInputs().get(0);
+    assertEquals("mod", innerMod.getFunctionName());
+    assertTrue(innerMod.getReturnType() instanceof IntegerType);
+    // Confirm nothing transits through DOUBLE — that would signal regressed precision.
+    for (TypedExpr child : innerMod.getInputs()) {
+      assertFalse(
+          "mod operand should not be cast to DOUBLE", child.getReturnType() instanceof DoubleType);
+    }
+  }
+
+  public void testConvertSpanNumericBigIntStaysInBigIntSpace() {
+    // Regression guard for the 2^53 precision bug: BIGINT must not transit through DOUBLE.
+    RelDataType rowType = typeFactory.builder().add("id", SqlTypeName.BIGINT).build();
+    VeloxExprConverter converter = new VeloxExprConverter(rowType);
+    RexNode idRef = rexBuilder.makeInputRef(typeFactory.createSqlType(SqlTypeName.BIGINT), 0);
+
+    TypedExpr result = converter.convert(makeSpanCall(idRef, 1, null));
+
+    assertTrue(result.getReturnType() instanceof BigIntType);
+    CallTypedExpr minus = (CallTypedExpr) result;
+    assertEquals("minus", minus.getFunctionName());
+    assertTrue(minus.getReturnType() instanceof BigIntType);
+    CallTypedExpr outerMod = (CallTypedExpr) minus.getInputs().get(1);
+    assertEquals("mod", outerMod.getFunctionName());
+    assertTrue(outerMod.getReturnType() instanceof BigIntType);
+  }
+
+  public void testConvertSpanNumericIntegerNegativeValueUsesEuclideanMod() {
+    // Regression guard for Codex P1: span on a signed integer with a negative value like -1
+    // must yield -width (not 0). We assert the emitted tree shape matches col - ((col%w+w)%w),
+    // which gives the correct floor-bucket for negatives.
+    RelDataType rowType = buildSpanRowType();
+    VeloxExprConverter converter = new VeloxExprConverter(rowType);
+    RexNode priceRef = rexBuilder.makeInputRef(typeFactory.createSqlType(SqlTypeName.INTEGER), 1);
+
+    TypedExpr result = converter.convert(makeSpanCall(priceRef, 10, null));
+
+    CallTypedExpr minus = (CallTypedExpr) result;
+    // Left operand of minus is the column (FieldAccess), right is the Euclidean modulo term.
+    TypedExpr left = minus.getInputs().get(0);
+    assertTrue(
+        "minus left operand should be a field reference, not a cast",
+        left instanceof FieldAccessTypedExpr);
+    // Outer mod's second operand is the width.
+    CallTypedExpr outerMod = (CallTypedExpr) minus.getInputs().get(1);
+    TypedExpr outerWidth = outerMod.getInputs().get(1);
+    assertTrue(outerWidth instanceof ConstantTypedExpr);
+  }
+
+  public void testConvertSpanNumericDoubleWidthStaysDouble() {
+    RelDataType rowType = buildSpanRowType();
+    VeloxExprConverter converter = new VeloxExprConverter(rowType);
+    RexNode weightRef = rexBuilder.makeInputRef(typeFactory.createSqlType(SqlTypeName.DOUBLE), 2);
+
+    // span(weight_double, 2) → numeric span on DOUBLE column, no cast needed.
+    TypedExpr result = converter.convert(makeSpanCall(weightRef, 2, null));
+
+    assertTrue(result.getReturnType() instanceof DoubleType);
+    CallTypedExpr multiply = (CallTypedExpr) result;
+    assertEquals("multiply", multiply.getFunctionName());
+  }
+
+  public void testIsSupportedRejectsSpanMillisecond() {
+    RelDataType rowType = buildSpanRowType();
+    RexNode tsRef = rexBuilder.makeInputRef(typeFactory.createSqlType(SqlTypeName.TIMESTAMP), 0);
+    RexCall call = (RexCall) makeSpanCall(tsRef, 1, "ms");
+    assertFalse(VeloxExprConverter.isSupported(call));
+  }
+
+  public void testIsSupportedRejectsSpanMonthCountGreaterThanOne() {
+    RelDataType rowType = buildSpanRowType();
+    RexNode tsRef = rexBuilder.makeInputRef(typeFactory.createSqlType(SqlTypeName.TIMESTAMP), 0);
+    RexCall call = (RexCall) makeSpanCall(tsRef, 3, "M");
+    assertFalse(VeloxExprConverter.isSupported(call));
+  }
+
+  public void testIsSupportedRejectsSpanMultiWeek() {
+    // `span(ts, 2w)` would anchor on Thursdays via floor(to_unixtime/604800)*604800 but
+    // `span(ts, 1w)` anchors on Mondays via date_trunc('week'). Let this fall back.
+    RelDataType rowType = buildSpanRowType();
+    RexNode tsRef = rexBuilder.makeInputRef(typeFactory.createSqlType(SqlTypeName.TIMESTAMP), 0);
+    RexCall call = (RexCall) makeSpanCall(tsRef, 2, "w");
+    assertFalse(VeloxExprConverter.isSupported(call));
+  }
+
+  public void testIsSupportedAcceptsSpanSingleWeek() {
+    RelDataType rowType = buildSpanRowType();
+    RexNode tsRef = rexBuilder.makeInputRef(typeFactory.createSqlType(SqlTypeName.TIMESTAMP), 0);
+    RexCall call = (RexCall) makeSpanCall(tsRef, 1, "w");
+    assertTrue(VeloxExprConverter.isSupported(call));
+  }
+
+  public void testIsSupportedRejectsSpanDecimalField() {
+    // Decimal columns aren't safe through integer or DOUBLE paths — fall back.
+    RelDataType rowType =
+        typeFactory
+            .builder()
+            .add("price", typeFactory.createSqlType(SqlTypeName.DECIMAL, 20, 4))
+            .build();
+    RexNode priceRef =
+        rexBuilder.makeInputRef(typeFactory.createSqlType(SqlTypeName.DECIMAL, 20, 4), 0);
+    RexCall call = (RexCall) makeSpanCall(priceRef, 100, null);
+    assertFalse(VeloxExprConverter.isSupported(call));
+  }
+
+  /** Build a numeric SPAN call with a fractional-width RexLiteral (scaled DECIMAL). */
+  private RexCall makeSpanCallWithFractionalWidth(RexNode field, String width) {
+    BigDecimal bd = new BigDecimal(width);
+    RexLiteral widthLit =
+        (RexLiteral)
+            rexBuilder.makeLiteral(
+                bd,
+                typeFactory.createSqlType(SqlTypeName.DECIMAL, bd.precision(), bd.scale()),
+                false);
+    RexNode unitLit = rexBuilder.makeNullLiteral(typeFactory.createSqlType(SqlTypeName.VARCHAR, 8));
+    return (RexCall) rexBuilder.makeCall(SPAN_OP, field, widthLit, unitLit);
+  }
+
+  public void testIsSupportedAcceptsSpanDoubleFieldFractionalWidth() {
+    // span(double_col, 0.5) should be vectorized — the DOUBLE arithmetic path handles fractional
+    // widths correctly. Regression guard for P2: the DECIMAL-scale rejection was overbroad.
+    RexNode weightRef = rexBuilder.makeInputRef(typeFactory.createSqlType(SqlTypeName.DOUBLE), 2);
+    RexCall call = makeSpanCallWithFractionalWidth(weightRef, "0.5");
+    assertTrue(VeloxExprConverter.isSupported(call));
+  }
+
+  public void testIsSupportedRejectsSpanIntegerFieldFractionalWidth() {
+    // span(int_col, 0.5) forces DOUBLE conversion, which risks BIGINT precision loss. Reject
+    // so integer spans always stay in integer space.
+    RexNode priceRef = rexBuilder.makeInputRef(typeFactory.createSqlType(SqlTypeName.INTEGER), 1);
+    RexCall call = makeSpanCallWithFractionalWidth(priceRef, "0.5");
+    assertFalse(VeloxExprConverter.isSupported(call));
+  }
+
+  public void testConvertSpanDoubleFieldFractionalWidthUsesDoublePath() {
+    // Confirms the lowering shape for span(double_col, 0.5) is floor(divide)*multiply in DOUBLE.
+    RelDataType rowType = buildSpanRowType();
+    VeloxExprConverter converter = new VeloxExprConverter(rowType);
+    RexNode weightRef = rexBuilder.makeInputRef(typeFactory.createSqlType(SqlTypeName.DOUBLE), 2);
+    TypedExpr result = converter.convert(makeSpanCallWithFractionalWidth(weightRef, "0.5"));
+
+    assertTrue(result.getReturnType() instanceof DoubleType);
+    CallTypedExpr multiply = (CallTypedExpr) result;
+    assertEquals("multiply", multiply.getFunctionName());
+    CallTypedExpr floor = (CallTypedExpr) multiply.getInputs().get(0);
+    assertEquals("floor", floor.getFunctionName());
+    CallTypedExpr divide = (CallTypedExpr) floor.getInputs().get(0);
+    assertEquals("divide", divide.getFunctionName());
+  }
+
+  public void testIsSupportedRejectsSpanZeroCount() {
+    RelDataType rowType = buildSpanRowType();
+    RexNode tsRef = rexBuilder.makeInputRef(typeFactory.createSqlType(SqlTypeName.TIMESTAMP), 0);
+    RexCall call = (RexCall) makeSpanCall(tsRef, 0, "m");
+    assertFalse(VeloxExprConverter.isSupported(call));
+  }
+
+  public void testIsSupportedRejectsSpanNonLiteralWidth() {
+    RelDataType rowType = buildSpanRowType();
+    RexNode tsRef = rexBuilder.makeInputRef(typeFactory.createSqlType(SqlTypeName.TIMESTAMP), 0);
+    // Build a span call where operand[1] is a RexInputRef, not a RexLiteral.
+    RexNode nonLiteralWidth =
+        rexBuilder.makeInputRef(typeFactory.createSqlType(SqlTypeName.INTEGER), 1);
+    RexNode unitLit = rexBuilder.makeLiteral("m");
+    RexCall call = (RexCall) rexBuilder.makeCall(SPAN_OP, tsRef, nonLiteralWidth, unitLit);
+    assertFalse(VeloxExprConverter.isSupported(call));
+  }
+
+  public void testIsSupportedAcceptsSpanSecond1() {
+    RelDataType rowType = buildSpanRowType();
+    RexNode tsRef = rexBuilder.makeInputRef(typeFactory.createSqlType(SqlTypeName.TIMESTAMP), 0);
+    RexCall call = (RexCall) makeSpanCall(tsRef, 1, "s");
+    assertTrue(VeloxExprConverter.isSupported(call));
+  }
+
+  public void testIsSupportedAcceptsSpanMinute5() {
+    RelDataType rowType = buildSpanRowType();
+    RexNode tsRef = rexBuilder.makeInputRef(typeFactory.createSqlType(SqlTypeName.TIMESTAMP), 0);
+    RexCall call = (RexCall) makeSpanCall(tsRef, 5, "m");
+    assertTrue(VeloxExprConverter.isSupported(call));
+  }
+
+  public void testIsSupportedAcceptsSpanNumeric() {
+    RelDataType rowType = buildSpanRowType();
+    RexNode priceRef = rexBuilder.makeInputRef(typeFactory.createSqlType(SqlTypeName.INTEGER), 1);
+    RexCall call = (RexCall) makeSpanCall(priceRef, 100, null);
+    assertTrue(VeloxExprConverter.isSupported(call));
+  }
+
+  public void testIsSupportedRejectsSpanNumericZeroWidth() {
+    // Width = 0 would divide by zero inside the lowered expression. Enforce width > 0 so the
+    // query falls back to the default engine instead of crashing in Velox.
+    RexNode priceRef = rexBuilder.makeInputRef(typeFactory.createSqlType(SqlTypeName.INTEGER), 1);
+    RexCall call = (RexCall) makeSpanCall(priceRef, 0, null);
+    assertFalse(VeloxExprConverter.isSupported(call));
+  }
+
+  public void testIsSupportedRejectsSpanNumericNegativeWidth() {
+    // Negative widths produce nonsensical bucket boundaries. Match the temporal branch which
+    // already rejects non-positive counts.
+    RexNode priceRef = rexBuilder.makeInputRef(typeFactory.createSqlType(SqlTypeName.INTEGER), 1);
+    RexCall call = (RexCall) makeSpanCall(priceRef, -5, null);
+    assertFalse(VeloxExprConverter.isSupported(call));
+  }
+
+  public void testConvertSpanIntegerUsesVeloxRegisteredModName() {
+    // Regression guard: Velox registers the modulo scalar as "mod" (Presto + Spark both use
+    // "mod"/"pmod"/"remainder"; no dialect registers "modulus"). If the Euclidean-mod rewrite
+    // ever drifts to a different name, integer spans would fail at Velox signature resolution.
+    RelDataType rowType = buildSpanRowType();
+    VeloxExprConverter converter = new VeloxExprConverter(rowType);
+    RexNode priceRef = rexBuilder.makeInputRef(typeFactory.createSqlType(SqlTypeName.INTEGER), 1);
+
+    TypedExpr result = converter.convert(makeSpanCall(priceRef, 10, null));
+
+    CallTypedExpr minus = (CallTypedExpr) result;
+    CallTypedExpr outerMod = (CallTypedExpr) minus.getInputs().get(1);
+    assertEquals("mod", outerMod.getFunctionName());
+    CallTypedExpr plus = (CallTypedExpr) outerMod.getInputs().get(0);
+    CallTypedExpr innerMod = (CallTypedExpr) plus.getInputs().get(0);
+    assertEquals("mod", innerMod.getFunctionName());
+  }
+
+  // ---- DATE span tests ----
+
+  public void testConvertSpanDate1dUsesDateTrunc() {
+    RelDataType rowType = typeFactory.builder().add("d", SqlTypeName.DATE).build();
+    VeloxExprConverter converter = new VeloxExprConverter(rowType);
+    RexNode dateRef = rexBuilder.makeInputRef(typeFactory.createSqlType(SqlTypeName.DATE), 0);
+
+    TypedExpr result = converter.convert(makeSpanCall(dateRef, 1, "d"));
+
+    assertTrue(result instanceof CallTypedExpr);
+    CallTypedExpr outer = (CallTypedExpr) result;
+    assertEquals("date_trunc", outer.getFunctionName());
+    assertTrue(outer.getReturnType() instanceof DateType);
+    TypedExpr unitArg = outer.getInputs().get(0);
+    assertTrue(unitArg instanceof ConstantTypedExpr);
+  }
+
+  public void testConvertSpanDate1MUsesDateTrunc() {
+    RelDataType rowType = typeFactory.builder().add("d", SqlTypeName.DATE).build();
+    VeloxExprConverter converter = new VeloxExprConverter(rowType);
+    RexNode dateRef = rexBuilder.makeInputRef(typeFactory.createSqlType(SqlTypeName.DATE), 0);
+
+    TypedExpr result = converter.convert(makeSpanCall(dateRef, 1, "M"));
+
+    CallTypedExpr outer = (CallTypedExpr) result;
+    assertEquals("date_trunc", outer.getFunctionName());
+    assertTrue(outer.getReturnType() instanceof DateType);
+  }
+
+  public void testIsSupportedRejectsSpanDateSubDayUnit() {
+    RexNode dateRef = rexBuilder.makeInputRef(typeFactory.createSqlType(SqlTypeName.DATE), 0);
+    // date_trunc(DATE) rejects sub-day units — fall back.
+    assertFalse(VeloxExprConverter.isSupported((RexCall) makeSpanCall(dateRef, 1, "h")));
+    assertFalse(VeloxExprConverter.isSupported((RexCall) makeSpanCall(dateRef, 1, "m")));
+    assertFalse(VeloxExprConverter.isSupported((RexCall) makeSpanCall(dateRef, 1, "s")));
+  }
+
+  public void testIsSupportedRejectsSpanDateCountGreaterThanOne() {
+    // date_trunc only handles count=1; count>1 on DATE would need interval math we don't emit.
+    RexNode dateRef = rexBuilder.makeInputRef(typeFactory.createSqlType(SqlTypeName.DATE), 0);
+    assertFalse(VeloxExprConverter.isSupported((RexCall) makeSpanCall(dateRef, 2, "d")));
+    assertFalse(VeloxExprConverter.isSupported((RexCall) makeSpanCall(dateRef, 3, "M")));
+  }
+
+  public void testIsSupportedAcceptsSpanDateWeekMonthQuarterYear() {
+    RexNode dateRef = rexBuilder.makeInputRef(typeFactory.createSqlType(SqlTypeName.DATE), 0);
+    assertTrue(VeloxExprConverter.isSupported((RexCall) makeSpanCall(dateRef, 1, "d")));
+    assertTrue(VeloxExprConverter.isSupported((RexCall) makeSpanCall(dateRef, 1, "w")));
+    assertTrue(VeloxExprConverter.isSupported((RexCall) makeSpanCall(dateRef, 1, "M")));
+    assertTrue(VeloxExprConverter.isSupported((RexCall) makeSpanCall(dateRef, 1, "q")));
+    assertTrue(VeloxExprConverter.isSupported((RexCall) makeSpanCall(dateRef, 1, "y")));
+  }
+
+  // ---- TIME span tests (must fall back) ----
+
+  public void testIsSupportedRejectsSpanTime() {
+    // velox4j has no TimeType wrapper, so we can't emit date_trunc(TIME). Falling back
+    // protects users from the silent numeric-path miscompile that would bucket raw millis.
+    RexNode timeRef = rexBuilder.makeInputRef(typeFactory.createSqlType(SqlTypeName.TIME), 0);
+    assertFalse(VeloxExprConverter.isSupported((RexCall) makeSpanCall(timeRef, 1, "h")));
+    assertFalse(VeloxExprConverter.isSupported((RexCall) makeSpanCall(timeRef, 30, "m")));
+    assertFalse(VeloxExprConverter.isSupported((RexCall) makeSpanCall(timeRef, 1, "s")));
   }
 }
