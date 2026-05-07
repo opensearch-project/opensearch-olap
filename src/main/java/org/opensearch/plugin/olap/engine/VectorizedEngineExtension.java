@@ -22,6 +22,7 @@ import org.apache.calcite.rex.RexNode;
 import org.apache.calcite.sql.type.SqlTypeName;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.opensearch.plugin.olap.plan.convert.RelevanceSplitter;
 import org.opensearch.plugin.olap.plan.convert.VeloxExprConverter;
 import org.opensearch.plugin.olap.plan.convert.VeloxTypeConverter;
 import org.opensearch.plugin.olap.plan.physical.DateTimeUdfRewriter;
@@ -250,6 +251,22 @@ public class VectorizedEngineExtension implements ExecutionEngine {
         return unsupported;
       }
     }
+    // For LogicalFilter, also run a dry-run RelevanceSplitter check. The splitter can rule out
+    // shapes that raw operator-name support can't detect — e.g., a relevance call nested inside
+    // arithmetic, or an OR subtree with a non-translatable predicate leaf. Matches what
+    // VeloxPlanGenerator.convertFilter will actually attempt at plan-gen time.
+    if (node instanceof LogicalFilter) {
+      LogicalFilter filter = (LogicalFilter) node;
+      if (RelevanceSplitter.containsRelevance(filter.getCondition())) {
+        RelevanceSplitter splitter =
+            new RelevanceSplitter(
+                filter.getCluster().getRexBuilder(), filter.getInput().getRowType());
+        RelevanceSplitter.Result result = splitter.split(filter.getCondition());
+        if (result.ruledOut) {
+          return "relevance-ruled-out";
+        }
+      }
+    }
     return null;
   }
 
@@ -260,6 +277,14 @@ public class VectorizedEngineExtension implements ExecutionEngine {
       // PPL's timestamp()/date()/time() UDFs are stripped by DateTimeUdfRewriter before Velox
       // conversion when they wrap a string literal or a matching UDT ref.
       if (DateTimeUdfRewriter.isRewritable(call)) {
+        return null;
+      }
+      // Relevance calls (match/multi_match/etc.) never reach Velox — RelevanceSplitter peels
+      // them out of LogicalFilter and ships them as a QueryBuilder on the transport request.
+      // Their operands use PPL-internal shapes (MAP_VALUE_CONSTRUCTOR wrapping each named arg)
+      // that the generic Velox converter doesn't know about; don't recurse into them. The
+      // LogicalFilter branch below runs a dry-run split that validates the call as a whole.
+      if (RelevanceSplitter.isRelevanceCall(call)) {
         return null;
       }
       if (!VeloxExprConverter.isSupported(call)) {

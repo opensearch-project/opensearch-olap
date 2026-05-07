@@ -8,6 +8,7 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.BigIntVector;
 import org.apache.arrow.vector.BitVector;
@@ -56,17 +57,47 @@ public class ArrowBatchBuilder {
     this.batchSize = batchSize;
   }
 
-  /** Column specification: field name, Arrow type, and DocValue type. */
+  /**
+   * Where to read this column's values from at scan time.
+   *
+   * <ul>
+   *   <li>{@link #DOC_VALUES} — Lucene doc values (existing path, numeric / keyword / date).
+   *   <li>{@link #STORED} — Lucene stored fields (when the mapping has {@code store: true}).
+   *   <li>{@link #SOURCE} — OpenSearch {@code _source} JSON (fallback for text fields without
+   *       stored-fields or doc values).
+   * </ul>
+   */
+  public enum SourceKind {
+    DOC_VALUES,
+    STORED,
+    SOURCE
+  }
+
+  /** Column specification: field name, Arrow type, and either a DocValue type or SourceKind. */
   public static class ColumnSpec {
     private final String name;
     private final ArrowType arrowType;
     private final DocValueType docValueType;
+    private final SourceKind sourceKind;
     private final List<ColumnSpec> children; // non-null for struct columns
 
     public ColumnSpec(String name, ArrowType arrowType, DocValueType docValueType) {
       this.name = name;
       this.arrowType = arrowType;
       this.docValueType = docValueType;
+      this.sourceKind = SourceKind.DOC_VALUES;
+      this.children = null;
+    }
+
+    /**
+     * Create a column backed by stored-fields or {@code _source}. Used for text fields that lack
+     * doc values. {@code arrowType} is {@code Utf8}.
+     */
+    public ColumnSpec(String name, ArrowType arrowType, SourceKind sourceKind) {
+      this.name = name;
+      this.arrowType = arrowType;
+      this.docValueType = null;
+      this.sourceKind = sourceKind;
       this.children = null;
     }
 
@@ -75,6 +106,7 @@ public class ArrowBatchBuilder {
       this.name = name;
       this.arrowType = ArrowType.Struct.INSTANCE;
       this.docValueType = null;
+      this.sourceKind = SourceKind.DOC_VALUES;
       this.children = children;
     }
 
@@ -88,6 +120,10 @@ public class ArrowBatchBuilder {
 
     public DocValueType getDocValueType() {
       return docValueType;
+    }
+
+    public SourceKind getSourceKind() {
+      return sourceKind;
     }
 
     public boolean isStruct() {
@@ -140,13 +176,25 @@ public class ArrowBatchBuilder {
     VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator);
     root.setRowCount(count);
 
-    // Populate each column (flat or struct)
+    // Populate each column (flat or struct). Doc-value columns fill here; text-backed columns
+    // (STORED/SOURCE) allocate their vectors here but defer population to the single-pass
+    // populateTextColumns call below.
     for (int col = 0; col < columns.size(); col++) {
       ColumnSpec spec = columns.get(col);
       FieldVector vector = root.getVector(col);
       vector.allocateNew();
       populateColumn(vector, spec, reader, docIds, count);
       vector.setValueCount(count);
+    }
+
+    // One pass over docs for all text-backed columns so we decompress each doc's stored-fields
+    // block once regardless of how many text columns are projected.
+    populateTextColumns(root, reader, docIds, count);
+    for (int col = 0; col < columns.size(); col++) {
+      if (columns.get(col).getSourceKind() != SourceKind.DOC_VALUES
+          && !columns.get(col).isStruct()) {
+        root.getVector(col).setValueCount(count);
+      }
     }
 
     return root;
@@ -168,8 +216,8 @@ public class ArrowBatchBuilder {
   }
 
   /**
-   * Populate a column (flat or struct) from Lucene doc values. For struct columns, reads flat
-   * doc-value fields and assembles them into a StructVector.
+   * Populate a column (flat or struct) from Lucene doc values or stored/source fields. For struct
+   * columns, reads flat doc-value fields and assembles them into a StructVector.
    */
   private void populateColumn(
       FieldVector vector, ColumnSpec spec, LeafReader reader, int[] docIds, int count)
@@ -188,12 +236,57 @@ public class ArrowBatchBuilder {
       for (int row = 0; row < count; row++) {
         structVector.setIndexDefined(row);
       }
+    } else if (spec.getSourceKind() != SourceKind.DOC_VALUES) {
+      // Text-backed columns (stored fields or _source) are populated by the per-batch visitor
+      // pass in buildBatch. Do nothing here — the vector was already set in that pass.
     } else {
       DocValueColumnReader dvReader =
           new DocValueColumnReader(spec.getName(), spec.getDocValueType());
       dvReader.open(reader);
       for (int row = 0; row < count; row++) {
         populateValue(vector, row, docIds[row], dvReader, spec.getArrowType());
+      }
+    }
+  }
+
+  /**
+   * Populate every {@link SourceKind#STORED} or {@link SourceKind#SOURCE} column in one per-doc
+   * pass. Uses a single {@link TextFieldColumnReader} so each doc's stored-fields block is
+   * decompressed once regardless of how many text columns are projected.
+   */
+  private void populateTextColumns(
+      VectorSchemaRoot root, LeafReader reader, int[] docIds, int count) throws IOException {
+    java.util.Set<String> storedNames = new java.util.HashSet<>();
+    java.util.Set<String> sourceNames = new java.util.HashSet<>();
+    java.util.Map<String, Integer> nameToCol = new java.util.HashMap<>();
+    for (int i = 0; i < columns.size(); i++) {
+      ColumnSpec spec = columns.get(i);
+      if (spec.isStruct()) {
+        continue;
+      }
+      if (spec.getSourceKind() == SourceKind.STORED) {
+        storedNames.add(spec.getName());
+        nameToCol.put(spec.getName(), i);
+      } else if (spec.getSourceKind() == SourceKind.SOURCE) {
+        sourceNames.add(spec.getName());
+        nameToCol.put(spec.getName(), i);
+      }
+    }
+    if (storedNames.isEmpty() && sourceNames.isEmpty()) {
+      return;
+    }
+    TextFieldColumnReader textReader = new TextFieldColumnReader(storedNames, sourceNames);
+    textReader.open(reader);
+    for (int row = 0; row < count; row++) {
+      int docId = docIds[row];
+      for (Map.Entry<String, Integer> e : nameToCol.entrySet()) {
+        String name = e.getKey();
+        int colIdx = e.getValue();
+        VarCharVector vec = (VarCharVector) root.getVector(colIdx);
+        String value = textReader.readString(docId, name);
+        if (value != null) {
+          vec.set(row, value.getBytes(StandardCharsets.UTF_8));
+        }
       }
     }
   }

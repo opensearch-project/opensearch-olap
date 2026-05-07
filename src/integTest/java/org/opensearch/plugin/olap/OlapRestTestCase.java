@@ -41,6 +41,8 @@ public abstract class OlapRestTestCase extends OpenSearchTestCase {
     PROJECTS("projects", "projects_mapping.json", "projects_data.json"),
     BIG5("big5", "big5_mapping.json", "big5_data.json"),
     CLICK_BENCH("hits", "clickbench_mapping.json", "clickbench_data.json"),
+    BEER("beer", "beer_mapping.json", "beer_data.json"),
+    BEER_TEXT("beer_text", "beer_text_mapping.json", "beer_text_data.json"),
     NESTED_SIMPLE(
         "opensearch-sql_test_index_nested_simple",
         "nested_simple_mapping.json",

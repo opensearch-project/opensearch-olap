@@ -197,6 +197,27 @@ public class JoinIT extends OlapRestTestCase {
     assertEquals("Expected 3 rows", 3, rows.length());
   }
 
+  // ---- Join + relevance-only-on-one-side ----
+  //
+  // The match(name, ...) predicate lives on the employees side; departments has no `name`
+  // field. If the relevance pushdown were applied to both scans (per-query scope), the
+  // departments side would filter to zero rows and the inner join would return zero —
+  // silently wrong. Per-scan scoping keeps the pushdown on the employees fragment only.
+  public void testInnerJoinWithRelevanceOnOneSide() throws IOException {
+    JSONObject response =
+        executePPLQuery(
+            "source = "
+                + Index.EMPLOYEES.getName()
+                + " | where match(name, 'Alice')"
+                + " | inner join left=e right=d ON e.dept_id = d.dept_id "
+                + Index.DEPARTMENTS.getName()
+                + " | fields e.name, d.dept_name");
+    JSONArray rows = getDataRows(response);
+    assertEquals("Alice matches exactly one employee", 1, rows.length());
+    assertEquals("Alice", rows.getJSONArray(0).getString(0));
+    assertEquals("Engineering", rows.getJSONArray(0).getString(1));
+  }
+
   // ---- Log Verification ----
 
   public void testJoinAppearsInLogs() throws IOException {

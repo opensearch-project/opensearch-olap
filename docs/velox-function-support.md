@@ -31,11 +31,17 @@ This is the primary reason the Big5 benchmark queries fall back — all 58 queri
 
 ### Fields without doc values
 
-The Velox engine reads data from Lucene doc values only. Field types without doc values (`text`, `match_only_text`) cannot be read by `LuceneArrowReader`. Queries scanning these columns will get null/empty values or crash.
+Most field types are read via Lucene doc values — the dense columnar format optimal for analytical workloads. Text fields don't have doc values, so a second reader handles them:
 
-**Affected types:** `text` (no doc values by default), `match_only_text` (never has doc values)
+**Text field reader (`TextFieldColumnReader`)**: when `LuceneArrowReader` encounters a `text`-typed field, it dispatches to a stored-fields / `_source`-backed reader instead of doc values. Per scan batch, one `FieldsVisitor` per doc decompresses the stored-fields block once and populates every text column from the same pass — avoiding O(columns × docs) stored-fields cost. If the field is declared `store: true` in the mapping, the reader uses Lucene stored fields directly; otherwise it extracts the value from the doc's `_source` JSON.
 
-**Workaround:** Use `keyword` type instead of `text` for fields that need vectorized execution. Or add `| fields` to PPL queries to project only supported columns.
+**Semantic quirks vs. doc values:**
+- Multi-valued text fields return the first value only (debug log records the skip), matching how the plugin already treats multi-valued keyword columns via `SortedSetDocValues`.
+- `_source`-disabled indexes (`_source: false` in mapping) produce null for text projections. If both `_source` and `store: true` are unavailable, the text column effectively becomes null-only; the plugin currently does not reject such plans at `canVectorize` time.
+
+**Affected types:** `match_only_text` (never has doc values, still unsupported). Regular `text` is now readable via the stored / `_source` path.
+
+**Performance note:** `_source` extraction is ~10× slower per doc than doc-value reads. For broad scans that materialize a text column across millions of docs this adds up. For typical relevance-style workloads (`match(body, q) | stats count()` with selective `match`), the cost is bounded by the matched-docs count, which is usually small.
 
 ## Mathematical Functions
 

@@ -429,13 +429,25 @@ public class LuceneArrowReader {
         logger.warn("Field {} not found in index mappings, skipping", fieldName);
         continue;
       }
-      ArrowType arrowType = mapToArrowType(fieldType.typeName());
-      DocValueType dvType = mapToDocValueType(fieldType.typeName());
+      String typeName = fieldType.typeName();
+      ArrowType arrowType = mapToArrowType(typeName);
+      // Text fields have no doc values. Route them through the stored-fields / _source reader
+      // in ArrowBatchBuilder instead of DocValueColumnReader. Prefer stored fields when the
+      // mapping has store:true; fall back to _source otherwise. The canVectorize gate
+      // ensures _source is retrievable (or store:true is set) before the plan reaches us.
+      if ("text".equals(typeName)) {
+        ArrowBatchBuilder.SourceKind kind =
+            fieldType.isStored()
+                ? ArrowBatchBuilder.SourceKind.STORED
+                : ArrowBatchBuilder.SourceKind.SOURCE;
+        flatSpecs.add(new ColumnSpec(fieldName, ArrowType.Utf8.INSTANCE, kind));
+        continue;
+      }
+      DocValueType dvType = mapToDocValueType(typeName);
       if (arrowType != null && dvType != null) {
         flatSpecs.add(new ColumnSpec(fieldName, arrowType, dvType));
       } else {
-        logger.warn(
-            "Unsupported field type {} for field {}, skipping", fieldType.typeName(), fieldName);
+        logger.warn("Unsupported field type {} for field {}, skipping", typeName, fieldName);
       }
     }
 
@@ -594,8 +606,9 @@ public class LuceneArrowReader {
         // OpenSearch stores all numeric types as SORTED_NUMERIC (supports multi-valued)
         return DocValueType.SORTED_NUMERIC;
       case "keyword":
-      case "text":
-        // OpenSearch stores keyword/text as SORTED_SET (supports multi-valued)
+        // OpenSearch stores keyword as SORTED_SET (supports multi-valued).
+        // `text` is handled separately in resolveColumnSpecs via the stored-fields / _source
+        // reader since text fields don't have doc values.
         return DocValueType.SORTED_SET;
       default:
         return null;

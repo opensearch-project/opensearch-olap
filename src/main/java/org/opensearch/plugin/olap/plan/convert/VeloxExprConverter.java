@@ -276,8 +276,26 @@ public class VeloxExprConverter {
   /**
    * Set of all Calcite operator names that we can convert to Velox. Used by canVectorize() to
    * reject plans with unsupported functions.
+   *
+   * <p>Includes PPL relevance function names (MATCH, MATCH_PHRASE, ...) — these never actually
+   * reach Velox because {@link org.opensearch.plugin.olap.plan.convert.RelevanceSplitter} peels
+   * them out of the filter in {@code VeloxPlanGenerator.convertFilter} and ships them as an
+   * OpenSearch {@code QueryBuilder} on the transport request. Whitelisting them here prevents
+   * {@code canVectorize()} from rejecting queries that contain them.
    */
-  public static final Set<String> SUPPORTED_FUNCTIONS = Set.copyOf(NAME_MAP.keySet());
+  public static final Set<String> SUPPORTED_FUNCTIONS = buildSupportedFunctions();
+
+  private static Set<String> buildSupportedFunctions() {
+    Set<String> s = new HashSet<>(NAME_MAP.keySet());
+    s.add("MATCH");
+    s.add("MATCH_PHRASE");
+    s.add("MATCH_PHRASE_PREFIX");
+    s.add("MATCH_BOOL_PREFIX");
+    s.add("MULTI_MATCH");
+    s.add("SIMPLE_QUERY_STRING");
+    s.add("QUERY_STRING");
+    return Set.copyOf(s);
+  }
 
   /**
    * SqlKinds that are handled natively (not via NAME_MAP). Used by canVectorize() to allow these

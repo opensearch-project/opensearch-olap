@@ -24,6 +24,7 @@ import org.boostscale.velox4j.serde.Serde;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.index.shard.ShardId;
+import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.plugin.olap.common.QueryId;
 import org.opensearch.plugin.olap.execution.OlapBloomFilter;
 import org.opensearch.plugin.olap.execution.ResultTooLargeException;
@@ -360,6 +361,13 @@ public class NodeResultCollector {
 
     ExecuteFragmentRequest request = requestFactory.create(task);
     request.setProfileEnabled(profileEnabled);
+    // Each fragment carries its own relevance pushdown (peeled off by RelevanceSplitter during
+    // plan-gen). Stamp only this fragment's pushdown — a sibling scan in the same query keeps
+    // its own (or no) pushdown.
+    QueryBuilder fragPushdown = task.getFragment().getRelevancePushdown();
+    if (fragPushdown != null) {
+      request.setRelevancePushdown(fragPushdown);
+    }
 
     transportService.sendRequest(
         task.getTargetNode(),

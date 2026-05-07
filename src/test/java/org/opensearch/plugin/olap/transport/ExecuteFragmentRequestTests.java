@@ -5,12 +5,19 @@
 package org.opensearch.plugin.olap.transport;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.List;
 import org.opensearch.common.io.stream.BytesStreamOutput;
+import org.opensearch.core.common.io.stream.NamedWriteableAwareStreamInput;
+import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.index.Index;
 import org.opensearch.core.index.shard.ShardId;
+import org.opensearch.index.query.MatchQueryBuilder;
+import org.opensearch.index.query.QueryBuilder;
+import org.opensearch.indices.IndicesModule;
 import org.opensearch.plugin.olap.execution.RfKind;
+import org.opensearch.search.SearchModule;
 import org.opensearch.test.OpenSearchTestCase;
 
 public class ExecuteFragmentRequestTests extends OpenSearchTestCase {
@@ -287,5 +294,43 @@ public class ExecuteFragmentRequestTests extends OpenSearchTestCase {
     assertTrue(deserialized.isCoRoutingJoin());
     assertNull(deserialized.getCoRoutingLeftPlanJson());
     assertNull(deserialized.getCoRoutingRightPlanJson());
+  }
+
+  public void testSerializeDeserializeCoRoutingRelevance() throws IOException {
+    // Regression guard: co-routing must ship each leaf's RelevanceSplitter-peeled QueryBuilder
+    // as a per-side optional field. Without this, a `match(...)` filter on one side of a
+    // co-routing join silently drops — the synthesized coordinator fragment's generic
+    // pushdown slot is null, and the leaf plan JSONs don't contain the relevance call
+    // (RelevanceSplitter removed it from the FilterNode residual before serialization).
+    ExecuteFragmentRequest original =
+        new ExecuteFragmentRequest("q-co-rel", 0, 0, "{\"coord\":true}", List.of(), null);
+    ShardId leftShard = new ShardId(new Index("orders", "_na_"), 0);
+    ShardId rightShard = new ShardId(new Index("customers", "_na_"), 0);
+    original.setCoRoutingJoin("orders", "customers", leftShard, rightShard, 0);
+    QueryBuilder leftMatch = new MatchQueryBuilder("note", "hops");
+    original.setCoRoutingRelevance(leftMatch, /* rightRelevance */ null);
+
+    BytesStreamOutput out = new BytesStreamOutput();
+    original.writeTo(out);
+
+    try (StreamInput in =
+        new NamedWriteableAwareStreamInput(out.bytes().streamInput(), namedWriteableRegistry())) {
+      ExecuteFragmentRequest deserialized = new ExecuteFragmentRequest(in);
+      assertTrue(deserialized.isCoRoutingJoin());
+      assertEquals(leftMatch, deserialized.getCoRoutingLeftRelevance());
+      assertNull(deserialized.getCoRoutingRightRelevance());
+    }
+  }
+
+  private static NamedWriteableRegistry namedWriteableRegistry() {
+    // QueryBuilder subclasses register themselves as NamedWriteables via SearchModule +
+    // IndicesModule; both are needed to deserialize a MatchQueryBuilder from the stream.
+    IndicesModule indicesModule = new IndicesModule(List.of());
+    SearchModule searchModule =
+        new SearchModule(org.opensearch.common.settings.Settings.EMPTY, List.of());
+    List<NamedWriteableRegistry.Entry> entries = new ArrayList<>();
+    entries.addAll(indicesModule.getNamedWriteables());
+    entries.addAll(searchModule.getNamedWriteables());
+    return new NamedWriteableRegistry(entries);
   }
 }

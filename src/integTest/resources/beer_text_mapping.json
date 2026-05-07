@@ -1,0 +1,12 @@
+{
+  "mappings": {
+    "properties": {
+      "Id": { "type": "integer" },
+      "Title": { "type": "text" },
+      "Body": { "type": "text" },
+      "Tags": { "type": "keyword" },
+      "CreationDate": { "type": "date", "format": "yyyy-MM-dd HH:mm:ss" },
+      "AcceptedAnswerId": { "type": "integer" }
+    }
+  }
+}
