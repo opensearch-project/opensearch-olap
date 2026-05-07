@@ -12,6 +12,7 @@ import org.opensearch.action.ActionRequestValidationException;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
 import org.opensearch.core.index.shard.ShardId;
+import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.plugin.olap.execution.RfKind;
 
 /**
@@ -95,6 +96,17 @@ public class ExecuteFragmentRequest extends ActionRequest {
    */
   private boolean profileEnabled;
 
+  /**
+   * OpenSearch {@link QueryBuilder} carrying PPL relevance-function push-down (match / match_phrase
+   * / multi_match / query_string / simple_query_string / match_bool_prefix / match_phrase_prefix),
+   * peeled out of the filter at plan-gen time by {@link
+   * org.opensearch.plugin.olap.plan.convert.RelevanceSplitter}. The data node applies it via {@code
+   * IndexShard.acquireSearcher} + {@code QueryShardContext} and AND-combines with the predicate
+   * push-down Query before handing to {@code LuceneArrowReader}. Null when the filter has no
+   * relevance calls (the common case).
+   */
+  private QueryBuilder relevancePushdown;
+
   // --- Shuffle scan fields ---
   /** Target node IDs for each shuffle partition. Null if not a shuffle scan. */
   private List<String> shuffleTargetNodeIds;
@@ -150,6 +162,17 @@ public class ExecuteFragmentRequest extends ActionRequest {
 
   /** Symmetric to {@link #coRoutingLeftPlanJson}, for the right side. */
   private String coRoutingRightPlanJson;
+
+  /**
+   * Leaf-side relevance-function push-down {@link QueryBuilder} for the left Co-Routing scan. Set
+   * when {@code RelevanceSplitter} peeled a {@code match(...)} out of the left leaf's FilterNode —
+   * because that FilterNode no longer carries the relevance call, the generic {@link
+   * #coRoutingLeftPlanJson} cannot recover it. Null when the left side had no relevance filter.
+   * Symmetric {@link #coRoutingRightRelevance} covers the right side.
+   */
+  private QueryBuilder coRoutingLeftRelevance;
+
+  private QueryBuilder coRoutingRightRelevance;
 
   public ExecuteFragmentRequest() {}
 
@@ -249,7 +272,15 @@ public class ExecuteFragmentRequest extends ActionRequest {
       this.coRoutingLeftScanIndex = in.readVInt();
       this.coRoutingLeftPlanJson = in.readOptionalString();
       this.coRoutingRightPlanJson = in.readOptionalString();
+      this.coRoutingLeftRelevance = in.readOptionalNamedWriteable(QueryBuilder.class);
+      this.coRoutingRightRelevance = in.readOptionalNamedWriteable(QueryBuilder.class);
     }
+
+    // Relevance-function push-down trailer: an optional OpenSearch QueryBuilder. Produced by
+    // RelevanceSplitter on the coordinator when a filter contains PPL relevance calls; applied
+    // via IndexShard.acquireSearcher + QueryShardContext on the data node before feeding rows
+    // to Velox. Null when the filter has no relevance calls (most queries).
+    this.relevancePushdown = in.readOptionalNamedWriteable(QueryBuilder.class);
   }
 
   /** Constructor for normal scan requests (backward compatible). */
@@ -359,7 +390,12 @@ public class ExecuteFragmentRequest extends ActionRequest {
       out.writeVInt(coRoutingLeftScanIndex);
       out.writeOptionalString(coRoutingLeftPlanJson);
       out.writeOptionalString(coRoutingRightPlanJson);
+      out.writeOptionalNamedWriteable(coRoutingLeftRelevance);
+      out.writeOptionalNamedWriteable(coRoutingRightRelevance);
     }
+
+    // Relevance-function push-down trailer (see the matching read in the StreamInput ctor).
+    out.writeOptionalNamedWriteable(relevancePushdown);
   }
 
   private static final byte[] EMPTY_BYTES = new byte[0];
@@ -500,6 +536,14 @@ public class ExecuteFragmentRequest extends ActionRequest {
     this.profileEnabled = profileEnabled;
   }
 
+  public QueryBuilder getRelevancePushdown() {
+    return relevancePushdown;
+  }
+
+  public void setRelevancePushdown(QueryBuilder relevancePushdown) {
+    this.relevancePushdown = relevancePushdown;
+  }
+
   public List<String> getShuffleTargetNodeIds() {
     return shuffleTargetNodeIds;
   }
@@ -593,6 +637,19 @@ public class ExecuteFragmentRequest extends ActionRequest {
   public void setCoRoutingLeafPlans(String leftPlanJson, String rightPlanJson) {
     this.coRoutingLeftPlanJson = leftPlanJson;
     this.coRoutingRightPlanJson = rightPlanJson;
+  }
+
+  public QueryBuilder getCoRoutingLeftRelevance() {
+    return coRoutingLeftRelevance;
+  }
+
+  public QueryBuilder getCoRoutingRightRelevance() {
+    return coRoutingRightRelevance;
+  }
+
+  public void setCoRoutingRelevance(QueryBuilder leftRelevance, QueryBuilder rightRelevance) {
+    this.coRoutingLeftRelevance = leftRelevance;
+    this.coRoutingRightRelevance = rightRelevance;
   }
 
   // --- Setters for builder-style construction ---

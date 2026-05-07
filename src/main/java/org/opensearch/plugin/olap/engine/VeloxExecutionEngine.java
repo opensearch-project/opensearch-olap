@@ -79,6 +79,7 @@ import org.boostscale.velox4j.type.Type;
 import org.boostscale.velox4j.type.VarCharType;
 import org.boostscale.velox4j.type.VarbinaryType;
 import org.opensearch.common.util.concurrent.FutureUtils;
+import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.plugin.olap.common.QueryId;
 import org.opensearch.plugin.olap.execution.OlapBloomFilter;
 import org.opensearch.plugin.olap.execution.RuntimeFilterPayload;
@@ -220,7 +221,11 @@ public class VeloxExecutionEngine {
       PhysicalOptimizer optimizer = new PhysicalOptimizer(veloxLifecycle.isMppEnabled(), statsMap);
       RelNode physicalPlan = optimizer.optimize(relNode);
 
-      // Generate Velox PlanNodes + PlanFragments from the physical plan
+      // Generate Velox PlanNodes + PlanFragments from the physical plan.
+      // Any relevance-function QueryBuilders peeled off by RelevanceSplitter are attached to
+      // their specific PlanFragments — NodeResultCollector reads them per-fragment when
+      // building ExecuteFragmentRequests, so a multi-scan plan (e.g. join) applies each
+      // pushdown only to the scan it came from.
       VeloxPlanGenerator generator = new VeloxPlanGenerator();
       List<PlanFragment> fragments = generator.generate(physicalPlan);
 
@@ -505,6 +510,11 @@ public class VeloxExecutionEngine {
     final int leftScanIndex = 0;
     final String finalLeftPlanJson = leftPlanJson;
     final String finalRightPlanJson = rightPlanJson;
+    // Each leaf fragment owns its per-side relevance push-down. The coRoutingFragment used as
+    // the task's fragment carries none, so the generic per-fragment stamp in NodeResultCollector
+    // can't route it — attach both sides explicitly via the customizer.
+    final QueryBuilder leftRelevance = leafFragments.get(0).getRelevancePushdown();
+    final QueryBuilder rightRelevance = leafFragments.get(1).getRelevancePushdown();
     List<ExecuteFragmentResponse> responses =
         collector.dispatchAndCollectCoRouting(
             queryId,
@@ -516,6 +526,7 @@ public class VeloxExecutionEngine {
               request.setCoRoutingJoin(
                   leftIndex, rightIndex, pair.leftShard, pair.rightShard, leftScanIndex);
               request.setCoRoutingLeafPlans(finalLeftPlanJson, finalRightPlanJson);
+              request.setCoRoutingRelevance(leftRelevance, rightRelevance);
             });
     recordProfileResponses(responses);
 

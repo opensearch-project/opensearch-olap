@@ -36,6 +36,11 @@ import org.opensearch.common.inject.Inject;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.index.shard.ShardId;
+import org.opensearch.index.IndexService;
+import org.opensearch.index.engine.Engine;
+import org.opensearch.index.query.QueryBuilder;
+import org.opensearch.index.query.QueryShardContext;
+import org.opensearch.index.shard.IndexShard;
 import org.opensearch.indices.IndicesService;
 import org.opensearch.plugin.olap.engine.VeloxExecutionEngine;
 import org.opensearch.plugin.olap.execution.ExternalStreamBridge;
@@ -176,24 +181,27 @@ public class TransportExecuteFragmentAction
         logger.info("Predicate pushdown enabled for query {}: {}", queryId, pushdownQuery);
       }
 
-      final org.apache.lucene.search.Query finalPushdownQuery = pushdownQuery;
+      final org.apache.lucene.search.Query finalPredicateQuery = pushdownQuery;
+      final QueryBuilder relevancePushdownQb = request.getRelevancePushdown();
       final boolean useParallelReads = veloxLifecycle.getSegmentParallelism() > 1;
       Thread feederThread =
           new Thread(
               () -> {
                 try {
                   for (ShardId shardId : shardIds) {
+                    org.apache.lucene.search.Query perShardQuery =
+                        combineWithRelevance(finalPredicateQuery, relevancePushdownQb, shardId);
                     if (useParallelReads) {
                       reader.readShardIntoStreamParallel(
                           shardId,
                           request.getSourceIndex(),
                           bridge,
-                          finalPushdownQuery,
+                          perShardQuery,
                           segmentExecutor,
                           scanStats);
                     } else {
                       reader.readShardIntoStream(
-                          shardId, request.getSourceIndex(), bridge, finalPushdownQuery, scanStats);
+                          shardId, request.getSourceIndex(), bridge, perShardQuery, scanStats);
                     }
                   }
                   bridge.noMoreInput();
@@ -569,11 +577,19 @@ public class TransportExecuteFragmentAction
       // Apply per-side pushdown from the leaf-fragment plans (FilterNode etc.). The coordinator
       // plan only has the two bare TableScanNodes; without this, leaf-side filters are silently
       // dropped — same issue the broadcast path already handled via probePlanJson, applied
-      // symmetrically to both scans here.
+      // symmetrically to both scans here. Then AND-combine each side's per-shard relevance
+      // QueryBuilder — RelevanceSplitter peeled those calls out of the FilterNode, so they
+      // cannot be recovered from the plan JSON and must ride the request separately.
       final org.apache.lucene.search.Query leftPushdown =
-          extractPushdownIfPresent(request.getCoRoutingLeftPlanJson());
+          combineWithRelevance(
+              extractPushdownIfPresent(request.getCoRoutingLeftPlanJson()),
+              request.getCoRoutingLeftRelevance(),
+              leftShardId);
       final org.apache.lucene.search.Query rightPushdown =
-          extractPushdownIfPresent(request.getCoRoutingRightPlanJson());
+          combineWithRelevance(
+              extractPushdownIfPresent(request.getCoRoutingRightPlanJson()),
+              request.getCoRoutingRightRelevance(),
+              rightShardId);
 
       Thread leftFeeder =
           new Thread(
@@ -1103,6 +1119,44 @@ public class TransportExecuteFragmentAction
       logger.warn(
           "Failed to extract pushdown query, falling back to full scan: {}", e.getMessage());
       return null;
+    }
+  }
+
+  /**
+   * AND-combine the fragment-level predicate pushdown Query with the per-shard relevance Query
+   * built from {@code relevancePushdown} (a QueryBuilder produced by {@code RelevanceSplitter} on
+   * the coordinator). Returns the predicate Query unchanged when the relevance side is null.
+   *
+   * <p>The relevance conversion needs a {@link QueryShardContext} per shard. We briefly acquire the
+   * shard's searcher here just for the conversion; the main read loop in {@code LuceneArrowReader}
+   * acquires its own searcher for the actual scan. Two acquires per shard is cheap and avoids
+   * widening the reader's API.
+   */
+  private org.apache.lucene.search.Query combineWithRelevance(
+      org.apache.lucene.search.Query predicateQuery,
+      QueryBuilder relevancePushdown,
+      ShardId shardId) {
+    if (relevancePushdown == null) {
+      return predicateQuery;
+    }
+    try {
+      IndexService indexService = indicesService.indexServiceSafe(shardId.getIndex());
+      IndexShard shard = indexService.getShard(shardId.id());
+      try (Engine.Searcher searcher = shard.acquireSearcher("olap-relevance")) {
+        QueryShardContext ctx =
+            indexService.newQueryShardContext(
+                shardId.id(), searcher, System::currentTimeMillis, null);
+        org.apache.lucene.search.Query relevanceQuery = relevancePushdown.toQuery(ctx);
+        return org.opensearch.plugin.olap.execution.RuntimeFilterBuilder.combine(
+            predicateQuery, relevanceQuery);
+      }
+    } catch (Exception e) {
+      // Never silently drop the relevance filter: RelevanceSplitter may have already removed the
+      // matching call from the Velox residual, so returning a broader predicateQuery here would
+      // produce over-broad results. Fail the task; the coordinator surfaces the error.
+      throw new RuntimeException(
+          "Failed to build relevance push-down Query for shard " + shardId + ": " + e.getMessage(),
+          e);
     }
   }
 

@@ -1,0 +1,20 @@
+{"index": {"_index": "beer_text"}}
+{"Id": 1, "Title": "How to brew hoppy IPA beer", "Body": "The taste of a good IPA depends on brewing hops and yeast. Start with two-row malt.", "Tags": "brewing", "CreationDate": "2015-03-10 12:00:00", "AcceptedAnswerId": 101}
+{"index": {"_index": "beer_text"}}
+{"Id": 2, "Title": "Pilsner vs lager beer taste", "Body": "Pilsners have a crisper taste than traditional lagers. Both are bottom fermented.", "Tags": "taste", "CreationDate": "2015-06-22 09:30:00", "AcceptedAnswerId": 205}
+{"index": {"_index": "beer_text"}}
+{"Id": 3, "Title": "Beer fermentation temperature", "Body": "For ale yeast the optimal taste comes from fermenting near 20C. Lager yeast prefers cooler.", "Tags": "brewing", "CreationDate": "2016-01-05 14:22:15", "AcceptedAnswerId": 310}
+{"index": {"_index": "beer_text"}}
+{"Id": 4, "Title": "Best hop varieties for stouts", "Body": "Stout recipes typically use low-alpha hops for balance. The taste leans roasty.", "Tags": "recipes", "CreationDate": "2016-04-18 08:15:00", "AcceptedAnswerId": 120}
+{"index": {"_index": "beer_text"}}
+{"Id": 5, "Title": "Homebrewing equipment guide", "Body": "A basic homebrew setup needs a kettle, fermenter, and airlock. The taste comes from your grain bill.", "Tags": "equipment", "CreationDate": "2016-09-01 16:45:30", "AcceptedAnswerId": 50}
+{"index": {"_index": "beer_text"}}
+{"Id": 6, "Title": "Free beer giveaways at pubs", "Body": "Many pubs run free sampling events. The taste varies by region.", "Tags": "pubs", "CreationDate": "2017-02-14 18:00:00", "AcceptedAnswerId": 275}
+{"index": {"_index": "beer_text"}}
+{"Id": 7, "Title": "Belgian ale brewing tips", "Body": "Belgian ales develop a fruity taste from the yeast. Secondary fermentation helps.", "Tags": "brewing", "CreationDate": "2017-07-30 11:11:11", "AcceptedAnswerId": 401}
+{"index": {"_index": "beer_text"}}
+{"Id": 8, "Title": "Understanding bitterness units", "Body": "IBU measures bitterness but not the perceived taste. Malt sweetness balances it.", "Tags": "taste", "CreationDate": "2018-11-02 13:05:00", "AcceptedAnswerId": 90}
+{"index": {"_index": "beer_text"}}
+{"Id": 9, "Title": "Can you reuse brewing yeast", "Body": "Yes, you can harvest yeast from a previous batch. It affects the taste slightly.", "Tags": "brewing", "CreationDate": "2019-05-20 10:00:00", "AcceptedAnswerId": 155}
+{"index": {"_index": "beer_text"}}
+{"Id": 10, "Title": "Lager conditioning period", "Body": "Proper lagering takes 4-6 weeks at cold temperature. The taste mellows over time.", "Tags": "brewing", "CreationDate": "2019-08-12 15:30:45", "AcceptedAnswerId": 220}

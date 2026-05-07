@@ -4,6 +4,14 @@
 
 package org.opensearch.plugin.olap.execution;
 
+import java.util.List;
+import org.apache.calcite.rel.type.RelDataType;
+import org.apache.calcite.rex.RexCall;
+import org.apache.calcite.rex.RexInputRef;
+import org.apache.calcite.rex.RexLiteral;
+import org.apache.calcite.rex.RexNode;
+import org.apache.calcite.sql.SqlKind;
+import org.apache.calcite.sql.type.SqlTypeName;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.lucene.document.DoublePoint;
@@ -446,6 +454,271 @@ public class LuceneFilterConverter {
   private boolean variantToBoolean(Variant v) {
     if (v instanceof BooleanValue) return ((BooleanValue) v).getValue();
     throw new UnsupportedOperationException("Cannot convert " + v.getClass() + " to boolean");
+  }
+
+  // ---- RexNode → QueryBuilder conversion (for splitter (c) OR-arm translation) ----
+
+  /**
+   * Translate a Calcite {@link RexNode} leaf to an OpenSearch {@link
+   * org.opensearch.index.query.QueryBuilder}, suitable for shipping over the transport.
+   *
+   * <p>Used by {@code RelevanceSplitter} when it needs to OR a non-relevance predicate against a
+   * relevance clause inside a single {@link org.opensearch.index.query.BoolQueryBuilder} SHOULD
+   * tree. Returns {@code null} on any unsupported shape — the caller treats that as "can't push
+   * down, rule out and fall back".
+   *
+   * <p>Supported shapes: AND, OR, NOT, =/≠/&lt;/&lt;=/&gt;/&gt;= on numeric and VARCHAR fields, IS
+   * NULL, IS NOT NULL, LIKE (wildcard), IN (terms).
+   */
+  public org.opensearch.index.query.QueryBuilder toQueryBuilder(
+      RexNode node, RelDataType inputRowType) {
+    if (!(node instanceof RexCall)) {
+      return null;
+    }
+    RexCall call = (RexCall) node;
+    SqlKind kind = call.getKind();
+    switch (kind) {
+      case AND:
+        return buildBoolFromChildren(call, inputRowType, BooleanClause.Occur.MUST);
+      case OR:
+        return buildBoolFromChildren(call, inputRowType, BooleanClause.Occur.SHOULD);
+      case NOT:
+        return buildNotQueryBuilder(call, inputRowType);
+      case EQUALS:
+        return buildEqQueryBuilder(call, inputRowType, false);
+      case NOT_EQUALS:
+        return buildEqQueryBuilder(call, inputRowType, true);
+      case GREATER_THAN:
+      case GREATER_THAN_OR_EQUAL:
+      case LESS_THAN:
+      case LESS_THAN_OR_EQUAL:
+        return buildRangeQueryBuilder(call, inputRowType, kind);
+      case IS_NULL:
+        return buildIsNullQueryBuilder(call, inputRowType);
+      case IS_NOT_NULL:
+        return buildIsNotNullQueryBuilder(call, inputRowType);
+      case LIKE:
+        return buildLikeQueryBuilder(call, inputRowType);
+      case IN:
+      case SEARCH:
+        // Calcite commonly rewrites IN (and some literal disjunctions) into SEARCH with a Sarg
+        // literal; SEARCH is structurally similar enough that the safe-falling-back path is fine —
+        // mark as unsupported rather than risking a wrong translation.
+        return null;
+      default:
+        return null;
+    }
+  }
+
+  private org.opensearch.index.query.QueryBuilder buildBoolFromChildren(
+      RexCall call, RelDataType inputRowType, BooleanClause.Occur occur) {
+    org.opensearch.index.query.BoolQueryBuilder bool =
+        new org.opensearch.index.query.BoolQueryBuilder();
+    for (RexNode child : call.getOperands()) {
+      org.opensearch.index.query.QueryBuilder sub = toQueryBuilder(child, inputRowType);
+      if (sub == null) {
+        // Fail strict: OR/AND children must all translate. Returning null propagates to caller.
+        return null;
+      }
+      if (occur == BooleanClause.Occur.MUST) {
+        bool.must(sub);
+      } else {
+        bool.should(sub);
+      }
+    }
+    if (occur == BooleanClause.Occur.SHOULD) {
+      bool.minimumShouldMatch(1);
+    }
+    return bool;
+  }
+
+  private org.opensearch.index.query.QueryBuilder buildNotQueryBuilder(
+      RexCall call, RelDataType inputRowType) {
+    RexNode inner = call.getOperands().get(0);
+    org.opensearch.index.query.QueryBuilder innerQb = toQueryBuilder(inner, inputRowType);
+    if (innerQb == null) {
+      return null;
+    }
+    return new org.opensearch.index.query.BoolQueryBuilder().mustNot(innerQb);
+  }
+
+  private org.opensearch.index.query.QueryBuilder buildEqQueryBuilder(
+      RexCall call, RelDataType inputRowType, boolean negate) {
+    List<RexNode> ops = call.getOperands();
+    if (ops.size() != 2) {
+      return null;
+    }
+    FieldLiteralPair pair = extractFieldLiteral(ops, inputRowType);
+    if (pair == null) {
+      return null;
+    }
+    Object value = literalValue(pair.literal);
+    if (value == null) {
+      return null;
+    }
+    org.opensearch.index.query.QueryBuilder eq =
+        new org.opensearch.index.query.TermQueryBuilder(pair.fieldName, value);
+    if (negate) {
+      return new org.opensearch.index.query.BoolQueryBuilder().mustNot(eq);
+    }
+    return eq;
+  }
+
+  private org.opensearch.index.query.QueryBuilder buildRangeQueryBuilder(
+      RexCall call, RelDataType inputRowType, SqlKind kind) {
+    List<RexNode> ops = call.getOperands();
+    if (ops.size() != 2) {
+      return null;
+    }
+    FieldLiteralPair pair = extractFieldLiteral(ops, inputRowType);
+    if (pair == null) {
+      return null;
+    }
+    Object value = literalValue(pair.literal);
+    if (value == null) {
+      return null;
+    }
+    // If the literal was on the left, the comparison direction flips.
+    SqlKind effective = pair.flipped ? flipKind(kind) : kind;
+    org.opensearch.index.query.RangeQueryBuilder range =
+        new org.opensearch.index.query.RangeQueryBuilder(pair.fieldName);
+    switch (effective) {
+      case GREATER_THAN:
+        return range.gt(value);
+      case GREATER_THAN_OR_EQUAL:
+        return range.gte(value);
+      case LESS_THAN:
+        return range.lt(value);
+      case LESS_THAN_OR_EQUAL:
+        return range.lte(value);
+      default:
+        return null;
+    }
+  }
+
+  private org.opensearch.index.query.QueryBuilder buildIsNullQueryBuilder(
+      RexCall call, RelDataType inputRowType) {
+    List<RexNode> ops = call.getOperands();
+    if (ops.size() != 1 || !(ops.get(0) instanceof RexInputRef)) {
+      return null;
+    }
+    String field = fieldName((RexInputRef) ops.get(0), inputRowType);
+    return new org.opensearch.index.query.BoolQueryBuilder()
+        .mustNot(new org.opensearch.index.query.ExistsQueryBuilder(field));
+  }
+
+  private org.opensearch.index.query.QueryBuilder buildIsNotNullQueryBuilder(
+      RexCall call, RelDataType inputRowType) {
+    List<RexNode> ops = call.getOperands();
+    if (ops.size() != 1 || !(ops.get(0) instanceof RexInputRef)) {
+      return null;
+    }
+    String field = fieldName((RexInputRef) ops.get(0), inputRowType);
+    return new org.opensearch.index.query.ExistsQueryBuilder(field);
+  }
+
+  private org.opensearch.index.query.QueryBuilder buildLikeQueryBuilder(
+      RexCall call, RelDataType inputRowType) {
+    List<RexNode> ops = call.getOperands();
+    if (ops.size() != 2
+        || !(ops.get(0) instanceof RexInputRef)
+        || !(ops.get(1) instanceof RexLiteral)) {
+      return null;
+    }
+    String field = fieldName((RexInputRef) ops.get(0), inputRowType);
+    String pattern = ((RexLiteral) ops.get(1)).getValueAs(String.class);
+    if (pattern == null) {
+      return null;
+    }
+    // SQL LIKE uses % / _ wildcards; Lucene WildcardQuery uses * / ?. Translate.
+    StringBuilder sb = new StringBuilder(pattern.length());
+    for (int i = 0; i < pattern.length(); i++) {
+      char c = pattern.charAt(i);
+      if (c == '%') {
+        sb.append('*');
+      } else if (c == '_') {
+        sb.append('?');
+      } else if (c == '*' || c == '?') {
+        sb.append('\\').append(c);
+      } else {
+        sb.append(c);
+      }
+    }
+    return new org.opensearch.index.query.WildcardQueryBuilder(field, sb.toString());
+  }
+
+  /** Extract a (field, literal) pair from a 2-operand RexCall. Returns null when shape is wrong. */
+  private FieldLiteralPair extractFieldLiteral(List<RexNode> ops, RelDataType inputRowType) {
+    RexNode a = ops.get(0);
+    RexNode b = ops.get(1);
+    if (a instanceof RexInputRef && b instanceof RexLiteral) {
+      return new FieldLiteralPair(fieldName((RexInputRef) a, inputRowType), (RexLiteral) b, false);
+    }
+    if (b instanceof RexInputRef && a instanceof RexLiteral) {
+      return new FieldLiteralPair(fieldName((RexInputRef) b, inputRowType), (RexLiteral) a, true);
+    }
+    return null;
+  }
+
+  private static String fieldName(RexInputRef ref, RelDataType inputRowType) {
+    return inputRowType.getFieldList().get(ref.getIndex()).getName();
+  }
+
+  private static Object literalValue(RexLiteral lit) {
+    if (lit.isNull()) {
+      return null;
+    }
+    SqlTypeName t = lit.getType().getSqlTypeName();
+    switch (t) {
+      case CHAR:
+      case VARCHAR:
+        return lit.getValueAs(String.class);
+      case BOOLEAN:
+        return lit.getValueAs(Boolean.class);
+      case TINYINT:
+      case SMALLINT:
+      case INTEGER:
+        return lit.getValueAs(Integer.class);
+      case BIGINT:
+        return lit.getValueAs(Long.class);
+      case REAL:
+      case FLOAT:
+        return lit.getValueAs(Float.class);
+      case DOUBLE:
+      case DECIMAL:
+        return lit.getValueAs(Double.class);
+      default:
+        // Dates/timestamps: as epoch-millis string — OpenSearch's RangeQueryBuilder accepts it.
+        return lit.getValueAs(String.class);
+    }
+  }
+
+  private static SqlKind flipKind(SqlKind kind) {
+    switch (kind) {
+      case GREATER_THAN:
+        return SqlKind.LESS_THAN;
+      case GREATER_THAN_OR_EQUAL:
+        return SqlKind.LESS_THAN_OR_EQUAL;
+      case LESS_THAN:
+        return SqlKind.GREATER_THAN;
+      case LESS_THAN_OR_EQUAL:
+        return SqlKind.GREATER_THAN_OR_EQUAL;
+      default:
+        return kind;
+    }
+  }
+
+  /** Carrier for {@link #extractFieldLiteral}. */
+  private static final class FieldLiteralPair {
+    final String fieldName;
+    final RexLiteral literal;
+    final boolean flipped;
+
+    FieldLiteralPair(String fieldName, RexLiteral literal, boolean flipped) {
+      this.fieldName = fieldName;
+      this.literal = literal;
+      this.flipped = flipped;
+    }
   }
 
   /** Comparison operator enum with flip support. */

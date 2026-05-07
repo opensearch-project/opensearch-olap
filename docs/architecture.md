@@ -15,6 +15,7 @@
    - 4.7 Backpressure and Memory Bounds
    - 4.8 Join Column-Name Disambiguation
    - 4.9 Query Profiling
+   - 4.10 Relevance Function Push-Down
 5. [Key Design Decisions](#5-key-design-decisions)
 6. [Comparison with RFC #4812](#6-comparison-with-rfc-4812)
 7. [Current Scope and Roadmap](#7-current-scope-and-roadmap)
@@ -295,16 +296,19 @@ Each data node executes a fragment using two cooperating threads connected by a 
 The feeder thread reads data from OpenSearch's Lucene index. For each assigned shard:
 
 1. **Acquire NRT searcher** — `shard.acquireSearcher("olap-velox")` obtains a near-real-time snapshot of the index.
-2. **Resolve column specs** — Maps each requested field to an Arrow type and Lucene doc-value type via the index mapping service:
+2. **Resolve column specs** — Maps each requested field to an Arrow type plus either a doc-value type or a text source kind, via the index mapping service:
    ```
-   OpenSearch Type     Doc-Value Type     Arrow Type
-   ───────────────     ──────────────     ──────────────────────
-   keyword, text       SORTED_SET         Utf8
-   long, integer       SORTED_NUMERIC     Int(64/32)
-   double, float       SORTED_NUMERIC     FloatingPoint
-   boolean             SORTED_NUMERIC     Bool
-   date                SORTED_NUMERIC     Timestamp(MICROSECOND)
+   OpenSearch Type     Reader path           Arrow Type
+   ───────────────     ────────────────────  ──────────────────────
+   keyword             DocValueColumnReader  Utf8 (SORTED_SET)
+   text                TextFieldColumnReader Utf8 (stored / _source)
+   long, integer       DocValueColumnReader  Int(64/32) (SORTED_NUMERIC)
+   double, float       DocValueColumnReader  FloatingPoint (SORTED_NUMERIC)
+   boolean             DocValueColumnReader  Bool (SORTED_NUMERIC)
+   date                DocValueColumnReader  Timestamp(MICROSECOND) (SORTED_NUMERIC)
    ```
+   **Text fields** don't have doc values; instead `TextFieldColumnReader` reads them via Lucene stored fields (when the mapping declares `store: true`) or by extracting the value from the doc's `_source`. Per scan batch, a single `FieldsVisitor` per doc decompresses the stored-fields block once and populates every text column from that pass. Multi-valued text returns the first value (same policy the doc-value path uses for keyword columns). The `_source` path auto-detects its stored media type (JSON / CBOR / SMILE) via `XContentHelper.convertToMap` rather than assuming JSON — indices ingested with a non-JSON content type work without modification. This is what makes PPL relevance functions usable on default text mappings — see [§4.10 Relevance Function Push-Down](#410-relevance-function-push-down) below.
+
    Doc values store epoch millis; `ArrowBatchBuilder` multiplies by 1000 into a `TimeStampMicroVector`. velox4j's Arrow bridge is configured for microsecond precision (`Arrow.cc makeOptions()`), so the feeder output becomes a Velox `TimestampVector` — enabling native `year()`, `date_trunc()`, and `timestamp <op> timestamp` scalars without BIGINT coercion.
 3. **Iterate segments** — A Lucene index shard consists of multiple segments (immutable on-disk units). The reader iterates each `LeafReaderContext` in the searcher.
 4. **Batch documents** — Within each segment, documents are read in batches of 4,096 rows. For each batch, `ArrowBatchBuilder` creates a `VectorSchemaRoot`:
@@ -496,6 +500,41 @@ The OLAP plugin plugs into the SQL plugin's PPL `profile=true` flow. When the pr
 The gap between `docsRead` and `docsMatched` is the observable effect of the runtime filter at the Lucene level. Tasks with `rf=NONE` (e.g., build-side leaves, coordinator stages) naturally report `docsRead=0` when they don't read from Lucene.
 
 **Overhead.** Profiling adds a per-task wire-format trailer (~60 bytes) and skips all counter work when `profile=true` is absent from the request, so the overhead is negligible for non-profiled queries. Per-fragment `time_ms` is the **sum** of task times, not wall-clock — parallelism across tasks is not subtracted out. Profiling is only emitted for successful queries.
+
+### 4.10 Relevance Function Push-Down
+
+PPL relevance functions — `match`, `match_phrase`, `match_phrase_prefix`, `match_bool_prefix`, `multi_match`, `simple_query_string`, `query_string` — cannot be evaluated inside Velox (it has no analyzer, no inverted index, no `match` scalar). Instead, the coordinator peels them out of the filter at plan-gen time and ships the equivalent OpenSearch `QueryBuilder` alongside the serialized Velox plan. Each data node applies the `QueryBuilder` as a Lucene query on its local shard searcher before handing rows to Velox.
+
+```
+  LogicalFilter(condition)
+      │
+      ▼
+  RelevanceSplitter.split(condition)
+      │
+      ├── ruledOut=true        →  canVectorize() returns false
+      │                          (e.g. `match(...)` under `abs(...)`, or an OR with a
+      │                           non-translatable leaf — shapes that can't be safely peeled)
+      │
+      ├── no relevance calls   →  condition stays as the Velox FilterNode's residual
+      │
+      └── split success
+            ├── pushdownQuery: QueryBuilder (match + AND-combined non-relevance leaves)
+            └── residual:       RexNode (non-relevance predicates that stay in Velox)
+```
+
+The QueryBuilder rides on `PlanFragment.relevancePushdown` — attached to the specific leaf fragment whose scan produced the filter, not globally on the query. On the data node, `combineWithRelevance(scanPushdown, relevanceQueryBuilder, shardId)` acquires the shard's searcher to build a `QueryShardContext`, calls `QueryBuilder.toQuery(ctx)`, and AND-combines the result with the doc-value predicate pushdown before passing to `LuceneArrowReader`. A failure to build the Lucene query fails the task — never silently drops the filter.
+
+**Three dispatch paths, three wire slots.**
+
+| Path | Wire field on `ExecuteFragmentRequest` | Scope |
+|------|----------------------------------------|-------|
+| Normal scan | `relevancePushdown` | Applied to every shard in the task |
+| Co-Routing join | `coRoutingLeftRelevance` / `coRoutingRightRelevance` | Per-side: each leaf's peeled filter only touches its own shard |
+| Broadcast / shuffle join | `relevancePushdown` on the specific leaf fragment | Stamped per-fragment at dispatch; siblings keep their own (or none) |
+
+Scoping matters: a relevance predicate on only one side of a join must not be applied to the other side. `RelevanceSplitter` already removed the call from the `FilterNode` residual, so the leaf plan JSON cannot recover it. Co-Routing therefore carries its own per-side slots; the other paths inherit from `PlanFragment.relevancePushdown`, which `VeloxPlanGenerator` writes on the leaf fragment at creation and clears before walking sibling subtrees.
+
+**canVectorize interaction.** `VectorizedEngineExtension.findUnsupportedRexCall` short-circuits when it sees a relevance call — the call's `MAP_VALUE_CONSTRUCTOR` operands (PPL's named-argument encoding) are otherwise not in the supported set. For `LogicalFilter` nodes specifically, the extension then runs a dry-run `RelevanceSplitter.split()`; `ruledOut=true` is what actually rejects un-vectorizable shapes (e.g. relevance nested in arithmetic). Relevance calls outside a `LogicalFilter` — in a projection or non-filter expression — can currently pass `canVectorize` and fail later in Velox; that case is rare and the failure is explicit, but the gate should eventually reject it up front.
 
 ---
 

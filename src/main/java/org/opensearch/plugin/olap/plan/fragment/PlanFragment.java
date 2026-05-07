@@ -6,6 +6,7 @@ package org.opensearch.plugin.olap.plan.fragment;
 
 import java.util.List;
 import org.boostscale.velox4j.plan.PlanNode;
+import org.opensearch.index.query.QueryBuilder;
 
 /**
  * A fragment of a distributed Velox query plan.
@@ -41,6 +42,13 @@ public class PlanFragment {
    * receive broadcast data. Null for non-broadcast fragments.
    */
   private List<byte[]> broadcastData;
+
+  /**
+   * OpenSearch QueryBuilder peeled off this fragment's FilterNode(s) by RelevanceSplitter. Applied
+   * by the data node via Lucene before rows feed Velox. Scoped to this fragment only — a different
+   * scan in the same query has its own (or no) pushdown.
+   */
+  private QueryBuilder relevancePushdown;
 
   public PlanFragment(
       int fragmentId,
@@ -87,5 +95,13 @@ public class PlanFragment {
 
   public void setBroadcastData(List<byte[]> broadcastData) {
     this.broadcastData = broadcastData;
+  }
+
+  public QueryBuilder getRelevancePushdown() {
+    return relevancePushdown;
+  }
+
+  public void setRelevancePushdown(QueryBuilder relevancePushdown) {
+    this.relevancePushdown = relevancePushdown;
   }
 }

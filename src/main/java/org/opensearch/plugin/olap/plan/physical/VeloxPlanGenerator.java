@@ -63,6 +63,7 @@ import org.boostscale.velox4j.window.WindowFunction;
 import org.boostscale.velox4j.window.WindowType;
 import org.opensearch.plugin.olap.plan.convert.FieldMapping;
 import org.opensearch.plugin.olap.plan.convert.PlanIdGenerator;
+import org.opensearch.plugin.olap.plan.convert.RelevanceSplitter;
 import org.opensearch.plugin.olap.plan.convert.VeloxAggConverter;
 import org.opensearch.plugin.olap.plan.convert.VeloxExprConverter;
 import org.opensearch.plugin.olap.plan.convert.VeloxTypeConverter;
@@ -120,6 +121,12 @@ public class VeloxPlanGenerator {
   private FieldMapping[] currentFieldMappings;
   private RowType currentVeloxOutputType;
 
+  // Accumulates OpenSearch QueryBuilders peeled off by RelevanceSplitter during convertFilter.
+  // Scoped to the *current* leaf fragment being built — handleExchange and the other
+  // leaf-creating paths stamp this onto the freshly-created PlanFragment and reset it before
+  // walking the next sibling. Multiple FilterNodes within the same fragment AND-combine.
+  private org.opensearch.index.query.QueryBuilder currentFragmentPushdown;
+
   /**
    * Generate PlanFragments from an optimized physical plan.
    *
@@ -133,6 +140,7 @@ public class VeloxPlanGenerator {
     fragments.clear();
     currentFieldMappings = null;
     currentVeloxOutputType = null;
+    currentFragmentPushdown = null;
 
     // Convert the physical plan to Velox PlanNode, creating fragments at Exchange boundaries
     PlanNode rootPlan = toVeloxPlan(physicalPlan);
@@ -142,12 +150,15 @@ public class VeloxPlanGenerator {
       String sourceIndex = extractSourceIndex(physicalPlan);
       // If the root plan IS a simple scan (no exchange), it's a single-fragment plan
       if (fragments.isEmpty()) {
-        fragments.add(
+        PlanFragment single =
             new PlanFragment(
                 fragmentId.getAndIncrement(),
                 rootPlan,
                 FragmentProperties.source(sourceIndex),
-                Collections.emptyList()));
+                Collections.emptyList());
+        single.setRelevancePushdown(currentFragmentPushdown);
+        currentFragmentPushdown = null;
+        fragments.add(single);
       } else {
         // Root fragment is the coordinator, dependent on all leaf fragments
         List<Integer> inputIds = new ArrayList<>();
@@ -250,7 +261,13 @@ public class VeloxPlanGenerator {
     }
 
     int childFragId = fragmentId.getAndIncrement();
-    fragments.add(new PlanFragment(childFragId, childPlan, props, Collections.emptyList()));
+    PlanFragment leafFragment =
+        new PlanFragment(childFragId, childPlan, props, Collections.emptyList());
+    // Attach any relevance pushdown accumulated while converting this leaf's subtree, then
+    // clear — a sibling subtree (other join side) must not inherit it.
+    leafFragment.setRelevancePushdown(currentFragmentPushdown);
+    currentFragmentPushdown = null;
+    fragments.add(leafFragment);
 
     // Reset field mappings — the parent fragment has a different schema context
     currentFieldMappings = null;
@@ -351,16 +368,42 @@ public class VeloxPlanGenerator {
   }
 
   private PlanNode convertFilter(PhysicalFilter filter) {
-    String nodeId = idGen.next();
     PlanNode source = toVeloxPlan(filter.getInput());
     if (source == null) {
       source = createExchangeScan(filter.getInput().getRowType());
     }
 
+    // Peel any relevance-function calls out of the filter before they reach Velox. The Lucene
+    // QueryBuilder is accumulated on the generator and shipped as a transport-level side channel;
+    // the residual (if any) flows through VeloxExprConverter as a normal FilterNode.
+    RelevanceSplitter splitter =
+        new RelevanceSplitter(filter.getCluster().getRexBuilder(), filter.getInput().getRowType());
+    RelevanceSplitter.Result split = splitter.split(filter.getCondition());
+    if (split.ruledOut) {
+      // canVectorize should have rejected this plan before we got here. Log and continue with
+      // the filter intact (relevance calls will fail Velox compilation — but that's strictly
+      // better than a wrong result, and a missed canVectorize gate is a bug we want to see).
+      logger.warn(
+          "Relevance splitter ruled out a filter that canVectorize accepted: {}",
+          filter.getCondition());
+    }
+    if (split.pushdownQuery != null) {
+      currentFragmentPushdown = andCombine(currentFragmentPushdown, split.pushdownQuery);
+    }
+    if (split.residualCondition == null) {
+      return source;
+    }
     VeloxExprConverter exprConverter = createExprConverter(filter.getInput().getRowType());
-    TypedExpr filterExpr = exprConverter.convert(filter.getCondition());
+    TypedExpr filterExpr = exprConverter.convert(split.residualCondition);
+    return new FilterNode(idGen.next(), Collections.singletonList(source), filterExpr);
+  }
 
-    return new FilterNode(nodeId, Collections.singletonList(source), filterExpr);
+  /** AND-combine two QueryBuilders via {@link BoolQueryBuilder#must}. */
+  private static org.opensearch.index.query.QueryBuilder andCombine(
+      org.opensearch.index.query.QueryBuilder a, org.opensearch.index.query.QueryBuilder b) {
+    if (a == null) return b;
+    if (b == null) return a;
+    return new org.opensearch.index.query.BoolQueryBuilder().must(a).must(b);
   }
 
   private PlanNode convertProject(PhysicalProject project) {
@@ -659,12 +702,15 @@ public class VeloxPlanGenerator {
     // 3. Create the leaf fragment with PARTIAL agg
     String sourceIndex = extractSourceIndex(exchange.getInput());
     int leafFragId = fragmentId.getAndIncrement();
-    fragments.add(
+    PlanFragment partialAggFragment =
         new PlanFragment(
             leafFragId,
             partialAgg,
             FragmentProperties.source(sourceIndex),
-            Collections.emptyList()));
+            Collections.emptyList());
+    partialAggFragment.setRelevancePushdown(currentFragmentPushdown);
+    currentFragmentPushdown = null;
+    fragments.add(partialAggFragment);
 
     // 4. Build the FINAL aggregate (coordinator side)
     List<Aggregate> finalAggs = new ArrayList<>(aggregates.size());
@@ -865,12 +911,15 @@ public class VeloxPlanGenerator {
     // 3. Create the leaf fragment with partial sort+limit
     String sourceIndex = extractSourceIndex(exchange.getInput());
     int leafFragId = fragmentId.getAndIncrement();
-    fragments.add(
+    PlanFragment partialSortFragment =
         new PlanFragment(
             leafFragId,
             partialPlan,
             FragmentProperties.source(sourceIndex),
-            Collections.emptyList()));
+            Collections.emptyList());
+    partialSortFragment.setRelevancePushdown(currentFragmentPushdown);
+    currentFragmentPushdown = null;
+    fragments.add(partialSortFragment);
 
     // 4. Build FINAL sort+limit on the coordinator (with empty sources — wired during execution)
     PlanNode finalPlan = createExchangeScan(inputRowType);

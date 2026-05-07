@@ -95,6 +95,12 @@ When adding a variant to a public enum (e.g. `JoinStrategy`, `ErrorCategory`), g
 ```
 Integration test logs are at `build/testclusters/integTest-0/logs/integTest.log`. `./gradlew integTest --rerun-tasks` wipes the log — capture it between runs if diffing behavior. Native JVM crashes leave `hs_err_pid*.log` in `build/testclusters/integTest-0/distro/.../logs/`.
 
+**Forbidden APIs**: `String.getBytes()` without a charset fails `forbiddenApisTest`; always pass `StandardCharsets.UTF_8`. Every no-arg default-charset method is blocked — use the explicit-charset overload.
+
+**Javadoc in check**: `./gradlew check` runs `javadoc` and hard-fails on broken `{@link #methodName}` references. If you rename a method referenced from a class-level doc comment, fix the `@link` too.
+
+**Lucene in-memory test docs**: anchoring a `ByteBuffersDirectory` doc with `StringField("_id", ...)` trips `FieldsVisitor`'s `_id must go through binaryField` assertion. Use a non-reserved anchor (`doc_uid`) instead.
+
 **Byte-valued settings**: Use `Setting.byteSizeSetting(key, defaultBSV, minBSV, maxBSV, NodeScope, Dynamic)` with `ByteSizeValue`/`ByteSizeUnit`. The setter accepts `ByteSizeValue` and caches `.getBytes()` into a `volatile long`. See `PER_FRAGMENT_ARROW_BYTES` in `VeloxLifecycleService`.
 
 **JDK 21 / JDK 25 compile classpath**: Project targets JDK 21 bytecode (`sourceCompatibility = VERSION_21`) but also compiles cleanly under JDK 25. JDK 25's javac is stricter about missing annotation class files — it fails hard where JDK 21 merely warned. Four `compileOnly` entries in `build.gradle` supply the annotations/helper classes referenced by Calcite/Arrow/SQL-plugin bytecode: `org.checkerframework:checker-qual`, `org.apiguardian:apiguardian-api`, `com.fasterxml.jackson.core:jackson-annotations`, `org.apache.calcite:calcite-linq4j`. If a new JDK version surfaces another `CompletionFailure: class file for X not found`, add that library as a `compileOnly` entry in the same block.
@@ -235,6 +241,8 @@ OpenSearch `object` fields appear as `MAP<VARCHAR, ANY>` in Calcite, with flat d
 Dropping a MAP parent ref anywhere else (filter/sort/outer Project) breaks output width — operators above index Calcite fields by position and will reference non-existent columns.
 
 `ANY` top-level fields (`match_only_text`, empty objects, unresolved fields) are rejected by `canVectorize()` — not readable from doc values. Only MAP is treated as an object parent.
+
+**Projection pruning caveat**: a naive `RexInputRef` walk of nodes above a scan under-counts needed fields, because MAP parents get expanded into their flat dot-path children in `convertProject` — a parent ref in a Project doesn't map to a single input index. Any future scan-projection pruner must expand MAP parents before narrowing `TableScanNode.outputType`.
 
 Metadata columns (`_id`, `_index`, `_score`, `_maxscore`, `_sort`, `_routing`) must be skipped in scan with veloxIndex=-1 mappings so projections referencing them are dropped.
 
